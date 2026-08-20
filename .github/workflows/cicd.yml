@@ -60,6 +60,30 @@ jobs:
       - name: Core checks passed
         run: echo "Core typecheck and root test shards passed."
 
+  garnet-runtime-review:
+    name: Garnet Runtime Review
+    needs:
+      - core
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - name: Garnet Runtime Review
+        uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2.2.0
+        with:
+          api_token: ${{ secrets.GARNET_API_TOKEN }}
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install and run one core test shard
+        env:
+          CORE_TEST_SHARD: 1/5
+        run: |
+          npm ci
+          npm run test:root:shard
+
   cli:
     name: CLI
     runs-on: ubuntu-latest
