@@ -1,3 +1,4 @@
+import { modelRegistry, lookupRegistryModel, enableBuiltinModel } from "./admin/model-registry.ts";
 import { type ApiCtx, type Route } from "./route.ts";
 import {
   getAdminResources,
@@ -7,19 +8,22 @@ import {
   retention,
   whoami,
 } from "./admin/scope-config.ts";
+import { testAutoFlagger } from "./admin/auto-flagger-test.ts";
 import { egress, listAdminAudit, listAdminErrors, listAdminRuns, metrics } from "./admin/observability.ts";
 import { getAdminSession, getAdminSessionLlm, listAdminSessions, listAdminShadowDeliveries } from "./admin/sessions.ts";
 import { downloadAdminFile, listAdminFiles, readAdminFile, uploadAdminFile } from "./admin/files.ts";
 import { archiveAdminSkill, getAdminSkill, listAdminArtifacts, putAdminCronDestination } from "./admin/artifacts.ts";
 import { getAdminMemory, listMemoryScopes, putAdminMemory } from "./admin/memory.ts";
-import { listSandboxRoutes, migrateSandboxScope } from "./admin/sandbox.ts";
+import { listSandboxRoutes, migrateSandboxScope, manageSandboxResources } from "./admin/sandbox.ts";
 import {
   createAdminGrant,
   getUserDetail,
+  inviteExternalUser,
   listKeychainStatus,
   listUsers,
   resetUserToBrandNew,
   revokeAdminGrant,
+  revokeExternalUser,
   searchDirectory,
   setUserOnboarding,
   startImpersonation,
@@ -70,9 +74,20 @@ const routes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "PUT", path: "/v1/admin/mcp-servers/:id", auth: "either", handle: putMcpServer },
   { method: "DELETE", path: "/v1/admin/mcp-servers/:id", auth: "either", handle: deleteMcpServer },
   { method: "DELETE", path: "/v1/admin/model-providers/:provider", auth: "either", handle: deleteModelProvider },
+  { method: "POST", path: "/v1/admin/model-registry/lookup", auth: "either", handle: lookupRegistryModel },
+  { method: "POST", path: "/v1/admin/model-registry/:model/enable", auth: "either", handle: enableBuiltinModel },
+  { method: "GET", path: "/v1/admin/model-registry", auth: "either", handle: modelRegistry },
+  { method: "PUT", path: "/v1/admin/model-registry/:model", auth: "either", handle: modelRegistry },
+  { method: "DELETE", path: "/v1/admin/model-registry/:model", auth: "either", handle: modelRegistry },
   { method: "GET", path: "/v1/admin/custom-providers", auth: "either", handle: getCustomProviders },
   { method: "PUT", path: "/v1/admin/custom-providers/:provider", auth: "either", handle: putCustomProvider },
   { method: "DELETE", path: "/v1/admin/custom-providers/:provider", auth: "either", handle: deleteCustomProvider },
+  {
+    method: "POST",
+    path: "/v1/admin/scopes/:scope/auto-flagger/test",
+    auth: "either",
+    handle: testAutoFlagger,
+  },
   { method: "PUT", path: "/v1/admin/scopes/:scope/:resource", auth: "either", handle: putScopeConfig },
   { method: "GET", path: "/v1/admin/whoami", auth: "either", handle: whoami },
   { method: "GET", path: "/v1/admin/scopes", auth: "either", handle: listAdminScopes },
@@ -110,6 +125,8 @@ const routes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "GET", path: "/v1/admin/memory/scopes", auth: "either", handle: listMemoryScopes },
   { method: "GET", path: "/v1/admin/memory", auth: "either", handle: getAdminMemory },
   { method: "PUT", path: "/v1/admin/memory", auth: "either", handle: putAdminMemory },
+  { method: "GET", path: "/v1/admin/sandboxes/:scopeId", auth: "either", handle: manageSandboxResources },
+  { method: "POST", path: "/v1/admin/sandboxes/:scopeId", auth: "either", handle: manageSandboxResources },
   { method: "GET", path: "/v1/admin/sandbox-routes", auth: "either", handle: listSandboxRoutes },
   { method: "POST", path: "/v1/admin/sandbox-routes/:scopeId/migrate", auth: "either", handle: migrateSandboxScope },
   { method: "GET", path: "/v1/admin/users", auth: "either", handle: listUsers },
@@ -120,6 +137,8 @@ const routes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "POST", path: "/v1/admin/users/:principalId/reset", auth: "either", handle: resetUserToBrandNew },
   { method: "POST", path: "/v1/admin/grants", auth: "either", handle: createAdminGrant },
   { method: "DELETE", path: "/v1/admin/grants/:principalId", auth: "either", handle: revokeAdminGrant },
+  { method: "POST", path: "/v1/admin/external-users", auth: "either", handle: inviteExternalUser },
+  { method: "DELETE", path: "/v1/admin/external-users/:email", auth: "either", handle: revokeExternalUser },
   { method: "POST", path: "/v1/admin/impersonate/stop", auth: "either", handle: stopImpersonation },
   { method: "POST", path: "/v1/admin/impersonate", auth: "either", handle: startImpersonation },
 ];
