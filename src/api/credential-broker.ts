@@ -1,8 +1,11 @@
+import { isComposioHost } from "../credentials/keychain.ts";
+import { errMessage } from "../util/errors.ts";
 import type { CapabilityClaims } from "../auth/capability-token.ts";
 import type { ScopeId } from "../types.ts";
 import type { CredentialUsageSink } from "../admin/credential-usage-sink.ts";
 import {
   credentialInjectionError,
+  credentialRequestHeaders,
   type DecryptedServiceCredential,
   type ServiceCredentialReader,
 } from "../credentials/keychain.ts";
@@ -79,11 +82,45 @@ export function brokerPathAllowed(pathname: string, prefixes?: string[]): boolea
   );
 }
 
-export function brokerCredentialAuthHeader(rec: DecryptedServiceCredential): [string, string] {
-  const injHeader = rec.injection?.header || "Authorization";
-  const rawScheme = rec.injection?.scheme ?? "Bearer ";
-  const injScheme = rawScheme && !/\s$/.test(rawScheme) ? `${rawScheme} ` : rawScheme;
-  return [injHeader, `${injScheme}${rec.secret}`];
+export function brokerRequestHeaders(
+  rec: DecryptedServiceCredential,
+  caller: Record<string, string>,
+): Record<string, string> {
+  const injected = credentialRequestHeaders(rec);
+  const owned = new Set(Object.keys(injected).map((name) => name.toLowerCase()));
+  const headers: Record<string, string> = {};
+  for (const [name, value] of Object.entries(caller)) if (!owned.has(name.toLowerCase())) headers[name] = value;
+  return { ...headers, ...injected };
+}
+
+type CredentialGrant =
+  | { rec: DecryptedServiceCredential }
+  | { rec?: undefined; status: number; code: string; message: string; host: string };
+
+export async function grantedCredential(
+  claims: CapabilityClaims,
+  slug: string,
+  reader: ServiceCredentialReader,
+  orgScopeId: ScopeId,
+): Promise<CredentialGrant> {
+  if (!Array.isArray(claims.credentials) || !claims.credentials.includes(slug))
+    return { status: 403, code: "not_entitled", message: "this session is not entitled to that credential", host: "" };
+  const rec = await reader.getServiceCredentialSecret(orgScopeId, slug);
+  if (!rec || !rec.enabled || rec.delivery === "env")
+    return {
+      status: 404,
+      code: "credential_unavailable",
+      message: "credential not found or disabled",
+      host: rec?.host ?? "",
+    };
+  if (claims.deployment && !rec.deployments)
+    return {
+      status: 403,
+      code: "not_available_to_deployments",
+      message: "this credential is switched off for published apps",
+      host: rec.host,
+    };
+  return { rec };
 }
 
 export async function brokerCredentialCall(opts: {
@@ -123,16 +160,9 @@ export async function brokerCredentialCall(opts: {
   if (!slug || !rawUrl) {
     return { status: 400, json: { error: "bad_request", message: "credential (slug) and url are required" } };
   }
-  if (!Array.isArray(claims.credentials) || !claims.credentials.includes(slug)) {
-    return deny(403, "not_entitled", "this session is not entitled to that credential", "");
-  }
-  const rec: DecryptedServiceCredential | null = await reader.getServiceCredentialSecret(orgScopeId, slug);
-  if (!rec || !rec.enabled || rec.delivery === "env") {
-    return deny(404, "credential_unavailable", "credential not found or disabled", rec?.host ?? "");
-  }
-  if (claims.deployment && !rec.deployments) {
-    return deny(403, "not_available_to_deployments", "this credential is switched off for published apps", rec.host);
-  }
+  const grant = await grantedCredential(claims, slug, reader, orgScopeId);
+  if (!grant.rec) return deny(grant.status, grant.code, grant.message, grant.host);
+  const { rec } = grant;
   if (credentialInjectionError(rec.injection)) {
     return deny(503, "invalid_injection", "credential injection configuration is invalid", rec.host);
   }
@@ -152,6 +182,8 @@ export async function brokerCredentialCall(opts: {
   } catch {
     return deny(400, "bad_url", "url is not a valid absolute URL", rec.host);
   }
+  if (isComposioHost(parsed.hostname))
+    return deny(403, "backend_only", "Composio calls must use the identity-bound /v1/composio API", rec.host);
   if (parsed.protocol !== "https:") return deny(403, "scheme_not_allowed", "only https targets are allowed", rec.host);
   if (
     rec.injection?.actor
@@ -172,14 +204,31 @@ export async function brokerCredentialCall(opts: {
     return deny(403, "path_not_allowed", "url path is not in the credential's allowlist", rec.host);
   }
 
-  const headers: Record<string, string> = {};
+  if (rec.maxRequestsPerDay !== undefined) {
+    let admitted: boolean;
+    try {
+      if (!opts.usage) throw new Error("no usage ledger");
+      admitted = await opts.usage.admitDailyCall(slug, rec.maxRequestsPerDay);
+    } catch (err) {
+      console.error(`[credential-broker] daily cap check failed for ${slug}:`, errMessage(err));
+      return deny(503, "daily_cap_unavailable", "the credential's daily request cap could not be checked", rec.host);
+    }
+    if (!admitted)
+      return deny(
+        429,
+        "daily_cap_reached",
+        `this credential has used its ${rec.maxRequestsPerDay} requests for today (UTC); it resets at 00:00 UTC`,
+        rec.host,
+      );
+  }
+
+  const caller: Record<string, string> = {};
   if (body.headers && typeof body.headers === "object") {
     for (const [k, v] of Object.entries(body.headers as Record<string, unknown>)) {
-      if (typeof v === "string" && ALLOWED_CALLER_HEADERS.has(k.toLowerCase())) headers[k] = v;
+      if (typeof v === "string" && ALLOWED_CALLER_HEADERS.has(k.toLowerCase())) caller[k] = v;
     }
   }
-  const [injHeader, injValue] = brokerCredentialAuthHeader(rec);
-  headers[injHeader] = injValue;
+  const headers = brokerRequestHeaders(rec, caller);
   if (rec.injection?.actor) headers["x-qm-actor"] = claims.actorId;
 
   let resp: BrokerFetchResponse;

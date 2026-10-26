@@ -1,8 +1,8 @@
-import type { Cron, CronSchedule, Destination } from "../types.ts";
+import { actsAsScope, type Cron, type CronSchedule, type Destination } from "../types.ts";
 import { principalDestination } from "../reach/reach.ts";
 import { personKeys } from "../directory/person.ts";
-import { errMessage } from "../util/errors.ts";
-import { createHash } from "node:crypto";
+import { errMessage, reportFailure, reportFailureAs } from "../util/errors.ts";
+import { randomUUID } from "node:crypto";
 
 export interface CronEditDetail {
   schedule?: CronSchedule;
@@ -83,22 +83,18 @@ export interface CronEditNoticeSink {
 
 export async function notifyOwnerOfCronEdit(
   sink: CronEditNoticeSink,
-  args: { cron: Cron; editorId: string; changeSummary: string[]; editFingerprint: string; detail?: CronEditDetail },
+  args: { cron: Cron; editorId: string; changeSummary: string[]; detail?: CronEditDetail },
   onError?: (message: string) => void,
 ): Promise<void> {
   const { cron } = args;
-  if (cron.runAs !== "scopeShared") return;
+  if (actsAsScope(cron.owner, cron.ownerScopeId)) return;
   try {
     const [editor, owner] = await Promise.all([
-      sink.directoryMember(args.editorId).catch(() => null),
-      sink.directoryMember(cron.owner).catch(() => null),
+      sink.directoryMember(args.editorId).catch(reportFailureAs("cron edit notice: editor lookup", null)),
+      sink.directoryMember(cron.owner).catch(reportFailureAs("cron edit notice: owner lookup", null)),
     ]);
     const ownerKeys = personKeys(owner, cron.owner);
     if ([...personKeys(editor, args.editorId)].some((k) => ownerKeys.has(k))) return;
-    const editKey = createHash("sha256")
-      .update(`${cron.id}:${args.editorId}:${args.editFingerprint}`)
-      .digest("hex")
-      .slice(0, 16);
     const url = sink.cronAdminUrl(cron);
     const label = cron.title ?? "shared";
     let ref = "shared";
@@ -107,7 +103,7 @@ export async function notifyOwnerOfCronEdit(
     const [kind, scopeRef] = String(cron.ownerScopeId).split(":", 2) as [string, string | undefined];
     const place =
       kind === "channel" && scopeRef && sink.channelName
-        ? await sink.channelName(scopeRef).catch(() => undefined)
+        ? await sink.channelName(scopeRef).catch(reportFailureAs("cron edit notice: channel name lookup", undefined))
         : undefined;
     await sink.enqueueDelivery({
       destination: principalDestination(cron.owner, args.editorId),
@@ -118,9 +114,10 @@ export async function notifyOwnerOfCronEdit(
         changes: args.changeSummary,
         ...(args.detail ? { detail: args.detail } : {}),
       }),
-      idempotencyKey: `cron-edit-notice:${cron.id}:${editKey}`,
+      idempotencyKey: `cron-edit-notice:${cron.id}:${randomUUID()}`,
     });
   } catch (e) {
-    (onError ?? ((m) => console.warn("[cron-edit-notice]", m)))(errMessage(e));
+    if (onError) onError(errMessage(e));
+    else reportFailure("cron edit notice", e);
   }
 }

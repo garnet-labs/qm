@@ -1,6 +1,5 @@
 import { createSweeper, type Sweeper } from "../util/sweeper.ts";
 import type { LeaderLease } from "../persistence/leader-lease.ts";
-import { createNoopLeaderLease } from "../persistence/leader-lease.ts";
 
 const SWEEP_LEASE_KEY = "wake:sweep";
 
@@ -11,17 +10,17 @@ export interface SweepSource {
 
 export interface WakeSweepOptions {
   intervalMs: number;
-  leaderLease?: LeaderLease;
+  leaderLease: LeaderLease;
 }
 
 export interface WakeSweep {
   start(): void;
-  stop(): void;
+  stop(): Promise<void>;
   sweep(): Promise<{ swept: number; fresh: number }>;
 }
 
 export function createWakeSweep(source: SweepSource, opts: WakeSweepOptions): WakeSweep {
-  const leaderLease = opts.leaderLease ?? createNoopLeaderLease();
+  const leaderLease = opts.leaderLease;
 
   const sweep = async (): Promise<{ swept: number; fresh: number }> => {
     const targets = await source.engagedSessions();

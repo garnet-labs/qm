@@ -1,11 +1,12 @@
+import { cleanupFailedProvision } from "./sandbox.ts";
 import { DeleteObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { orgId as configOrgId } from "../config.ts";
 import type { WorkspaceLayer } from "../types.ts";
 import type { WorkspaceStore } from "../workspace/workspace-store.ts";
-import { createNoopAdvisoryLock, type AdvisoryLock } from "../persistence/advisory-lock.ts";
-import { createMemoryMap, type DurableMap } from "../persistence/durable-map.ts";
+import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
+import type { DurableMap } from "../persistence/durable-map.ts";
 import { createKeyedQueue } from "../util/async.ts";
-import { scopeStorageKey } from "../util/scope-storage-key.ts";
+import { scopeStorageKey } from "../../cli/src/scope-storage-key.ts";
 import { swallowAs, errMessage } from "../util/errors.ts";
 import { shq } from "../util/shell.ts";
 import { nonInteractiveShellPrefix } from "./sandbox-env.ts";
@@ -82,8 +83,8 @@ export interface AwsSandboxOptions extends BlobStagingOptions {
   cpus?: number;
   memoryMb?: number;
   diskGb?: number;
-  store?: DurableMap<StoredMicrovm>;
-  advisoryLock?: AdvisoryLock;
+  store: DurableMap<StoredMicrovm>;
+  advisoryLock: AdvisoryLock;
   extraTools?: string[];
   credentialPaths?: CredentialPathSpec[];
   onError?: (e: { category: string; code: string; message: string; scopeLabel?: string }) => void;
@@ -108,8 +109,8 @@ export function createAwsSandbox(workspace: WorkspaceStore, opts: AwsSandboxOpti
     });
   const s3: Pick<S3Client, "send"> =
     opts.s3 ?? new S3Client({ region, ...(opts.profile ? { profile: opts.profile } : {}) });
-  const store = opts.store ?? createMemoryMap<StoredMicrovm>();
-  const advisoryLock = opts.advisoryLock ?? createNoopAdvisoryLock();
+  const store = opts.store;
+  const advisoryLock = opts.advisoryLock;
   const provisionQueue = createKeyedQueue<string>();
   const withScopeLock = <T>(scope: string, run: () => Promise<T>): Promise<T> =>
     provisionQueue(scope, () => advisoryLock.withLock(`aws-provision:${scope}`, run));
@@ -170,8 +171,8 @@ export function createAwsSandbox(workspace: WorkspaceStore, opts: AwsSandboxOpti
     return Buffer.from((JSON.parse(res.text) as { b64: string }).b64, "base64");
   }
 
-  async function ensureRunning(id: string): Promise<void> {
-    await client.ensureRunning(id, await resolveEndpoint(id));
+  async function ensureRunning(id: string, observed?: Awaited<ReturnType<AwsMicrovmApi["getMicrovm"]>>): Promise<void> {
+    await client.ensureRunning(id, await resolveEndpoint(id), observed);
   }
 
   const homeSnapshots = createHomeSnapshotOps<string>({
@@ -260,7 +261,7 @@ export function createAwsSandbox(workspace: WorkspaceStore, opts: AwsSandboxOpti
         if (alive && !stale) {
           endpointById.set(stored.microvmId, stored.endpoint);
           scopeByMicrovm.set(stored.microvmId, scope);
-          await ensureRunning(stored.microvmId);
+          await ensureRunning(stored.microvmId, desc);
           return { id: stored.microvmId, endpoint: stored.endpoint, coldStart: false };
         }
         if (alive && stale) {
@@ -306,7 +307,7 @@ export function createAwsSandbox(workspace: WorkspaceStore, opts: AwsSandboxOpti
         const desc = await api.tryGetMicrovm(existing.microvmId);
         if (desc && desc.state !== "TERMINATED" && desc.state !== "TERMINATING") {
           endpointById.set(existing.microvmId, existing.endpoint);
-          await ensureRunning(existing.microvmId);
+          await ensureRunning(existing.microvmId, desc);
           return { id: existing.microvmId, endpoint: existing.endpoint, coldStart: false };
         }
       }
@@ -320,6 +321,7 @@ export function createAwsSandbox(workspace: WorkspaceStore, opts: AwsSandboxOpti
     backend: "aws-microvm",
     writablePersistence: "snapshot_to_workspace",
     processSessions: true,
+    parksOnTeardown: true,
     egressEnforcement: "none",
     spec: {
       os: "Amazon Linux 2023, glibc",
@@ -423,16 +425,6 @@ export function createAwsSandbox(workspace: WorkspaceStore, opts: AwsSandboxOpti
       endpointById.set(id, body.endpoint);
       const coldStart = body.coldStart;
 
-      const prepared = await execRaw(
-        id,
-        `mkdir -p ${shq(WORKSPACE_DIR)} && ${ephemeralCredLinkScript(HOME_DIR, credentialPaths)}`,
-        PREP_TIMEOUT_SEC,
-      );
-      if (prepared.code !== 0)
-        throw new Error(
-          `AWS sandbox credential setup failed: ${execFailureDetail(prepared, PREP_TIMEOUT_SEC).slice(0, 200)}`,
-        );
-
       const env = provOpts?.env && Object.keys(provOpts.env).length ? provOpts.env : undefined;
       const handle: SandboxHandle = {
         id,
@@ -443,20 +435,35 @@ export function createAwsSandbox(workspace: WorkspaceStore, opts: AwsSandboxOpti
         ...(env ? { env } : {}),
       };
 
-      await materializeRoLayers(
-        workspace,
-        layers,
-        handle,
-        {
-          readFile: (h, rel) => sandbox.readFile(h, rel),
-          writeFileBytes: (h, rel, data) => sandbox.writeFileBytes(h, rel, data),
-          exec: (script, t) => execRaw(id, script, t),
-        },
-        { manifest: RO_LAYERS_MANIFEST, tar: RO_LAYERS_TAR, label: "aws" },
-      );
-
       activeByMicrovm.set(id, (activeByMicrovm.get(id) ?? 0) + 1);
-      return handle;
+      try {
+        const prepared = await execRaw(
+          id,
+          `mkdir -p ${shq(WORKSPACE_DIR)} && ${ephemeralCredLinkScript(HOME_DIR, credentialPaths)}`,
+          PREP_TIMEOUT_SEC,
+        );
+        if (prepared.code !== 0)
+          throw new Error(
+            `AWS sandbox credential setup failed: ${execFailureDetail(prepared, PREP_TIMEOUT_SEC).slice(0, 200)}`,
+          );
+
+        await materializeRoLayers(
+          workspace,
+          layers,
+          handle,
+          {
+            readFile: (h, rel) => sandbox.readFile(h, rel),
+            writeFileBytes: (h, rel, data) => sandbox.writeFileBytes(h, rel, data),
+            exec: (script, t) => execRaw(id, script, t),
+          },
+          { manifest: RO_LAYERS_MANIFEST, tar: RO_LAYERS_TAR, label: "aws" },
+        );
+
+        return handle;
+      } catch (error) {
+        await cleanupFailedProvision(sandbox, handle, error);
+        throw error;
+      }
     },
 
     async run(handle, command, execOpts?: ExecOptions): Promise<ExecResult> {

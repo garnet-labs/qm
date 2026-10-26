@@ -2,7 +2,7 @@ import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { Agent } from "@earendil-works/pi-agent-core";
-import { runApprovalTurn } from "../src/core-bridge.ts";
+import { resolveApproval, runApprovalTurn } from "../src/core-bridge.ts";
 
 const MODEL = { id: "m", api: "anthropic", provider: "anthropic" } as unknown as Model<Api>;
 
@@ -84,7 +84,11 @@ test("a completed approval resume resolves quietly", async () => {
 });
 
 test("a denied approval's refusal is a clean outcome, not an error", async () => {
-  stubApprovalResolve({ status: "refused", reason: "approval denied for git push --force" });
+  stubApprovalResolve({
+    status: "refused",
+    refusalKind: "approval_denied",
+    reason: "approval denied for git push --force",
+  });
   await runApprovalTurn(fakeAgent(), { requestId: "a-1", approved: false }, undefined);
 });
 
@@ -104,6 +108,11 @@ test("a missing or expired approval record surfaces a visible expiry message", a
     runApprovalTurn(fakeAgent(), { requestId: "a-1", approved: true }, undefined),
     /no longer available/,
   );
+});
+
+test("deciding an approval that was already decided resolves quietly with nothing to follow", async () => {
+  stubResolveResponse({ error: "not_found" }, 404);
+  assert.equal(await resolveApproval({ requestId: "a-1", approved: false }), null);
 });
 
 test("a synchronous core refusal surfaces its reason, not a bare HTTP status", async () => {

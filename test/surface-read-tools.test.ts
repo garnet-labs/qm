@@ -5,8 +5,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildApp } from "../src/wiring.ts";
-import type { TurnRequest } from "../src/types.ts";
+import { buildApp } from "./support/build-app.ts";
+import type { SurfaceContextResult, TurnRequest } from "../src/types.ts";
 import { testConfig } from "./support/test-config.ts";
 import { createAgentTools, type ToolContextRef } from "../src/harness/agent-tools.ts";
 
@@ -25,19 +25,19 @@ function mention(text: string, channel: string, root: string): TurnRequest {
     surface: "slack",
     actor,
     conversation: { kind: "channel", threadRef: `ch:${channel}:${root}`, channelRef: channel, audience: [actor, mate] },
-    deliveryTarget: `slack:${channel}:${root}`,
+    deliveryTarget: `${channel}:${root}`,
     text,
     liveActor: true,
     async: true,
   };
 }
 
-function startFulfiller(app: any, messages: unknown[]) {
+function startFulfiller(app: any, messages: unknown[], extra: Partial<SurfaceContextResult> = {}) {
   let running = true;
   const loop = (async () => {
     while (running) {
       const pending = await app.pendingContextRequests("slack");
-      for (const r of pending) await app.fulfillContextRequest(r.id, { result: { messages } });
+      for (const r of pending) await app.fulfillContextRequest(r.id, { result: { messages, ...extra } });
       await sleep(20);
     }
   })();
@@ -61,18 +61,49 @@ async function subToolResult(built: any, root: string, tool: string, deadlineMs 
   throw new Error(`no assistant reply for ${tool}`);
 }
 
+test("read_thread leaves an omitted limit to the surface provider", async () => {
+  const built = freshApp();
+  built.runtime.start();
+  let running = true;
+  const queries: any[] = [];
+  const loop = (async () => {
+    while (running) {
+      for (const request of await built.app.pendingContextRequests("slack")) {
+        queries.push(request.query);
+        await built.app.fulfillContextRequest(request.id, { result: { messages: [] } });
+      }
+      await sleep(20);
+    }
+  })();
+  try {
+    await built.app.turn(mention("!read_thread", "C10", "1000.1"));
+    assert.match(await subToolResult(built, "C10:1000.1", "read_thread"), /read 0 message/);
+    assert.equal(queries.length, 1);
+    assert.equal(queries[0].count, undefined);
+  } finally {
+    running = false;
+    await loop;
+    await built.runtime.stop();
+  }
+});
+
 test("whats_new returns POINTERS (counts of new-here + other active threads), never message prose", async () => {
   const built = freshApp();
   built.runtime.start();
   const root = "C10:1000.1";
-  const stop = startFulfiller(built.app, [
-    { ts: "1000.1", author: "Ann", text: "the anchor message" },
-    { ts: "1000.2", author: "Bob", text: "here 1", threadTs: "1000.1" },
-    { ts: "1000.3", author: "Cat", text: "here 2", threadTs: "1000.1" },
-    { ts: "2000.2", author: "Dee", text: "other 1", threadTs: "2000.1" },
-    { ts: "2000.3", author: "Eve", text: "other 2", threadTs: "2000.1" },
-    { ts: "3000.1", author: "Fay", text: "a top-level channel post" },
-  ]);
+  const stop = startFulfiller(
+    built.app,
+    [
+      { ts: "1000.1", author: "Ann", text: "the anchor message" },
+      { ts: "1000.2", author: "Bob", text: "here 1", threadTs: "1000.1" },
+      { ts: "1000.3", author: "you", text: "here 2 from a person named you", threadTs: "1000.1" },
+      { ts: "1000.4", author: "you", text: "the agent's own reply", threadTs: "1000.1" },
+      { ts: "2000.2", author: "Dee", text: "other 1", threadTs: "2000.1" },
+      { ts: "2000.3", author: "Eve", text: "other 2", threadTs: "2000.1" },
+      { ts: "3000.1", author: "Fay", text: "a top-level channel post" },
+    ],
+    { selfTs: ["1000.4"] },
+  );
   try {
     await built.app.turn(mention("!whats_new", "C10", "1000.1"));
     const reply = await subToolResult(built, root, "whats_new");
@@ -83,21 +114,22 @@ test("whats_new returns POINTERS (counts of new-here + other active threads), ne
   }
 });
 
-test("search falls back to a live scan when no cache is wired, returning author+snippet pointers", async () => {
+test("enabled mirror search uses the current channel and returns author/snippet pointers without a live pull", async () => {
   const built = freshApp();
   built.runtime.start();
   const root = "C11:1100.1";
-  const stop = startFulfiller(built.app, [
-    { ts: "1100.2", author: "Bob", text: "the budget doc is in shared/q2.md" },
-    { ts: "1100.3", author: "Cat", text: "unrelated chatter" },
+  await built.surfaceCache.ingest([
+    { container: "C11", ts: "1100.2", authorName: "Bob", text: "the budget doc is in shared/q2.md" },
+    { container: "C11", ts: "1100.3", authorName: "Cat", text: "unrelated chatter" },
+    { container: "CSECRET", ts: "1100.4", authorName: "Eve", text: "the secret budget" },
   ]);
   try {
     await built.app.turn(mention("!search budget", "C11", "1100.1"));
     const reply = await subToolResult(built, root, "search");
-    assert.match(reply, /search\(live\) 1 hit/);
+    assert.match(reply, /search\(cache\) 1 hit/);
+    assert.deepEqual(await built.app.pendingContextRequests("slack"), []);
     assert.match(reply, /first=Bob:the budget doc/);
   } finally {
-    await stop();
     await built.runtime.stop();
   }
 });
@@ -226,7 +258,7 @@ test("search/whats_new surface the mirror coverage window end-to-end once the mi
   await built.app.ingestSurfaceEvents(
     [
       {
-        container: "slack:C30:3000.1",
+        container: "C30",
         ts: "3000.1",
         authorId: "U2",
         authorName: "Bob",
@@ -241,8 +273,8 @@ test("search/whats_new surface the mirror coverage window end-to-end once the mi
     await built.app.turn(mention("!search budget", "C30", "3000.1"));
     const searchReply = await subToolResult(built, root, "search");
     assert.match(searchReply, /coverage=\d{4}-\d\d-\d\d/, "the search reply carries the mirror coverage floor");
-    await built.app.turn(mention("!whats_new", "C30", "3000.1"));
-    const wnReply = await subToolResult(built, root, "whats_new");
+    await built.app.turn(mention("!whats_new", "C30", "3000.2"));
+    const wnReply = await subToolResult(built, "C30:3000.2", "whats_new");
     assert.match(wnReply, /coverage=\d{4}-\d\d-\d\d/, "whats_new carries the mirror coverage floor");
   } finally {
     await stop();
@@ -259,7 +291,7 @@ test("search source=slack routes through the live-search seam; an unconfigured p
     while (running) {
       for (const r of await built.app.pendingContextRequests("slack")) {
         const body = (r as any).query?.searchAll
-          ? { messages: [], note: "live-search-unconfigured" }
+          ? { messages: [], liveSearch: "unconfigured" as const }
           : { messages: [] };
         await built.app.fulfillContextRequest(r.id, { result: body });
       }
@@ -287,7 +319,7 @@ test("search source=slack with no connected login for the asker tells the agent 
       for (const r of await built.app.pendingContextRequests("slack")) {
         const q = (r as any).query ?? {};
         const body =
-          q.searchAll && !q.viewerToken ? { messages: [], note: "live-search-unconnected" } : { messages: [] };
+          q.searchAll && !q.viewerToken ? { messages: [], liveSearch: "unconnected" as const } : { messages: [] };
         await built.app.fulfillContextRequest(r.id, { result: body });
       }
       await sleep(20);
@@ -322,5 +354,31 @@ test("set_standing_order writes the channel policy the ambient judge reads (reco
     assert.match(got, /piratey/);
   } finally {
     await built.runtime.stop();
+  }
+});
+
+test("successful Slack reads preserve partial-context and rate-limit guidance in model tool results", async () => {
+  const guidance =
+    "Some context is missing. Slack history is rate-limited; retry in 60 seconds or set up your own Slack app at https://qm.test/admin/?setup=slack";
+  const tool = surfaceTool({
+    async readThread() {
+      return { ok: true, messages: [{ text: "available thread context" }], message: guidance };
+    },
+    async whatsNew() {
+      return { ok: true, hereNew: 2, activeSubConversations: 1, message: guidance };
+    },
+    async search() {
+      return { ok: true, hits: [{ snippet: "available search hit" }], source: "cache", message: guidance };
+    },
+  });
+  for (const [action, expected] of [
+    ["read_thread", "available thread context"],
+    ["whats_new", "2 new in this thread"],
+    ["search", "available search hit"],
+  ]) {
+    const result = await tool.execute(`partial-${action}`, { action, query: "available" });
+    const output = result.content.map((item: { text?: string }) => item.text ?? "").join("\n");
+    assert.ok(output.includes(expected!), action);
+    assert.ok(output.includes(guidance), action);
   }
 });

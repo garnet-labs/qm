@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type QmConfig } from "../src/config.ts";
-import { FLY_TEMPLATE_ENV_DEFAULTS } from "../src/target-env-defaults.ts";
+import { ENV_DEFAULTS } from "../src/target-env-defaults.ts";
 import {
   computedSecrets,
   serviceSecretValue,
@@ -154,8 +154,6 @@ test('"sandbox" is a reserved name — a plugin may not shadow the sandbox pseud
 test("model credentials are optional at deploy time because Admin onboarding can configure them", () => {
   const fly = makeConfig({ target: "fly" });
   assert.equal(secretByName(fly, "ANTHROPIC_API_KEY").required, false);
-  const flyMock = makeConfig({ target: "fly", env: { core: { HARNESS: "mock" } } });
-  assert.equal(secretByName(flyMock, "ANTHROPIC_API_KEY").required, false);
   const docker = makeConfig();
   assert.equal(secretByName(docker, "ANTHROPIC_API_KEY").required, false);
 });
@@ -213,15 +211,7 @@ test("naming a base model provider makes that provider's key a required deployme
 test("the providers a deployment did not select stay optional", () => {
   const anthropic = makeConfig({ modelProvider: "anthropic" });
   assert.equal(secretByName(anthropic, "OPENROUTER_API_KEY").required, false);
-  // OPENAI_API_KEY keeps its own Codex rule, so it is absent rather than optional here.
-  assert.ok(!computedSecrets(anthropic).some((secret) => secret.name === "OPENAI_API_KEY"));
-});
-
-test("an OpenAI base model and the Codex harness agree on one required key", () => {
-  const both = makeConfig({ modelProvider: "openai", env: { core: { HARNESS: "codex" } } });
-  const matches = computedSecrets(both).filter((secret) => secret.name === "OPENAI_API_KEY");
-  assert.equal(matches.length, 1, "overlapping rules collapse to a single secret");
-  assert.equal(matches[0]!.required, true);
+  assert.equal(secretByName(anthropic, "OPENAI_API_KEY").required, false);
 });
 
 test("omitting modelProvider preserves the pre-existing deferred-to-Admin behavior", () => {
@@ -250,32 +240,25 @@ test("AWS public app domains require and route their gate secret to core", () =>
   assert.ok(renderEnvExample(enabled).includes("AWS_DEPLOY_GATE_SECRET="));
 });
 
-test("real harnesses require and route the sandbox-reachable PUBLIC_API_URL to core", () => {
-  for (const harness of ["pi", "opencode"]) {
-    const real = makeConfig({ env: { core: { HARNESS: harness } } });
-    const publicApi = secretByName(real, "PUBLIC_API_URL");
-    assert.equal(publicApi.required, true);
-    assert.deepEqual(runtimeSecretNames("core", publicApi), ["PUBLIC_API_URL"]);
-    assert.ok(renderEnvExample(real).includes("PUBLIC_API_URL="));
-  }
-  assert.ok(
-    !computedSecrets(makeConfig({ env: { core: { HARNESS: "mock" } } })).some((s) => s.name === "PUBLIC_API_URL"),
-  );
+test("the default harness requires and routes the sandbox-reachable PUBLIC_API_URL to core", () => {
+  const real = makeConfig();
+  const publicApi = secretByName(real, "PUBLIC_API_URL");
+  assert.equal(publicApi.required, true);
+  assert.deepEqual(runtimeSecretNames("core", publicApi), ["PUBLIC_API_URL"]);
+  assert.ok(renderEnvExample(real).includes("PUBLIC_API_URL="));
 });
 
-test("FLY_TEMPLATE_ENV_DEFAULTS stays in sync with deploy/core/fly.toml", () => {
+test("ENV_DEFAULTS stays in sync with the packaged core fly template", () => {
   const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-  const toml = readFileSync(join(root, "deploy", "core", "fly.toml"), "utf8");
-  const packaged = readFileSync(join(root, "cli", "templates", "fly", "core.toml"), "utf8");
-  for (const [name, value] of Object.entries(FLY_TEMPLATE_ENV_DEFAULTS.core ?? {})) {
+  const toml = readFileSync(join(root, "cli", "templates", "fly", "core.toml"), "utf8");
+  for (const [name, value] of Object.entries(ENV_DEFAULTS.core ?? {})) {
     assert.match(
       toml,
       new RegExp(`^\\s*${name}\\s*=\\s*"${value}"`, "m"),
-      `deploy/core/fly.toml sets ${name}="${value}"`,
+      `cli/templates/fly/core.toml sets ${name}="${value}"`,
     );
   }
   assert.doesNotMatch(toml, /^\s*DEPLOY_PROVIDER\s*=/m);
-  assert.doesNotMatch(packaged, /^\s*DEPLOY_PROVIDER\s*=/m);
 });
 
 test("config secretEnv extras enter the computed set as required operator secrets, virtual services folding onto core", () => {
@@ -337,6 +320,18 @@ test("PORTAL_IDENTITY_SECRET reaches every service that signs or verifies a port
   );
 });
 
+test("INBOX_USERS is one optional secret shared by web-ui and admin", () => {
+  const config = makeConfig({ services: ["core", "web-ui", "admin"] });
+  const allowlist = secretByName(config, "INBOX_USERS");
+  assert.equal(allowlist.required, false);
+  assert.deepEqual(allowlist.services, ["admin", "web-ui"]);
+  assert.deepEqual([...secretDestinations(allowlist).keys()], ["web-ui"]);
+  assert.deepEqual(runtimeSecretNames("web-ui", allowlist), ["INBOX_USERS"]);
+  assert.deepEqual(runtimeSecretNames("admin", allowlist), ["INBOX_USERS"]);
+  assert.match(renderEnvExample(config), /Inbox, Calendar, and Design System\. \(admin, web-ui\)/);
+  assert.match(renderEnvExample(config), /^# INBOX_USERS=\s{2}# optional$/m);
+});
+
 test("the invitation-email pair reaches core as optional secrets on every topology", () => {
   for (const name of ["RESEND_API_KEY", "AUTH_EMAIL_FROM"]) {
     const alone = secretByName(makeConfig(), name);
@@ -387,5 +382,70 @@ test("combined auth rejects two source secrets for the same environment name", (
   assert.throws(
     () => serviceSecretValue(config, "auth", "RESEND_API_KEY", new Map()),
     /would receive env RESEND_API_KEY from both/,
+  );
+});
+
+test("the retired SANDBOX_SCOPE_BACKENDS map no longer requires provider credentials", () => {
+  const config = makeConfig({
+    env: {
+      core: { SANDBOX_BACKEND: "sprites", SANDBOX_SCOPE_BACKENDS: '{"personal":"modal","channel":"superserve"}' },
+    },
+  });
+  const required = computedSecrets(config)
+    .filter((secret) => secret.required)
+    .map((secret) => secret.name);
+  assert.ok(required.includes("SPRITES_TOKEN"));
+  for (const name of ["MODAL_TOKEN_ID", "SUPERSERVE_API_KEY"]) assert.ok(!required.includes(name), name);
+});
+
+test("shared Fly publishing requires private peers only when selected", () => {
+  for (const provider of ["fly", "aws"]) {
+    for (const shared of [false, true]) {
+      const config = makeConfig({
+        target: "aws",
+        env: {
+          core: {
+            DEPLOY_PROVIDER: provider,
+            ...(shared ? { FLY_DEPLOY_SHARED_APP_NAME: "acme-apps" } : {}),
+          },
+        },
+      });
+      const peer = computedSecrets(config).find((secret) => secret.name === "FLY_DEPLOY_WIREGUARD_PEERS");
+      assert.equal(Boolean(peer?.required), provider === "fly" && shared);
+      if (provider === "fly" && shared) assert.doesNotMatch(renderEnvExample(config), /tokens create org/);
+    }
+  }
+});
+
+test("deployment control credentials are conditional and cannot be delivered to plugins or sandboxes", () => {
+  assert.equal(
+    computedSecrets(makeConfig()).some((secret) => secret.name === "DEPLOYMENT_CONTROL_SECRET"),
+    false,
+  );
+  const aws = { backgroundWorkControl: true } as NonNullable<QmConfig["aws"]>;
+  const config = makeConfig({ target: "aws", aws });
+  const control = secretByName(config, "DEPLOYMENT_CONTROL_SECRET");
+  assert.equal(control.required, true);
+  assert.deepEqual(control.services, ["core"]);
+  assert.throws(
+    () =>
+      computedSecrets({
+        ...config,
+        plugins: [{ name: "external", secrets: [{ name: "DEPLOYMENT_CONTROL_SECRET" }] }],
+      }),
+    /only to core/,
+  );
+  assert.throws(
+    () => computedSecrets({ ...config, sandbox: { app: "sandbox", secretEnv: ["DEPLOYMENT_CONTROL_SECRET"] } }),
+    /only to core/,
+  );
+  assert.throws(
+    () =>
+      computedSecrets({
+        ...config,
+        services: ["core", "portal"],
+        secretEnv: { portal: { TOKEN: "DEPLOYMENT_CONTROL_SECRET" } },
+      }),
+    /only to core/,
   );
 });

@@ -1,11 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import {
-  renderComputerBlock,
-  renderResidentLoginsBlock,
-  renderConnectedAppsBlock,
-} from "../src/core/environment-facts.ts";
-import { RESIDENT_AUTH_CONNECTORS, type ScopeLivenessRecord } from "../src/credentials/resident-auth.ts";
+import { renderComputerBlock, renderConnectedAppsBlock } from "../src/core/environment-facts.ts";
 import type { ConnectorStatusRecord } from "../src/credentials/connector-status.ts";
 import type { AgentComputerSpec } from "../src/sandbox/sandbox.ts";
 
@@ -36,8 +31,6 @@ test("computer block: renders OS/size/runtimes/tools and the not-installed list"
   assert.match(out, /Installed CLIs:.*aws/);
   assert.match(out, /NOT installed.*gh/);
   assert.match(out, /`\/root\/workspace` \(read-write\)/);
-  assert.match(out, /publish ships files in your workspace/);
-  assert.match(out, /Recovery depends on the sandbox provider/);
   assert.match(out, /\$HOME` \(`\/root`\) holds native logins/);
   assert.match(out, /`\.\/global` \(read-only\)/);
   assert.match(out, /team-\*.*2 mounted/);
@@ -59,38 +52,12 @@ test("computer block: partial spec omits the fields it lacks (no empty fragments
   assert.doesNotMatch(out, /NOT installed/);
 });
 
-test("logins block: null record renders nothing (first turn, no probe yet)", () => {
-  assert.equal(renderResidentLoginsBlock(null, RESIDENT_AUTH_CONNECTORS), "");
-});
-
-test("logins block: all-absent record renders nothing (no tools present)", () => {
-  const record: ScopeLivenessRecord = {
-    scopeId: "personal:U1",
-    checkedAt: 1,
-    connectors: Object.fromEntries(RESIDENT_AUTH_CONNECTORS.map((c) => [c.id, "absent" as const])),
-  };
-  assert.equal(renderResidentLoginsBlock(record, RESIDENT_AUTH_CONNECTORS), "");
-});
-
-test("logins block: shows active with a check, inactive with its exact reauth command, omits absent", () => {
-  const record: ScopeLivenessRecord = {
-    scopeId: "personal:U1",
-    checkedAt: 1,
-    connectors: { gh: "active", glab: "inactive", gcloud: "absent" },
-  };
-  const out = renderResidentLoginsBlock(record, RESIDENT_AUTH_CONNECTORS);
-  assert.match(out, /## Your logins/);
-  assert.match(out, /GitHub — ✓ signed in/);
-  assert.match(out, /GitLab — ✗ not signed in.*`glab auth login`/);
-  assert.doesNotMatch(out, /Google Cloud/);
-  assert.doesNotMatch(out, /AWS/);
-});
-
 test("connected-apps block: lists only admin-configured providers and the exact connection URL", () => {
   const url = "https://qm.example/keychain";
   const unavailable = renderConnectedAppsBlock(null, [], url);
-  assert.match(unavailable, /No app connections are enabled by the admin/);
-  assert.match(unavailable, /Do not suggest or offer any app connection/);
+  assert.match(unavailable, /No direct OAuth app connections are configured/);
+  assert.match(unavailable, /does not describe app access through separately authorized credentials/);
+  assert.match(unavailable, /Connection page: https:\/\/qm\.example\/keychain/);
 
   const none: ConnectorStatusRecord = { principalId: "U1", checkedAt: 1, providers: { google: { connected: false } } };
   const available = renderConnectedAppsBlock(none, ["google"], url);
@@ -128,4 +95,40 @@ test("connected-apps block: reconnect-needed apps are named separately", () => {
   assert.match(out, /Connected: Google/);
   assert.match(out, /Needs reconnect: GitHub \(refresh failed: revoked by provider\)/);
   assert.match(out, /Do not use these apps until the user reconnects them/);
+});
+
+test("connected-apps block is canonical across provider and status insertion order", () => {
+  const providers = {
+    slack: { connected: true },
+    google: { connected: true },
+    github: { connected: true, needsReconnect: true },
+    dropbox: { connected: true, needsReconnect: true },
+  };
+  const record = { principalId: "U1", checkedAt: 1, providers };
+  const available = ["slack", "google", "github", "dropbox", "linear", "notion"];
+  const reversed = { ...record, providers: Object.fromEntries(Object.entries(providers).reverse()) };
+  assert.equal(
+    renderConnectedAppsBlock(record, available),
+    renderConnectedAppsBlock(reversed, [...available].reverse()),
+  );
+  assert.deepEqual(Object.keys(providers), ["slack", "google", "github", "dropbox"]);
+});
+
+test("connected-apps block: names linked per-user MCP sign-ins by label", () => {
+  const rec: ConnectorStatusRecord = {
+    principalId: "U1",
+    checkedAt: 1,
+    providers: {
+      google: { connected: true },
+      orders: { connected: true, mcpLabel: "Orders" },
+    },
+  };
+  const out = renderConnectedAppsBlock(rec, ["google"], "https://qm.example/keychain");
+  assert.match(out, /Connected: Google, Orders\./);
+  assert.doesNotMatch(out, /Available to connect: .*Orders/);
+
+  const mcpOnly = renderConnectedAppsBlock(rec, [], "https://qm.example/keychain");
+  assert.match(mcpOnly, /No direct OAuth app connections are configured/);
+  assert.match(mcpOnly, /Connected: Orders\./);
+  assert.doesNotMatch(mcpOnly, /Google/);
 });

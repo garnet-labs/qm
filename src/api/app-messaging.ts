@@ -3,7 +3,7 @@ import { orgId as orgIdOf } from "../config.ts";
 import { parseScopeId, scopeId } from "../types.ts";
 import { personKey, personKeys, samePersonInDirectory, samePersonMatcher } from "../directory/person.ts";
 import type { Destination, SurfaceContextRequest, SurfaceContextResult } from "../types.ts";
-import { errMessage } from "../util/errors.ts";
+import { reportFailureAs } from "../util/errors.ts";
 import { adminCronHistoryUrl } from "../util/admin-links.ts";
 import { createMemoryMap } from "../persistence/durable-map.ts";
 import { randomUUID } from "node:crypto";
@@ -20,12 +20,40 @@ import { pickMatch, type DirectoryMember } from "../directory/directory-store.ts
 import { externalMemberActive } from "../identity/external-members.ts";
 import { hasRevisionEvents, recordMessageRevisions } from "../core/message-revisions.ts";
 import { answerWebContextRequest } from "./web-context.ts";
+import { availableRuntimeError, validateRuntimeChoice } from "./runtime-config.ts";
+import { assertCronRuntime } from "../cron/runtime.ts";
+import type { Cron } from "../types.ts";
 import { validateUserSchedule } from "../cron/schedule.ts";
 
 import type { App, AppDeps, ReachNowResult } from "./app-types.ts";
 import { CONTEXT_REQUEST_EXPIRY_MS } from "./app-types.ts";
 import type { AppHelpers } from "./app-helpers.ts";
 import type { AmbientHelpers } from "./app-ambient.ts";
+
+export async function cronVisibility(deps: AppDeps, h: AppHelpers, principalId: string) {
+  const viewerKeys = personKeys(await deps.directory.get(principalId).catch(() => null), principalId);
+  const viewersOwn = (id: string): boolean => viewerKeys.has(personKey(id));
+  const scopeNames = new Map<ScopeId, string | null>([[scopeId("org", orgIdOf()), null]]);
+  if (deps.identity.isInternal(deps.identity.classify(principalId))) {
+    for (const c of await deps.directory.listChannelsFor(principalId)) {
+      scopeNames.set(scopeId("channel", c.channelId), c.name);
+    }
+  }
+  for (const project of await h.projectsForViewer(principalId)) scopeNames.set(project.scopeId, project.name);
+  const allowed = (ownerScopeId: ScopeId): boolean => {
+    const { kind, ref } = parseScopeId(ownerScopeId);
+    return kind !== "group" || deps.projects?.recognizes(ref) !== true || scopeNames.has(ownerScopeId);
+  };
+  return {
+    viewersOwn,
+    scopeNames,
+    canSee: (c: Pick<import("../types.ts").Cron, "ownerScopeId" | "owner" | "destination">): boolean =>
+      allowed(c.ownerScopeId) &&
+      (viewersOwn(c.owner) ||
+        scopeNames.has(c.ownerScopeId) ||
+        (c.destination?.type === "principal" && viewersOwn(c.destination.target))),
+  };
+}
 
 export function createMessagingMethods(
   deps: AppDeps,
@@ -45,12 +73,13 @@ export function createMessagingMethods(
   | "cronFiresByThreadRefs"
   | "latestCronFireForThread"
   | "setCronDestination"
-  | "setCronRecipientConsent"
+  | "setCronRuntime"
   | "createWebhook"
   | "getWebhook"
   | "listWebhooks"
+  | "listWebhookEvents"
   | "setWebhookEnabled"
-  | "setWebhookRecipientConsent"
+  | "updateWebhook"
   | "pendingDeliveries"
   | "enqueueDelivery"
   | "ingestSurfaceEvents"
@@ -91,7 +120,7 @@ export function createMessagingMethods(
   | "reachNow"
   | "resolveReachTarget"
 > {
-  const { adminBase, projectsForViewer, resolveReachTargetFor } = h;
+  const { adminBase, resolveReachTargetFor } = h;
   const { judgeAmbientContainer, ambientSelf } = ambient;
   const contextRequests = deps.contextRequests ?? createMemoryMap<SurfaceContextRequest>();
   const contextRequestListeners = new Set<(request: SurfaceContextRequest) => void>();
@@ -102,7 +131,7 @@ export function createMessagingMethods(
   const identityMembers = async (): Promise<DirectoryMember[]> => {
     const [externals, participants] = await Promise.all([
       deps.identity.listExternalMembers(),
-      deps.sessions?.listParticipants() ?? [],
+      deps.sessions?.distinctParticipants() ?? [],
     ]);
     const candidates: DirectoryMember[] = [
       ...(deps.emailAuthMembers ?? []),
@@ -110,8 +139,8 @@ export function createMessagingMethods(
         .filter((member) => externalMemberActive(member))
         .map((member) => ({ principalId: member.email, displayName: member.email, type: "internal" as const })),
       ...participants
-        .filter((w) => deps.identity.classify(w.principalId).type === "internal")
-        .map((w) => ({ principalId: w.principalId, displayName: w.principalId, type: "internal" as const })),
+        .filter((principalId) => deps.identity.classify(principalId).type === "internal")
+        .map((principalId) => ({ principalId, displayName: principalId, type: "internal" as const })),
     ];
     const byKey = new Map<string, DirectoryMember>();
     for (const member of candidates) {
@@ -126,17 +155,19 @@ export function createMessagingMethods(
     return [...stored, ...viaEmail.filter((member) => !seen.has(personKey(member.principalId)))];
   };
 
+  const validateRuntime = async (cron: Pick<Cron, "runtime" | "ownerScopeId" | "loopId" | "action" | "message">) => {
+    assertCronRuntime(cron);
+    if (!cron.runtime) return;
+    const error =
+      validateRuntimeChoice(cron.runtime) ??
+      (await availableRuntimeError({ deps }, cron.ownerScopeId, cron.runtime, "cron"));
+    if (error) throw new Error(error);
+  };
+
   return {
     async createCron(input) {
+      await validateRuntime(input);
       validateUserSchedule(input.schedule);
-      if (input.runAs === "scopeShared") {
-        if (input.ownerScopeId.startsWith("personal:"))
-          throw new Error("scopeShared requires a shared (channel/group) scope, not a personal one");
-        if (!input.members?.length) throw new Error("scopeShared requires a member snapshot");
-      }
-      if ((await deps.crons.list()).filter((cron) => cron.owner === input.owner).length >= 100) {
-        throw new Error("cron limit reached for this owner (100)");
-      }
       const cron = await deps.crons.create(input);
       deps.auditLog.record({
         at: Date.now(),
@@ -164,29 +195,11 @@ export function createMessagingMethods(
     },
     async listCronsForViewer(principalId) {
       const all = await deps.crons.list();
-      const viewerKeys = personKeys(await deps.directory.get(principalId).catch(() => null), principalId);
-      const viewersOwn = (id: string): boolean => viewerKeys.has(personKey(id));
-      const scopeNames = new Map<ScopeId, string | null>([[scopeId("org", orgIdOf()), null]]);
-      if (deps.identity.isInternal(deps.identity.classify(principalId))) {
-        for (const c of await deps.directory.listChannelsFor(principalId)) {
-          scopeNames.set(scopeId("channel", c.channelId), c.name);
-        }
-      }
-      for (const project of await projectsForViewer(principalId)) scopeNames.set(project.scopeId, project.name);
-      const allowed = (ownerScopeId: ScopeId): boolean => {
-        const { kind, ref } = parseScopeId(ownerScopeId);
-        return kind !== "group" || deps.projects?.recognizes(ref) !== true || scopeNames.has(ownerScopeId);
-      };
-      const owned = all.filter((c) => viewersOwn(c.owner) && allowed(c.ownerScopeId));
+      const { viewersOwn, scopeNames, canSee } = await cronVisibility(deps, h, principalId);
+      const owned = all.filter((c) => viewersOwn(c.owner) && canSee(c));
       const visible = all
         .filter((c) => !viewersOwn(c.owner))
-        .filter((c) => allowed(c.ownerScopeId))
-        .filter(
-          (c) =>
-            scopeNames.has(c.ownerScopeId) ||
-            c.members?.some((m) => viewersOwn(m.id)) === true ||
-            (c.destination?.type === "principal" && viewersOwn(c.destination.target)),
-        )
+        .filter(canSee)
         .map((c) => {
           const name = scopeNames.get(c.ownerScopeId);
           return name ? { ...c, scopeName: name } : c;
@@ -196,13 +209,8 @@ export function createMessagingMethods(
     async updateCron(id, patch) {
       const before = await deps.crons.get(id);
       if (!before) return null;
+      if (patch.runtime !== undefined) await validateRuntime({ ...before, ...patch });
       if (patch.schedule) validateUserSchedule(patch.schedule);
-      if (patch.runAs === "scopeShared") {
-        if (before.ownerScopeId.startsWith("personal:"))
-          throw new Error("scopeShared requires a shared (channel/group) scope, not a personal one");
-        const members = patch.members ?? before.members;
-        if (!members?.length) throw new Error("scopeShared requires a member snapshot");
-      }
       const grantsReaffirmed = patch.unattendedGrants !== undefined;
       const guardedPatch =
         (before.unattendedGrants?.length ?? 0) > 0 && !grantsReaffirmed ? { ...patch, unattendedGrants: [] } : patch;
@@ -246,6 +254,12 @@ export function createMessagingMethods(
       }
       return outcome;
     },
+    async setCronRuntime(id, runtime) {
+      const before = await deps.crons.get(id);
+      if (!before) return null;
+      await validateRuntime({ ...before, runtime });
+      return deps.crons.update(id, { runtime });
+    },
     async setCronDestination(id, destination) {
       const before = await deps.crons.get(id);
       if (!before) return null;
@@ -258,9 +272,6 @@ export function createMessagingMethods(
         scopeLabel: before.ownerScopeId,
       });
       return deps.crons.get(id);
-    },
-    setCronRecipientConsent(id, recipientConsent) {
-      return deps.crons.setRecipientConsent(id, recipientConsent);
     },
     async createWebhook(input) {
       const webhook = await deps.webhooks.create(input);
@@ -276,14 +287,24 @@ export function createMessagingMethods(
     getWebhook(id) {
       return deps.webhooks.get(id);
     },
+    async listWebhookEvents(id, viewer) {
+      const events = await deps.webhooks.listEvents(id);
+      return Promise.all(
+        events.map(async (event) => {
+          const session = await deps.sessions.getByThread(`webhook:${id}:${event.deliveryId}`);
+          const visible = session && (await h.sessionForViewer(session.id, viewer));
+          return { ...event, ...(visible ? { sessionId: session.id } : {}) };
+        }),
+      );
+    },
     listWebhooks() {
       return deps.webhooks.list();
     },
     setWebhookEnabled(id, enabled) {
       return deps.webhooks.setEnabled(id, enabled);
     },
-    setWebhookRecipientConsent(id, recipientConsent) {
-      return deps.webhooks.setRecipientConsent(id, recipientConsent);
+    updateWebhook(id, patch) {
+      return deps.webhooks.update(id, patch);
     },
     pendingDeliveries(type, claimMs) {
       return claimMs && claimMs > 0 ? deps.deliveries.claimPending(type, claimMs) : deps.deliveries.pending(type);
@@ -296,14 +317,12 @@ export function createMessagingMethods(
       if (self && (self.name || self.mentionId)) ambientSelf.set(`${orgIdOf()}:${surface}`, self);
       const out = await deps.surfaceCache.ingest(events);
       if (surface === "slack" && hasRevisionEvents(events)) {
-        void recordMessageRevisions(deps.sessions, events).catch((e) =>
-          console.error("[revisions] surface revision record failed:", errMessage(e)),
+        void recordMessageRevisions(deps.sessions, events).catch(
+          reportFailureAs("revisions: surface revision record", undefined),
         );
       }
       for (const container of new Set(events.filter((e) => !e.self).map((e) => e.container))) {
-        void judgeAmbientContainer(surface, container).catch((e) =>
-          console.error("[ambient] judge failed:", errMessage(e)),
-        );
+        void judgeAmbientContainer(surface, container).catch(reportFailureAs("ambient: judge", undefined));
       }
       return out;
     },
@@ -434,13 +453,14 @@ export function createMessagingMethods(
       }
       return true;
     },
-    async upsertChannels(channels, channelMembers, syncedAt, channelRosterIds, revocations) {
+    async upsertChannels(channels, channelMembers, syncedAt, channelRosterIds, revocations, partial) {
       const applied = await deps.directory.replaceChannels(
         channels,
         channelMembers,
         syncedAt,
         channelRosterIds,
         revocations,
+        partial,
       );
       await h.syncLinkedProjectRosters();
       return applied;
@@ -512,7 +532,13 @@ export function createMessagingMethods(
       if (!delivery || delivery.destination.type !== "principal") return;
       const recipientId = delivery.destination.target;
       const recipientScope = scopeId("personal", recipientId);
-      const session = await deps.sessions.getOrCreateByThread(recipientThreadRef, "dm", recipientScope);
+      const session = await deps.sessions.getOrCreateByThread(
+        recipientThreadRef,
+        "dm",
+        recipientScope,
+        undefined,
+        "slack",
+      );
       await deps.deliveries.recordRecipientThread(delivery.id, recipientThreadRef, Date.now());
       await deps.sessions.addParticipant(session.id, recipientId);
     },

@@ -1,9 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readdirSync } from "node:fs";
+import { readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { countTokens } from "../src/util/tokens.ts";
-import { createPiHarness } from "../src/harness/pi-harness.ts";
+import { createPiHarness, stableCwd } from "../src/harness/pi-harness.ts";
 import type { HarnessTurnInput } from "../src/harness/harness.ts";
 
 function countTempDirs(prefix: string): number {
@@ -23,7 +24,7 @@ function recordingTurn(
     tools: {} as HarnessTurnInput["tools"],
     scopeLabel: "scope" as HarnessTurnInput["scopeLabel"],
     orgScopeId: "org:test" as HarnessTurnInput["orgScopeId"],
-    emit: async (entry) => ({ ...entry, seq: 1 }) as Awaited<ReturnType<HarnessTurnInput["emit"]>>,
+    emit: async (entry) => ({ ...entry, seq: 1, createdAt: 0 }) as Awaited<ReturnType<HarnessTurnInput["emit"]>>,
     recordModelCall: (rec) => recorded.push(rec),
   };
 }
@@ -48,19 +49,41 @@ test("every turn composes the freshly resolved system prompt", async () => {
   await runIgnoringPromptError(harness, recordingTurn(first, recorded, "fresh-prompt"));
   await runIgnoringPromptError(harness, recordingTurn(second, recorded, "fresh-prompt"));
 
-  assert.equal(recorded[0]!.inputTokens, countTokens(first) + countTokens("hi"));
-  assert.equal(recorded[1]!.inputTokens, countTokens(second) + countTokens("hi"));
+  const prompt = "── Wednesday, December 31, 1969 ──\nhi";
+  assert.equal(recorded[0]!.inputTokens, countTokens(first) + countTokens(prompt));
+  assert.equal(recorded[1]!.inputTokens, countTokens(second) + countTokens(prompt));
 });
 
-test("each turn removes its isolated resource directories", async () => {
+test("the cwd pi appends to the system prompt is one constant path per harness", () => {
+  assert.equal(stableCwd("pi"), join(tmpdir(), "pi-cwd"));
+  assert.equal(stableCwd("pi"), stableCwd("pi"));
+});
+
+test("each turn removes its agent directory and reuses one constant cwd", async () => {
   const prefix = `pi-turn-${process.pid}`;
   const harness = createPiHarness({ tempDirPrefix: prefix });
   const recorded: Array<{ model: string; inputTokens: number; entryCount: number }> = [];
 
   await runIgnoringPromptError(harness, recordingTurn("BASE", recorded, "cleanup"));
+  await runIgnoringPromptError(harness, recordingTurn("BASE", recorded, "cleanup-2"));
 
+  assert.equal(countTempDirs(`${prefix}-agent-`), 0);
+  assert.equal(countTempDirs(`${prefix}-cwd`), 1);
+  rmSync(stableCwd(prefix), { recursive: true, force: true });
+});
+
+test("a squatted shared cwd falls back to a per-turn cwd that is removed afterwards", async () => {
+  const prefix = `pi-squat-${process.pid}`;
+  writeFileSync(stableCwd(prefix), "not a directory");
+  const harness = createPiHarness({ tempDirPrefix: prefix });
+  const recorded: Array<{ model: string; inputTokens: number; entryCount: number }> = [];
+
+  await runIgnoringPromptError(harness, recordingTurn("BASE", recorded, "squat"));
+
+  assert.equal(recorded.length, 1, "the turn still reached the model call");
   assert.equal(countTempDirs(`${prefix}-cwd-`), 0);
   assert.equal(countTempDirs(`${prefix}-agent-`), 0);
+  rmSync(stableCwd(prefix), { force: true });
 });
 
 test("the Pi harness exposes no session-reset hook after removing session state", () => {
@@ -73,17 +96,27 @@ test("ack emoji keeps working on a non-Anthropic base model when an Anthropic ke
     resolveProviderKeys: async () => ({ anthropic: "sk-ant-test" }),
   });
   const realFetch = globalThis.fetch;
-  const calls: Array<{ url: string; model: unknown }> = [];
+  const calls: Array<{ url: string; model: unknown; thinking: unknown }> = [];
   globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
-    calls.push({ url: String(url), model: JSON.parse(String(init?.body ?? "{}")).model });
-    return new Response(JSON.stringify({ content: [{ type: "text", text: '{"emoji":"eyes"}' }] }), { status: 200 });
+    const body = JSON.parse(String(init?.body ?? "{}"));
+    calls.push({ url: String(url), model: body.model, thinking: body.thinking });
+    return new Response(
+      JSON.stringify({
+        content: [
+          { type: "thinking", thinking: "" },
+          { type: "text", text: '{"emoji":"eyes"}' },
+        ],
+      }),
+      { status: 200 },
+    );
   }) as typeof globalThis.fetch;
   try {
     const picked = await harness.models.pickAckEmoji?.("ship it", ["eyes", "rocket"]);
     assert.equal(picked, "eyes", "the pick still lands even though the base model is OpenAI");
     assert.equal(calls.length, 1, "the Anthropic ack call was actually attempted");
     assert.match(calls[0]!.url, /anthropic/, "it went to the Anthropic API");
-    assert.equal(calls[0]!.model, "claude-haiku-4-5", "it used the Anthropic auxiliary, not the OpenAI judge model");
+    assert.equal(calls[0]!.model, "claude-haiku-5-5", "it used the Anthropic auxiliary, not the OpenAI judge model");
+    assert.deepEqual(calls[0]!.thinking, { type: "disabled" }, "the 64-token pick never spends its budget thinking");
   } finally {
     globalThis.fetch = realFetch;
   }
@@ -122,21 +155,28 @@ test("model utilities resolve provider credentials for every call", async () => 
   assert.equal(resolutions, 2);
 });
 
-test("prior-turn bootstrap is taped as a retry-idempotent import before the first prompt", async () => {
-  const harness = createPiHarness();
-  const records: Array<{ kind: string; payload: unknown }> = [];
+test("prior-turn bootstrap reaches the model before the first prompt", async () => {
+  const harness = createPiHarness({ apiKey: "sk-test" });
+  const bodies: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    bodies.push(String(init?.body ?? ""));
+    return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "stop" } }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof globalThis.fetch;
   const turn = recordingTurn("BASE", [], "prior-bootstrap");
   turn.priorTurns = [
     { role: "assistant", text: "I opened this thread with the release result" },
     { role: "user", name: "Jordan", text: "tell me more" },
   ];
-  turn.tape = async (record) => {
-    records.push({ kind: record.kind, payload: record.payload });
-  };
-  await runIgnoringPromptError(harness, turn);
-  const bootstrap = records.filter((record) => record.kind === "context_event");
-  assert.equal(bootstrap.length, 1);
-  assert.equal((bootstrap[0]!.payload as { event?: string }).event, "legacy_import");
-  assert.match(JSON.stringify(bootstrap[0]), /release result/);
-  assert.match(JSON.stringify(bootstrap[0]), /tell me more/);
+  try {
+    await runIgnoringPromptError(harness, turn);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.ok(bodies.length > 0);
+  assert.match(bodies[0]!, /release result/);
+  assert.match(bodies[0]!, /tell me more/);
 });

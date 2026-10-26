@@ -11,6 +11,7 @@ interface Call {
 }
 
 const calls: Call[] = [];
+let composioReturnTo: string | null = null;
 const core = createServer((req: IncomingMessage, res) => {
   let raw = "";
   req.on("data", (chunk) => (raw += chunk));
@@ -25,6 +26,10 @@ const core = createServer((req: IncomingMessage, res) => {
       res.end(JSON.stringify({ deployments: [{ id: "d1", permission: "write" }] }));
       return;
     }
+    if ((req.url ?? "").split("?")[0] === "/v1/composio/complete-auth") {
+      res.end(JSON.stringify({ returnTo: composioReturnTo }));
+      return;
+    }
     res.end(JSON.stringify({ ok: true }));
   });
 });
@@ -33,6 +38,7 @@ await new Promise<void>((resolve) => core.listen(0, resolve));
 process.env.CORE_API_URL = `http://localhost:${(core.address() as AddressInfo).port}`;
 process.env.CORE_SIGNING_SECRET = "body-parsing-test";
 process.env.WEB_UI_PRINCIPALS = "alice";
+process.env.WEB_UI_PUBLIC_URL = "http://localhost:8790";
 
 const { handler } = await import("../server/index.ts");
 const surface = createServer((req, res) => void handler(req, res));
@@ -61,8 +67,8 @@ test("an empty body on a strict route is refused, not read as a field-clearing o
   for (const [method, path] of [
     ["POST", "/api/deployments/d1/display-name"],
     ["POST", "/api/deployments/d1/name"],
-    ["POST", "/api/memory/restore"],
-    ["PUT", "/api/memory"],
+    ["PATCH", "/api/memory"],
+    ["DELETE", "/api/memory"],
     ["POST", "/api/sessions/s1"],
     ["POST", "/api/connectors/revoke"],
     ["POST", "/api/keychain/drops"],
@@ -107,22 +113,16 @@ test("a steer forwards a server-built TurnRequest; client-supplied identity fiel
   assert.deepEqual(body.request?.conversation, { kind: "dm", threadRef });
 });
 
-test("a steer claiming a thread the user does not own is refused before reaching core", async () => {
-  const before = calls.length;
-  const r = await fetch(`${base}/api/runs/r1/signal`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ kind: "steer", text: "louder", threadRef: "web:bob:stolen" }),
-  });
-  assert.equal(r.status, 403);
-  assert.equal(calls.length, before, "nothing is forwarded to core");
-});
-
-test("a steer without a threadRef and an abort still forward the bare signal", async () => {
-  for (const body of [{ kind: "steer", text: "louder" }, { kind: "abort" }]) {
+test("ordinary steering without conversation context and abort preserve bare signal forwarding", async () => {
+  for (const body of [
+    { kind: "steer", text: "louder" },
+    { kind: "steer", text: "louder", threadRef: "" },
+    { kind: "steer", text: "louder", threadRef: "invalid" },
+    { kind: "abort" },
+  ]) {
     const r = await fetch(`${base}/api/runs/r1/signal`, { method: "POST", headers, body: JSON.stringify(body) });
     assert.equal(r.status, 200);
-    assert.deepEqual(calls.at(-1)?.body, body);
+    assert.deepEqual(calls.at(-1)?.body, { kind: body.kind, ...("text" in body ? { text: body.text } : {}) });
   }
 });
 
@@ -131,4 +131,65 @@ test("routes that historically tolerated an empty body still do", async () => {
   assert.equal(r.status, 200, "fork with no body still forks from the tail");
   const forked = calls.at(-1);
   assert.deepEqual(forked?.body, { principalId: "alice" });
+});
+
+test("app authorization accepts existing browser payloads and validates new return context", async () => {
+  const authorize = (body: Record<string, unknown>) =>
+    fetch(`${base}/api/composio/authorize`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+  const legacy = await authorize({ toolkit: "gmail" });
+  assert.equal(legacy.status, 200);
+  assert.ok(calls.at(-1)?.url.startsWith("/v1/composio/authorize"));
+  assert.deepEqual(calls.at(-1)?.body, { toolkit: "gmail" });
+  const state = "00000000-0000-4000-8000-000000000000";
+  const modern = await authorize({ toolkit: "gmail", returnTo: "/s/chat", state });
+  assert.equal(modern.status, 200);
+  const callback = new URL(String(calls.at(-1)?.body.callbackUrl));
+  assert.equal(callback.pathname, "/s/chat");
+  assert.equal(callback.searchParams.get("composioReturn"), state);
+  const before = calls.length;
+  for (const invalid of [
+    { returnTo: "/s/chat" },
+    { state },
+    { returnTo: null, state: null },
+    { returnTo: "https://evil.example", state },
+    { returnTo: "/", state: "bad" },
+  ]) {
+    const response = await authorize({ toolkit: "gmail", ...invalid });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error, "invalid_return_url");
+  }
+  assert.equal(calls.length, before);
+});
+
+test("app disconnection forwards only the chosen account to core", async () => {
+  const response = await fetch(`${base}/api/composio/disconnect`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ accountId: "ca_mine", user_id: "bob", principalId: "bob" }),
+  });
+  assert.equal(response.status, 200);
+  assert.ok(calls.at(-1)?.url.startsWith("/v1/composio/disconnect"));
+  assert.deepEqual(calls.at(-1)?.body, { accountId: "ca_mine" });
+});
+
+test("Composio verifier forwards only the opaque session and redirects safely", async () => {
+  composioReturnTo = "http://localhost:8790//evil.example/path";
+  const response = await fetch(`${base}/api/composio/callback?session_uri=opaque&user_id=bob`, {
+    headers,
+    redirect: "manual",
+  });
+  assert.equal(response.status, 303);
+  assert.equal(response.headers.get("location"), composioReturnTo);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.deepEqual(calls.at(-1)?.body, { sessionUri: "opaque" });
+  composioReturnTo = "https://evil.example/path";
+  assert.equal(
+    (await fetch(`${base}/api/composio/callback?session_uri=opaque`, { headers, redirect: "manual" })).status,
+    400,
+  );
+  composioReturnTo = null;
 });

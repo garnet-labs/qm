@@ -11,12 +11,13 @@ scanning, not thinking. If nothing changed, it says so and stops.
 
 It runs as a scheduled cron turn owned by one person and delivers to their DM. It adds no
 new tool: it reads the connectors that person has already connected and the memory of this
-scope, and writes with the `memory`, `execute`, and `read` primitives.
+scope, uses `memory` for durable knowledge, `files` actions `read` / `write` for workspace files,
+and the available command tool for scripts.
 
 ## Sources
 
 Use only what this deployment actually has, and say which sources you used. Check
-**Connected apps** and **Your logins** in your prompt — those blocks are the complete
+**Connected apps** and the keychain credentials in your prompt — those blocks are the complete
 allowlist. Typically: mail and calendar (what lands today, what's unanswered), the issue
 tracker (what moved, what's assigned to them), the repositories they work in (merged,
 failing, waiting on their review), and any shared credential vended for a news or search

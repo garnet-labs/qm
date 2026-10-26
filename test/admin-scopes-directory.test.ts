@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { createInsecureTestServer } from "../src/api/server.ts";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 
 function start() {
@@ -26,6 +26,35 @@ function start() {
 
 const ALICE_ADMIN = { "x-admin-actor": "admin-alice@default-org" };
 const json = async (r: Response): Promise<any> => r.json();
+
+test("the scope directory starts independent resource reads together", async () => {
+  const s = start();
+  const gate = Promise.withResolvers<void>();
+  const started = new Set<string>();
+  const ready = Promise.withResolvers<void>();
+  const hold =
+    <T>(name: string, read: () => Promise<T>) =>
+    async () => {
+      started.add(name);
+      ready.resolve();
+      await gate.promise;
+      return read();
+    };
+  const app = s.built.app;
+  app.listCrons = hold("crons", app.listCrons.bind(app));
+  app.listDeployments = hold("deployments", app.listDeployments.bind(app));
+  app.listSkills = hold("skills", app.listSkills.bind(app));
+  app.listEnvironments = hold("environments", app.listEnvironments.bind(app));
+  const request = fetch(`${s.base}/v1/admin/scopes`, { headers: ALICE_ADMIN });
+  try {
+    await ready.promise;
+    assert.deepEqual([...started].sort(), ["crons", "deployments", "environments", "skills"]);
+  } finally {
+    gate.resolve();
+    await request;
+    await s.close();
+  }
+});
 
 test("the admin scope directory lists every known scope with labels and counts (powers the picker)", async () => {
   const s = start();
@@ -49,7 +78,15 @@ test("the admin scope directory lists every known scope with labels and counts (
 
     const r = await fetch(`${s.base}/v1/admin/scopes`, { headers: ALICE_ADMIN });
     assert.equal(r.status, 200);
-    const d = await json(r);
+    const first = await json(r);
+    assert.equal(first.activityAsOf, undefined, "the first read does not wait for session counts");
+    assert.equal(first.scopes.find((row: any) => row.scopeId === "channel:C9").sessions, undefined);
+    let d = first;
+    for (let i = 0; i < 50 && d.activityAsOf === undefined; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+      d = await json(await fetch(`${s.base}/v1/admin/scopes`, { headers: ALICE_ADMIN }));
+    }
+    assert.equal(typeof d.activityAsOf, "number", "a later read serves the counts the background refresh computed");
     const byId = new Map(d.scopes.map((row: any) => [row.scopeId, row]));
 
     assert.ok(byId.has("org:default-org"), "the org scope is always listed");
@@ -61,7 +98,7 @@ test("the admin scope directory lists every known scope with labels and counts (
     const c9: any = byId.get("channel:C9");
     assert.equal(c9.label, "#eng", "channel rows carry the human channel name");
     assert.equal(c9.sessions, 1);
-    assert.equal(c9.lastMessage, "ship the board deck", "rows carry the newest conversation's last-message preview");
+    assert.equal(c9.lastMessage, undefined, "the directory carries no message previews");
     const gone: any = byId.get("channel:GONE");
     assert.equal(gone.crons, 1, "rows carry artifact counts");
     assert.equal(gone.sessions, 0);

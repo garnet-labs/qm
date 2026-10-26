@@ -4,7 +4,7 @@ import { deepLinkPath, isPlainLeftClick, UI_BASE } from "./deep-link";
 import { nextGridIndex } from "./grid-nav";
 import { setScopedSession } from "./session-scope";
 import { ADMIN_HOME_URL, appState, can, switchView } from "./shell";
-import { icon } from "./ui";
+import { icon } from "./icons";
 import type { View } from "./shell-state";
 
 interface Destination {
@@ -21,7 +21,7 @@ const browseState = { open: false, sel: 0 };
 
 let host: HTMLDivElement | null = null;
 
-function destinations(): Destination[] {
+export function destinations(): Destination[] {
   const to = (view: View, glyph: IconNode, label: string, blurb: string): Destination => ({
     view,
     href: deepLinkPath(UI_BASE, view, null),

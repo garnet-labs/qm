@@ -19,6 +19,7 @@ import { createMemorySessionStore } from "../src/sessions/memory-session-store.t
 import { mintDeployGitAccess, verifyDeployGitAccess } from "../src/deploy/access-token.ts";
 import { mintCapabilityToken, CAPABILITY_TTL_MS, CONTROL_PLANE_AUD } from "../src/auth/capability-token.ts";
 import { scopeId } from "../src/types.ts";
+import { singleProcessDeps } from "./support/single-process.ts";
 
 const execFileP = promisify(execFile);
 const SECRET = "deploy-git-rw-secret".repeat(3);
@@ -34,6 +35,7 @@ function fixture(urls: { apiBaseUrl?: string; publicUrl?: string } = {}) {
   const deployStore = createDeployStore({ git: { repoRoot: mkdtempSync(join(tmpdir(), "git-rw-repo-")) } });
   const acl: AclStore = createAclStore();
   const deploy = createDeployService({
+    ...singleProcessDeps(),
     deployStore,
     provider: {
       profile: { managedScaleToZero: false },
@@ -304,6 +306,38 @@ test("git-url endpoint: an org-owned deployment is read for a plain member, writ
     const promoted = await ask("U2");
     assert.equal(((await promoted.json()) as { permission: string }).permission, "write");
   } finally {
+    await f.close();
+  }
+});
+
+test("a garbage push body that git rejects early fails the request without crashing core", async () => {
+  const f = fixture();
+  const uncaught: unknown[] = [];
+  const onUncaught = (error: unknown) => uncaught.push(error);
+  process.on("uncaughtException", onUncaught);
+  try {
+    const d = await f.app.deploy({
+      ownerScopeId: scopeId("personal", "U1"),
+      createdBy: "U1",
+      entrypoint: "node server.js",
+      files: [{ path: "server.js", data: "console.log('v1')" }],
+    });
+    const parsed = new URL(await gitUrl(f.base, d.id, "write"));
+    const authorization = `Basic ${Buffer.from(`${decodeURIComponent(parsed.username)}:${decodeURIComponent(parsed.password)}`).toString("base64")}`;
+    parsed.username = "";
+    parsed.password = "";
+    parsed.pathname += "/git-receive-pack";
+    const res = await fetch(parsed, {
+      method: "POST",
+      headers: { authorization, "content-type": "application/x-git-receive-pack-request" },
+      body: Buffer.alloc(8_000_000, 0x5a),
+    });
+    assert.equal(res.status, 500);
+    await res.arrayBuffer();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.deepEqual(uncaught, []);
+  } finally {
+    process.off("uncaughtException", onUncaught);
     await f.close();
   }
 });

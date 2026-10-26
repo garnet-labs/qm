@@ -7,20 +7,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { createServer } from "../src/api/server.ts";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { scopeId, type ScopeId } from "../src/types.ts";
-import { agentApiMatches } from "../src/api/agent-api-catalog.ts";
 import { mintCapabilityToken, CAPABILITY_TTL_MS } from "../src/auth/capability-token.ts";
 import { testConfig } from "./support/test-config.ts";
 
 const SECRET = "discovery-test-secret".repeat(3);
 const ORG = scopeId("org", "default-org");
 
-async function start() {
+async function start(swarmsEnabled = true) {
   const built = buildApp(
     testConfig({
       dataDir: mkdtempSync(join(tmpdir(), "agent-apis-")),
       signingSecret: SECRET,
+      swarmsEnabled,
     }),
   );
   const server = createServer(built.app, {
@@ -39,6 +39,7 @@ const capFor = (
   opts: {
     memory?: { write?: ScopeId; orgWrite?: ScopeId; read: ScopeId[] };
     liveActor?: boolean;
+    liveAuthor?: boolean;
     grants?: string[];
   } = {},
 ) =>
@@ -49,6 +50,7 @@ const capFor = (
       exp: Date.now() + CAPABILITY_TTL_MS,
       ...(opts.memory ? { memory: opts.memory } : {}),
       ...(opts.liveActor ? { liveActor: true } : {}),
+      ...(opts.liveAuthor ? { liveAuthor: true } : {}),
       ...(opts.grants ? { grants: opts.grants } : {}),
     },
     SECRET,
@@ -121,6 +123,8 @@ test("discovery for an org admin's LIVE turn includes the admin plane (live gran
     assert.ok(p.includes("/v1/admin/users"));
     assert.ok(!p.includes("/v1/admin/grants"), "grant management is portal-only and must not be advertised");
     assert.ok(body.guidance.some((g: string) => g.includes("confirm before any mutation")));
+    assert.match(JSON.stringify(body), /content reads require a DM or effective Open sharing for the live admin/);
+    assert.doesNotMatch(JSON.stringify(body), /DM only|only from a DM|bulk config imports require/);
     assert.equal(p.filter((x: string) => x === "/v1/admin/whoami").length, 1, "whoami listed once, not duplicated");
   } finally {
     await s.close();
@@ -146,11 +150,11 @@ test("a granted autonomous turn discovers only the unattended read family", asyn
     const { body } = await listApis(s.base, await capFor("admin-alice", { grants: ["admin.sessions.read"] }));
     const adminPaths = paths(body).filter((path) => path.startsWith("/v1/admin/"));
     assert.deepEqual(adminPaths, [
+      "/v1/admin/scopes",
       "/v1/admin/sessions",
       "/v1/admin/sessions/:id",
-      "/v1/admin/scopes",
-      "/v1/admin/errors",
       "/v1/admin/runs",
+      "/v1/admin/errors",
       "/v1/admin/whoami",
     ]);
     assert.ok(body.guidance.some((guidance: string) => guidance.includes("flag any other admin action")));
@@ -178,7 +182,7 @@ test("discovery advertises the deployment share endpoint, with guidance", async 
     assert.ok(p.includes("/v1/deployments/:id"), "deployment detail is discoverable");
     assert.ok(p.includes("/v1/deployments/:id/restore"), "restore is discoverable");
     assert.ok(
-      body.guidance.some((g: string) => /share it with everyone/i.test(g)),
+      body.guidance.some((g: string) => g.includes("POST /v1/deployments/:id/share") && g.includes('scope:"org"')),
       "share guidance is present",
     );
   } finally {
@@ -186,33 +190,52 @@ test("discovery advertises the deployment share endpoint, with guidance", async 
   }
 });
 
-test("the catalog IS the gate: discovery rows with real paths are admitted, unlisted routes are not", () => {
-  assert.equal(agentApiMatches("GET", "/v1/apis"), true);
-  assert.equal(agentApiMatches("POST", "/v1/deployments/abc/share"), true);
-  assert.equal(agentApiMatches("GET", "/v1/deployments/abc"), true);
-  assert.equal(agentApiMatches("POST", "/v1/deployments/abc/restore"), true);
-  assert.equal(agentApiMatches("GET", "/v1/deployments/abc/share"), false, "share is POST-only");
-  assert.equal(agentApiMatches("POST", "/v1/share"), true, "the uniform share verb is agent-callable");
-  assert.equal(agentApiMatches("GET", "/v1/share"), false, "share is POST-only");
-  assert.equal(agentApiMatches("POST", "/v1/crons"), true);
-  assert.equal(agentApiMatches("POST", "/v1/skills"), true);
-  assert.equal(agentApiMatches("PUT", "/v1/skills/abc"), true);
-  assert.equal(agentApiMatches("DELETE", "/v1/skills/abc"), true);
-  assert.equal(agentApiMatches("GET", "/v1/skills/abc"), true);
-  assert.equal(agentApiMatches("POST", "/v1/skills/abc/restore"), true);
-  assert.equal(agentApiMatches("GET", "/v1/crons/abc"), true);
-  assert.equal(agentApiMatches("POST", "/v1/crons/abc/note"), true);
-  assert.equal(agentApiMatches("GET", "/v1/crons/abc/note"), false, "note is POST-only");
-  assert.equal(agentApiMatches("POST", "/v1/webhooks/abc/enable"), true);
-  assert.equal(agentApiMatches("PUT", "/v1/memory/self"), true);
-  assert.equal(agentApiMatches("PUT", "/v1/admin/memory"), true);
-  assert.equal(agentApiMatches("GET", "/v1/admin/whoami"), true);
-  assert.equal(
-    agentApiMatches("POST", "/v1/connectors/oauth/revoke"),
-    true,
-    "disconnect is the mirror of connect — agent-callable",
-  );
-  assert.equal(agentApiMatches("POST", "/v1/turns"), false, "turn ingress stays source-auth only");
-  assert.equal(agentApiMatches("GET", "/v1/sessions/abc"), false);
-  assert.equal(agentApiMatches("DELETE", "/v1/webhooks"), false);
+test("discovery includes admin routes for a verified human thread reply", async () => {
+  const s = await start();
+  try {
+    const { body } = await listApis(
+      s.base,
+      await capFor("admin-alice", {
+        liveAuthor: true,
+        grants: ["admin.sessions.read"],
+      }),
+    );
+    const p = paths(body);
+    assert.ok(p.includes("/v1/admin/scopes/:scopeId/:resource"));
+    assert.equal(p.filter((path) => path === "/v1/admin/whoami").length, 1);
+    assert.equal(p.filter((path) => path === "/v1/admin/scopes").length, 1);
+    assert.ok(body.guidance.some((g: string) => g.includes("confirm before any mutation")));
+    assert.match(JSON.stringify(body), /content reads require a DM or effective Open sharing for the live admin/);
+    assert.doesNotMatch(JSON.stringify(body), /DM only|only from a DM|bulk config imports require/);
+    assert.ok(!body.guidance.some((g: string) => g.includes("This cron")));
+    const member = await listApis(s.base, await capFor("U1", { liveAuthor: true }));
+    assert.ok(!paths(member.body).includes("/v1/admin/scopes"));
+  } finally {
+    await s.close();
+  }
+});
+
+test("disabled swarms are absent from discovery and reject direct API calls", async () => {
+  const { base, built, close } = await start(false);
+  try {
+    assert.equal(built.app.swarms, undefined);
+    const token = await capFor("U1");
+    const { status, body } = await listApis(base, token);
+    assert.equal(status, 200);
+    assert.ok(!paths(body).includes("/v1/swarm"));
+    assert.ok(body.guidance.every((line: string) => !line.includes("Swarm")));
+    for (const method of ["GET", "POST"]) {
+      const response = await fetch(`${base}/v1/swarm`, {
+        method,
+        headers: { "x-agent-capability": token, "content-type": "application/json" },
+        ...(method === "POST"
+          ? { body: JSON.stringify({ action: "spawn", requestId: "disabled", text: "work" }) }
+          : {}),
+      });
+      assert.equal(response.status, 503);
+      assert.deepEqual(await response.json(), { error: "swarm service unavailable" });
+    }
+  } finally {
+    await close();
+  }
 });

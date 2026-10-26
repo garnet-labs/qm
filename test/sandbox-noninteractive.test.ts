@@ -8,6 +8,8 @@ import { createLocalWorkspaceStore } from "../src/workspace/workspace-store.ts";
 import { scopeId } from "../src/types.ts";
 import { nonInteractiveShellPrefix, NONINTERACTIVE_ENV } from "../src/sandbox/sandbox-env.ts";
 import { installFakeSprites, type FakeSprites } from "./support/fake-sprites.ts";
+import { createMemoryMap } from "../src/persistence/durable-map.ts";
+import { createMemoryAdvisoryLock } from "../src/persistence/advisory-lock.ts";
 
 let ff: FakeSprites;
 before(() => {
@@ -18,9 +20,10 @@ after(() => ff.cleanup());
 function spritesHandle(env?: Record<string, string>) {
   const dir = mkdtempSync(join(tmpdir(), "noninteractive-"));
   const sandbox = createSpritesSandbox(createLocalWorkspaceStore(dir), {
+    initializationStore: createMemoryMap(),
+    advisoryLock: createMemoryAdvisoryLock(),
     token: "test-token",
-    client: ff.client,
-    fetchImpl: ff.fetchImpl,
+    baseUrl: ff.baseUrl,
   });
   const layers = [{ scopeId: scopeId("personal", "U1"), mountPath: "", mode: "rw" as const }];
   return { sandbox, layers, ...(env ? { env } : {}) };

@@ -7,7 +7,8 @@ import { callerEnvSnapshot, gitHead, repoRoot } from "../lib/envctx.ts";
 import { portHolders } from "../lib/proc.ts";
 import { resolveSocketPath, supervisorReachable, supervisorRequest } from "../lib/client.ts";
 import { EXIT, CHILD_ORDER } from "../lib/types.ts";
-import type { StatusReport } from "../lib/types.ts";
+import { errMessage } from "../lib/util.ts";
+import type { CanaryReply, StatusReport } from "../lib/types.ts";
 
 interface Check {
   id: string;
@@ -16,6 +17,23 @@ interface Check {
   detail: string;
   remedy?: string;
   autoFixable?: boolean;
+}
+
+export function eventDeliveryCheck(canary: CanaryReply): Check {
+  const unconfigured = !canary.ok && canary.code === "unconfigured";
+  let remedy: string | undefined;
+  if (!canary.ok) {
+    remedy = unconfigured
+      ? "set CANARY_CHANNEL in the slot env (a channel the bot is in), then dev down && dev up"
+      : "events are not arriving: dev up --rotate (stolen/stale app), or check the slack log";
+  }
+  return {
+    id: "event-delivery",
+    ok: canary.ok,
+    severity: unconfigured ? "warn" : "critical",
+    detail: canary.ok ? `canary round trip ${canary.rttMs}ms` : `canary failed: ${canary.reason}`,
+    remedy,
+  };
 }
 
 export async function runDoctor(opts: { json: boolean; fix: boolean; store: string; slack: boolean }): Promise<number> {
@@ -29,9 +47,22 @@ export async function runDoctor(opts: { json: boolean; fix: boolean; store: stri
   })();
 
   const mine = worktree ? myLease(worktree, opts.store) : null;
-  // A browser-only instance (--no-slack, or a live lease booted that way) needs no pool app.
   const needsPool = opts.slack && mine?.meta.slack !== "0";
   const slots = listSlots(opts.store);
+  const validSlots = new Map<string, ReturnType<typeof slotPorts>>();
+  for (const slot of slots) {
+    try {
+      validSlots.set(slot, slotPorts(slot));
+    } catch (error) {
+      checks.push({
+        id: `slot-config:${slot}`,
+        ok: false,
+        severity: "warn",
+        detail: errMessage(error),
+        remedy: `rename or remove ${slot}.env so its slot number fits the configured port range`,
+      });
+    }
+  }
   let poolDetail = "Slack off -- no pool slot needed";
   if (needsPool) {
     poolDetail = slots.length ? `${slots.length} pool slot(s) configured` : "no poolN.env files in the pool store";
@@ -75,7 +106,7 @@ export async function runDoctor(opts: { json: boolean; fix: boolean; store: stri
     });
     if (reachable) {
       const status = (await supervisorRequest(sock, "GET", "/status", undefined, 8000)).body as StatusReport;
-      for (const name of CHILD_ORDER) {
+      for (const name of status.webEnabled === false ? ["core"] : CHILD_ORDER) {
         const child = status.children[name];
         checks.push({
           id: `child:${name}`,
@@ -105,25 +136,8 @@ export async function runDoctor(opts: { json: boolean; fix: boolean; store: stri
               ? "check for other instances; reconnect and verify with dev up --rotate"
               : undefined,
         });
-        const canary = (await supervisorRequest(sock, "POST", "/canary", {}, 40_000)).body as {
-          ok: boolean;
-          rttMs?: number;
-          reason?: string;
-        };
-        const unconfigured = !canary.ok && /no canary channel configured/.test(canary.reason ?? "");
-        let eventDeliveryRemedy: string | undefined;
-        if (!canary.ok) {
-          eventDeliveryRemedy = unconfigured
-            ? "set CANARY_CHANNEL in the slot env (a channel the bot is in), then dev down && dev up"
-            : "events are not arriving: dev up --rotate (stolen/stale app), or check the slack log";
-        }
-        checks.push({
-          id: "event-delivery",
-          ok: canary.ok,
-          severity: unconfigured ? "warn" : "critical",
-          detail: canary.ok ? `canary round trip ${canary.rttMs}ms` : `canary failed: ${canary.reason}`,
-          remedy: eventDeliveryRemedy,
-        });
+        const canary = (await supervisorRequest(sock, "POST", "/canary", {}, 40_000)).body as CanaryReply;
+        checks.push(eventDeliveryCheck(canary));
       }
       const gitNow = gitHead(worktree);
       checks.push({
@@ -178,10 +192,10 @@ export async function runDoctor(opts: { json: boolean; fix: boolean; store: stri
   }
 
   if (worktree) {
-    for (const slot of slots) {
+    for (const [slot, ports] of validSlots) {
       const lease = listLeases(opts.store).find((l) => l.slot === slot);
       if (lease) continue;
-      for (const [name, port] of Object.entries(slotPorts(slot))) {
+      for (const [name, port] of Object.entries(ports)) {
         if (name === "supervisor" || name === "prodProxy" || name === "slackHealth") continue;
         const holders = portHolders(port);
         if (holders.length) {
@@ -190,7 +204,7 @@ export async function runDoctor(opts: { json: boolean; fix: boolean; store: stri
             ok: false,
             severity: "warn",
             detail: `free slot ${slot}'s ${name} port ${port} is held by pid(s) ${holders.join(",")}`,
-            remedy: `kill ${holders.join(" ")}`,
+            remedy: "leave unrelated listeners running; dev up skips occupied port blocks",
           });
         }
       }

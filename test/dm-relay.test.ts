@@ -5,7 +5,8 @@ import type { Server } from "node:http";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildApp, type BuiltApp } from "../src/wiring.ts";
+import { type BuiltApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { createServer } from "../src/api/server.ts";
 import { createApp, type AppDeps } from "../src/api/app.ts";
 import { createDeliveryStore } from "../src/delivery/delivery-store.ts";
@@ -118,12 +119,16 @@ describe("agent → teammate DM: the cron recipient route (§10)", () => {
   it("accepts task/text aliases so user-facing cron creation doesn't expose internal modes", async () => {
     const taskRes = await post(
       "/v1/crons",
-      { schedule: { cron: "* * * * *" }, task: "check mail; reply [no-update] if nothing changed", recipient: "Alice" },
+      {
+        schedule: { cron: "* * * * *" },
+        task: "check mail; call finish_silently if nothing changed",
+        recipient: "Alice",
+      },
       { "x-agent-capability": await capDm("U-carol") },
     );
     assert.equal(taskRes.status, 200);
     const taskBody = (await taskRes.json()) as any;
-    assert.equal(taskBody.cron.action, "check mail; reply [no-update] if nothing changed");
+    assert.equal(taskBody.cron.action, "check mail; call finish_silently if nothing changed");
     assert.equal(taskBody.cron.message, undefined);
 
     const textRes = await post(
@@ -325,7 +330,8 @@ describe("agent → teammate DM: the cron recipient route (§10)", () => {
     const pending = await built.app.pendingDeliveries("principal");
     const d = pending.find((x) => x.id === body.deliveryId);
     assert.ok(d, "delivery is in the principal queue");
-    assert.equal(d!.text, "Carol asked me to pass on:\nship it 🚀");
+    assert.equal(d!.text, "ship it 🚀");
+    assert.equal(d!.destination.relaySender, "Carol");
     assert.equal(d!.destination.onBehalfOf, "U-carol");
   });
 
@@ -356,7 +362,8 @@ describe("agent → teammate DM: the cron recipient route (§10)", () => {
     const pending = await built.app.pendingDeliveries("group");
     const d = pending.find((x) => x.id === body.deliveryId);
     assert.ok(d, "delivery is in the group queue");
-    assert.equal(d!.text, "Carol asked me to pass on:\nheads up");
+    assert.equal(d!.text, "heads up");
+    assert.equal(d!.destination.relaySender, "Carol");
     assert.equal(d!.destination.type, "group");
     assert.equal(d!.destination.target, "G-jrs");
   });
@@ -424,6 +431,7 @@ describe("agent → teammate DM: delivery events in the recipient's session (ant
 
     const session = await sessions.getByThread("dm:D-alice");
     assert.ok(session, "recipient DM session created");
+    assert.equal(session!.surface, "slack");
     const entries = await sessions.getEntries(session!.id);
     assert.equal(
       entries.some((e) => e.type === "assistant"),

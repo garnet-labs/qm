@@ -14,7 +14,7 @@ import { createMemoryService } from "../src/memory/memory-service.ts";
 import { createModelGateway } from "../src/model/model-gateway.ts";
 import { createAuditLog } from "../src/audit/audit-log.ts";
 import { createRateLimiter } from "../src/ratelimit/rate-limiter.ts";
-import { createMockHarness } from "../src/harness/mock-harness.ts";
+import { createMockHarness } from "./support/mock-harness.ts";
 import { createDeployStore } from "../src/deploy/deploy-store.ts";
 import { createDockerDeployProvider } from "../src/deploy/docker-deploy-provider.ts";
 import { createDeployService } from "../src/deploy/deploy-service.ts";
@@ -24,6 +24,7 @@ import type { Sandbox, SandboxHandle, TeardownOptions } from "../src/sandbox/san
 import type { ErrorLog } from "../src/admin/error-log.ts";
 import type { SurfaceCache } from "../src/surface-cache/types.ts";
 import type { Conversation, Principal } from "../src/types.ts";
+import { singleProcessDeps } from "./support/single-process.ts";
 
 const ORG = "default-org";
 const actor: Principal = { id: "U1", type: "internal" };
@@ -102,7 +103,6 @@ function buildOrchestrator(
   sandbox: Sandbox,
   errors?: ErrorLog,
   harness = createMockHarness(),
-  eagerProvision = false,
   surfaceCache?: SurfaceCache,
 ) {
   const config = createMemoryConfigStore(ORG);
@@ -111,6 +111,7 @@ function buildOrchestrator(
   const workspace = createLocalWorkspaceStore(mkdtempSync(join(tmpdir(), "frr-")));
   const sessions = createMemorySessionStore();
   const deploy = createDeployService({
+    ...singleProcessDeps(),
     deployStore: createDeployStore(),
     provider: createDockerDeployProvider(),
     deployDir: join(tmpdir(), "frr-deploy"),
@@ -118,6 +119,7 @@ function buildOrchestrator(
     acl,
   });
   const orch = createOrchestrator({
+    ...singleProcessDeps(),
     identity: createIdentityService(),
     resolution: createResolutionService(ORG, config, acl),
     sessions,
@@ -131,7 +133,6 @@ function buildOrchestrator(
     memory: createMemoryService(workspace),
     deploy,
     acl,
-    eagerProvision,
     ...(errors ? { errors } : {}),
     ...(surfaceCache ? { surfaceCache } : {}),
   });
@@ -160,9 +161,53 @@ test("background: the run finishes as soon as the reply is ready; backup/teardow
   assert.equal(g.teardownFinished, 1, "the detached tail completed once unblocked");
 });
 
+test("background: title persistence finishes before the run while teardown stays detached", async () => {
+  const g = gatedSandbox();
+  const base = createMockHarness();
+  const harness = { ...base, models: { ...base.models, generateTitle: () => new Promise<string>(() => {}) } };
+  const { orch, sessions } = buildOrchestrator(g.sandbox, undefined, harness);
+  const result = await orch.handleTurn({
+    ...dm("dm:U1:title-background", "!run echo hi"),
+    displayText: "Simulate four-way title outage from the visible message",
+    runId: "title-background",
+    background: true,
+  });
+
+  assert.equal(result.status, "ok");
+  assert.equal(
+    (await sessions.get(result.sessionId!))?.title,
+    "Simulate four-way title outage from the visible message",
+  );
+  assert.equal(g.teardownFinished, 0);
+  for (let i = 0; i < 200 && g.teardownStarted === 0; i++) await tick();
+  g.release();
+});
+
+test("spine-routed titles use visible text instead of the internal wake envelope", async () => {
+  const { orch, sessions } = buildOrchestrator(gatedSandbox().sandbox);
+  const result = await orch.handleTurn({
+    ...dm(
+      "dm:U1:title-spine",
+      '<wake reason="addressed">Simulate four-way title outage from the internal envelope</wake>',
+    ),
+    displayText: "Simulate four-way title outage from the visible message",
+    runId: "title-spine",
+    background: true,
+  });
+
+  assert.equal(
+    (await sessions.get(result.sessionId!))?.title,
+    "Simulate four-way title outage from the visible message",
+  );
+  assert.equal(
+    (await orch.regenerateTitle(result.sessionId!, actor.id))?.title,
+    "Simulate four-way title outage from the visible message",
+  );
+});
+
 test("background: a turn that never used its eagerly provisioned box returns before teardown and marks the home unchanged", async () => {
   const g = gatedSandbox();
-  const { orch } = buildOrchestrator(g.sandbox, undefined, createMockHarness(), true);
+  const { orch } = buildOrchestrator(g.sandbox, undefined, createMockHarness());
 
   const first = await orch.handleTurn({ ...dm("dm:U1:t4", "!run echo hi"), runId: "r4", background: true });
   assert.equal(first.status, "ok");
@@ -185,6 +230,35 @@ test("background: a turn that never used its eagerly provisioned box returns bef
   assert.equal(g.teardownFinished, 2);
 });
 
+test("background: a turn paused on approval returns its card before the eagerly provisioned box is torn down", async () => {
+  const g = gatedSandbox();
+  const { orch, sessions } = buildOrchestrator(g.sandbox, undefined, createMockHarness());
+
+  const first = await orch.handleTurn({ ...dm("dm:U1:t7", "!run echo hi"), runId: "r7", background: true });
+  assert.equal(first.status, "ok");
+  for (let i = 0; i < 200 && g.teardownStarted === 0; i++) await tick();
+  g.release();
+  for (let i = 0; i < 200 && g.teardownFinished === 0; i++) await tick();
+
+  const turn = orch.handleTurn({ ...dm("dm:U1:t7", "!finish-silent-paused"), runId: "r8", background: true });
+  const paused = await Promise.race([turn, new Promise<null>((resolve) => setTimeout(() => resolve(null), 2_000))]);
+  assert.ok(paused, "the paused turn returned while the teardown was still gated");
+  assert.equal(paused.status, "pending_approval");
+  assert.equal(paused.pendingApprovals?.length, 1);
+  assert.equal(g.provisioned, 2, "the box was provisioned eagerly for the paused turn");
+  assert.equal(g.teardownFinished, 1, "the approval card returned without waiting for that box's teardown");
+
+  const { lease } = await sessions.acquireLease(paused.sessionId!);
+  assert.ok(lease, "the resumed turn can claim the session while the box is still being reclaimed");
+  await sessions.releaseLease(lease!);
+
+  for (let i = 0; i < 200 && g.teardownStarted < 2; i++) await tick();
+  assert.equal(g.teardownStarted, 2, "the detached tail still reclaims the box");
+  g.release();
+  for (let i = 0; i < 200 && g.teardownFinished < 2; i++) await tick();
+  assert.equal(g.teardownFinished, 2);
+});
+
 test("background: the message edit catch-up still runs before the lease is released", async () => {
   const g = gatedSandbox();
   let asked = 0;
@@ -197,7 +271,7 @@ test("background: the message edit catch-up still runs before the lease is relea
           }
         : async () => [],
   }) as unknown as SurfaceCache;
-  const { orch } = buildOrchestrator(g.sandbox, undefined, createMockHarness(), false, surfaceCache);
+  const { orch } = buildOrchestrator(g.sandbox, undefined, createMockHarness(), surfaceCache);
   const result = await orch.handleTurn({
     ...dm("ch:C1:t1", "!run echo hi"),
     surface: "slack",

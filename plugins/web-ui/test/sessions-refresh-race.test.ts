@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { JSDOM } from "jsdom";
 import { createServer } from "vite";
-test("superseded session refreshes observe the winning refresh's list", async () => {
+test("session refresh bursts share one trailing read and observe its fresh list", async () => {
   const dom = new JSDOM('<!doctype html><div id="app"></div><main id="main"></main>', {
     url: "http://localhost/web-ui/",
   });
@@ -36,7 +36,7 @@ test("superseded session refreshes observe the winning refresh's list", async ()
   const pending: Array<(r: Response) => void> = [];
   globalThis.fetch = async (input) => {
     const path = String(input);
-    if (path === "/api/sessions") return new Promise<Response>((resolve) => pending.push(resolve));
+    if (path.startsWith("/api/sessions?")) return new Promise<Response>((resolve) => pending.push(resolve));
     if (path === "/api/contexts") return Response.json({ contexts: [] });
     throw new Error(`Unexpected request: ${path}`);
   };
@@ -58,13 +58,12 @@ test("superseded session refreshes observe the winning refresh's list", async ()
       ready = true;
     });
 
-    assert.equal(pending.length, 3, "three /api/sessions requests in flight");
-    const body = () => Response.json({ sessions: [sessionA] });
-    pending[0]!(body());
-    pending[1]!(body());
+    assert.equal(pending.length, 1, "a burst must not run overlapping session reads");
+    pending[0]!(Response.json({ sessions: [] }));
     await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.equal(ready, false, "sessionsReady() must wait for a winning refresh");
-    pending[2]!(body());
+    assert.equal(pending.length, 2, "one trailing read observes changes newer than the first snapshot");
+    assert.equal(ready, false, "sessionsReady() must wait for the fresh read");
+    pending[1]!(Response.json({ sessions: [sessionA] }));
     assert.equal(await pane2, true, "the winning refresh reports success");
     assert.equal(await boot, true, "a superseded refresh resolves with the winner's outcome");
     const p1 = await pane1;
@@ -140,12 +139,12 @@ function jsdomGlobals(): JSDOM {
   return dom;
 }
 
-test("opening a conversation joins the list refresh already in flight instead of starting its own", async () => {
+test("opening a conversation joins the first list load and leaves a current list to the delivery stream", async () => {
   const dom = jsdomGlobals();
   const pending: Array<(r: Response) => void> = [];
   globalThis.fetch = async (input) => {
     const path = String(input);
-    if (path === "/api/sessions") return new Promise<Response>((resolve) => pending.push(resolve));
+    if (path.startsWith("/api/sessions?")) return new Promise<Response>((resolve) => pending.push(resolve));
     if (path === "/api/contexts") return Response.json({ contexts: [] });
     throw new Error(`Unexpected request: ${path}`);
   };
@@ -163,13 +162,13 @@ test("opening a conversation joins the list refresh already in flight instead of
     await sessionsReady();
 
     refreshSessionsOnOpen();
+    refreshSessionsOnOpen();
     await new Promise((resolve) => setTimeout(resolve, 0));
-    assert.equal(pending.length, 2, "once it has landed, opening a conversation freshens the list again");
-
-    refreshSessionsOnOpen();
-    refreshSessionsOnOpen();
-    assert.equal(pending.length, 2, "…and panes restored together still share one refresh, loaded list or not");
-    pending[1]!(Response.json({ sessions: [] }));
+    assert.equal(
+      pending.length,
+      1,
+      "once it has landed, opening a conversation leaves the list to the delivery stream",
+    );
   } finally {
     await vite.close();
     dom.window.close();
@@ -200,12 +199,47 @@ test("a failed list load does not lock out the next conversation open", async ()
   }
 });
 
+test("after a background refresh fails, the next open refetches the loaded list", async () => {
+  const dom = jsdomGlobals();
+  const sessions = [{ id: "a", threadRef: "web:alex:a", scopeId: "personal:alex", title: "Before" }];
+  let failing = false;
+  let hits = 0;
+  globalThis.fetch = async (input) => {
+    const path = String(input);
+    if (path === "/api/contexts") return Response.json({ contexts: [] });
+    hits++;
+    if (failing) throw new Error("network down");
+    return Response.json({ sessions });
+  };
+
+  const vite = await createServer({ server: { middlewareMode: true, hmr: false, ws: false }, appType: "custom" });
+  try {
+    const { refreshSessions, refreshSessionsOnOpen, sessionsState } = await vite.ssrLoadModule("/src/sessions.ts");
+    assert.equal(await refreshSessions({ showLoading: true }), true);
+    failing = true;
+    assert.equal(await refreshSessions({ silent: true }), false);
+    failing = false;
+    sessions[0]!.title = "After";
+    refreshSessionsOnOpen();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(hits, 3, "an open repairs a list whose last refresh failed");
+    assert.equal(sessionsState.list[0]?.title, "After");
+    refreshSessionsOnOpen();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(hits, 3, "and leaves it alone once it is current again");
+  } finally {
+    await vite.close();
+    dom.window.close();
+  }
+});
+
 test("an open that joined a refresh whose answer was discarded asks again itself", async () => {
   const dom = jsdomGlobals();
   const pending: Array<(r: Response) => void> = [];
   globalThis.fetch = async (input) => {
     const path = String(input);
-    if (path === "/api/sessions") return new Promise<Response>((resolve) => pending.push(resolve));
+    if (path.startsWith("/api/sessions?")) return new Promise<Response>((resolve) => pending.push(resolve));
     if (path === "/api/contexts") return Response.json({ contexts: [] });
     throw new Error(`Unexpected request: ${path}`);
   };
@@ -254,6 +288,75 @@ test("an open that joined a refresh that simply failed does not double the load"
     assert.equal(await doomed, false);
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.equal(hits, 1, "a refresh that failed is not worth asking three more times while the server is down");
+  } finally {
+    await vite.close();
+    dom.window.close();
+  }
+});
+
+test("queued refreshes recover a failed read and retain the latest patch epoch", async () => {
+  const dom = jsdomGlobals();
+  const pending: Array<(r: Response) => void> = [];
+  globalThis.fetch = async (input) => {
+    if (String(input) === "/api/contexts") return Response.json({ contexts: [] });
+    return new Promise<Response>((resolve) => pending.push(resolve));
+  };
+  const vite = await createServer({ server: { middlewareMode: true, hmr: false, ws: false }, appType: "custom" });
+  try {
+    const { refreshSessions, sessionsState } = await vite.ssrLoadModule("/src/sessions.ts");
+    const first = refreshSessions({ silent: true });
+    const outdated = refreshSessions({ silent: true, patchEpoch: -1 });
+    const current = refreshSessions({ silent: true });
+    assert.equal(pending.length, 1);
+    pending[0]!(Response.json({ error: "unavailable" }, { status: 503 }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(pending.length, 2);
+    const session = { id: "s", threadRef: "web:alex:s", scopeId: "personal:alex", title: "Current" };
+    pending[1]!(Response.json({ sessions: [session] }));
+    assert.deepEqual(await Promise.all([first, outdated, current]), [true, true, true]);
+    assert.equal(sessionsState.list[0]?.title, "Current");
+
+    const started = refreshSessions({ silent: true });
+    const stale = refreshSessions({ silent: true, patchEpoch: -1 });
+    pending[2]!(Response.json({ sessions: [] }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    pending[3]!(Response.json({ sessions: [{ ...session, title: "Stale" }] }));
+    assert.deepEqual(await Promise.all([started, stale]), [false, false]);
+    assert.equal(sessionsState.list[0]?.title, "Current", "a queued obsolete patch recovery cannot overwrite state");
+  } finally {
+    await vite.close();
+    dom.window.close();
+  }
+});
+
+test("a stalled refresh can be replaced without old requests trapping later refreshes", async (t) => {
+  const dom = jsdomGlobals();
+  const pending: Array<(r: Response) => void> = [];
+  globalThis.fetch = async (input) => {
+    if (String(input) === "/api/contexts") return Response.json({ contexts: [] });
+    return new Promise<Response>((resolve) => pending.push(resolve));
+  };
+  const vite = await createServer({ server: { middlewareMode: true, hmr: false, ws: false }, appType: "custom" });
+  try {
+    const { refreshSessions, sessionsState } = await vite.ssrLoadModule("/src/sessions.ts");
+    let now = Date.now();
+    t.mock.method(Date, "now", () => now);
+    const stalled = refreshSessions({ silent: true });
+    const queued = refreshSessions({ silent: true });
+    now += 10_001;
+    const replacement = refreshSessions({ silent: true });
+    assert.equal(pending.length, 2, "a stalled request must not hold every caller indefinitely");
+    const session = { id: "s", threadRef: "web:alex:s", scopeId: "personal:alex", title: "Replacement" };
+    pending[1]!(Response.json({ sessions: [session] }));
+    assert.equal(await replacement, true);
+    const fresh = refreshSessions({ silent: true });
+    assert.equal(pending.length, 3, "the stalled request cannot make a finished replacement look active");
+    pending[2]!(Response.json({ sessions: [{ ...session, title: "Fresh" }] }));
+    assert.equal(await fresh, true);
+    pending[0]!(Response.json({ sessions: [] }));
+    assert.deepEqual(await Promise.all([stalled, queued]), [true, true]);
+    assert.equal(sessionsState.list[0]?.title, "Fresh");
+    assert.equal(pending.length, 3, "the abandoned queued refresh must not run after its replacement");
   } finally {
     await vite.close();
     dom.window.close();

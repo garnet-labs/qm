@@ -14,6 +14,7 @@ import { createDirectoryStore } from "../src/directory/directory-store.ts";
 import { createIdentityService } from "../src/identity/identity-service.ts";
 import { createMemorySessionStore } from "../src/sessions/memory-session-store.ts";
 import { scopeId } from "../src/types.ts";
+import { singleProcessDeps } from "./support/single-process.ts";
 
 const auditLog = { record() {}, events: async () => [], tail: async () => [] };
 
@@ -46,6 +47,7 @@ async function fixture(
   const upstreamPort = (upstream.address() as AddressInfo).port;
   const deployStore = createDeployStore();
   const deploy = createDeployService({
+    ...singleProcessDeps(),
     deployStore,
     provider: {
       profile: { managedScaleToZero: false },
@@ -164,19 +166,6 @@ test("without a subdomain configuration /d/ document navigations proxy in place"
     });
     assert.equal(nav.status, 200);
     assert.equal(nav.body, "UPSTREAM OK");
-  } finally {
-    await f.close();
-  }
-});
-
-test("owner-url without a subdomain configuration explains the /d/ path and the enabling env var", async () => {
-  const f = await fixture({});
-  try {
-    const r = await httpGet(f.port, "/v1/deployments/mysite/owner-url?principalId=alice@example.com", {});
-    assert.equal(r.status, 503);
-    const { message } = JSON.parse(r.body) as { message: string };
-    assert.match(message, /\/d\/mysite\//);
-    assert.match(message, /DEPLOY_APPS_DOMAIN/);
   } finally {
     await f.close();
   }

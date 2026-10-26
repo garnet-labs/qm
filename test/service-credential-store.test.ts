@@ -4,12 +4,14 @@ import { scopeId } from "../src/types.ts";
 import { createKeychain, isValidCredentialSlug, type KeychainCredential } from "../src/credentials/keychain.ts";
 import { createMemoryMap, type DurableMap } from "../src/persistence/durable-map.ts";
 import { deriveConnectorKey } from "../src/connectors/connector-client-store.ts";
+import { createMemoryAdvisoryLock } from "../src/persistence/advisory-lock.ts";
 
 const ORG = scopeId("org", "default-org");
 const KEY = deriveConnectorKey("test-connector-key-aaaaaaaaaaaaaaaa");
 
 function store(opts: { creds?: DurableMap<KeychainCredential> } = {}) {
   return createKeychain({
+    lock: createMemoryAdvisoryLock(),
     creds: opts.creds ?? createMemoryMap<KeychainCredential>(),
     grants: createMemoryMap(),
     asks: createMemoryMap(),
@@ -273,10 +275,15 @@ test("env delivery validates its envKey; broker refuses one", async () => {
 
 test("a service credential is available to published apps by default; the switch persists and reads back through both views", async () => {
   const cfg = store();
-  await cfg.setServiceCredential(ORG, { slug: "yc-data", name: "YC data", secret: "s", host: "api.example" });
+  await cfg.setServiceCredential(ORG, { slug: "acme-data", name: "Acme data", secret: "s", host: "api.example" });
   assert.equal((await cfg.listServiceCredentials(ORG))[0]!.deployments, true);
-  assert.equal((await cfg.getServiceCredentialSecret(ORG, "yc-data"))!.deployments, true);
-  await cfg.setServiceCredential(ORG, { slug: "yc-data", name: "YC data", host: "api.example", deployments: false });
+  assert.equal((await cfg.getServiceCredentialSecret(ORG, "acme-data"))!.deployments, true);
+  await cfg.setServiceCredential(ORG, {
+    slug: "acme-data",
+    name: "Acme data",
+    host: "api.example",
+    deployments: false,
+  });
   assert.equal((await cfg.listServiceCredentials(ORG))[0]!.deployments, false);
-  assert.equal((await cfg.getServiceCredentialSecret(ORG, "yc-data"))!.deployments, false);
+  assert.equal((await cfg.getServiceCredentialSecret(ORG, "acme-data"))!.deployments, false);
 });

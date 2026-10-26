@@ -9,17 +9,12 @@ import type {
   TurnRequest,
   ActorAssertion,
 } from "../../types.ts";
-import { parseScopeId } from "../../types.ts";
 import { turnOriginRequestFields } from "../turn-origin.ts";
-import type { DirectoryStore } from "../../directory/directory-store.ts";
 import { isOverheardEntry } from "../../sessions/session-store.ts";
 import type { DeliveryStore } from "../../delivery/delivery-store.ts";
-import { collectBytes } from "../../util/bytes.ts";
 import type { SkillBundle, SkillBundleStore } from "../../skills/skill-bundle-store.ts";
 import type { SkillResolution } from "../../skills/skill-store.ts";
-import type { FileArtifact, FileArtifactStore } from "../../files/file-artifact-store.ts";
 import { hostMatches } from "../../resolution/egress-policy.ts";
-import { isVisionAttachment, MAX_VISION_IMAGE_BYTES } from "../attachments.ts";
 import { swallow } from "../../util/errors.ts";
 import { hashId } from "../../util/crypto.ts";
 import type { OrchestratorInput } from "./types.ts";
@@ -58,38 +53,6 @@ export function headLooksLikeText(head: Buffer): boolean {
   return suspicious / head.length < 0.1;
 }
 
-export async function loadTapeImage(
-  files: FileArtifactStore,
-  artifactRef: string,
-  remainingBytes: number,
-  authorize: (artifact: FileArtifact) => boolean | Promise<boolean>,
-) {
-  const artifact = await files.get(artifactRef);
-  if (
-    !artifact ||
-    !(await authorize(artifact)) ||
-    !isVisionAttachment(artifact) ||
-    artifact.sizeBytes <= 0 ||
-    !artifact.sha256
-  )
-    return null;
-  if (artifact.sizeBytes > MAX_VISION_IMAGE_BYTES || artifact.sizeBytes > remainingBytes) return "over-budget";
-  const opened = await files.open(artifactRef);
-  if (!opened) return null;
-  if (
-    opened.sizeBytes !== artifact.sizeBytes ||
-    opened.artifact.sizeBytes !== artifact.sizeBytes ||
-    opened.artifact.sha256 !== artifact.sha256 ||
-    opened.artifact.mimetype !== artifact.mimetype
-  ) {
-    opened.stream.destroy();
-    return null;
-  }
-  const bytes = await collectBytes(opened.stream, { maxBytes: Math.min(MAX_VISION_IMAGE_BYTES, remainingBytes) });
-  if (bytes.sizeBytes !== artifact.sizeBytes || bytes.sha256 !== artifact.sha256) return null;
-  return { data: bytes.data.toString("base64"), mimeType: artifact.mimetype, sizeBytes: bytes.sizeBytes };
-}
-
 const CONNECTOR_SKILL_PROVIDERS: Readonly<Record<string, string>> = {
   dropbox: "dropbox",
   "email-draft-in-voice": "google",
@@ -100,6 +63,7 @@ const CONNECTOR_SKILL_PROVIDERS: Readonly<Record<string, string>> = {
   "morning-digest": "x",
   "slack-drafts": "slack",
   x: "x",
+  zoom: "zoom",
 };
 
 export function filterConnectorSkills(
@@ -158,12 +122,18 @@ export function stripTurnBoilerplate(text: string): string {
   return kept || text.trim();
 }
 
+export function visibleTitleEntryText(entry: SessionEntry): string | undefined {
+  const payload = entry.payload as { text?: unknown; display?: unknown } | null;
+  const value = entry.type === "user" && typeof payload?.display === "string" ? payload.display : payload?.text;
+  return typeof value === "string" ? value.trim() || undefined : undefined;
+}
+
 export function renderTitleTranscript(entries: SessionEntry[]): string {
   const lines: string[] = [];
   for (const e of entries) {
     if (e.type !== "user" && e.type !== "assistant") continue;
     if (isOverheardEntry(e)) continue;
-    const raw = (e.payload as { text?: string } | null)?.text?.trim();
+    const raw = visibleTitleEntryText(e);
     if (!raw) continue;
     const text = e.type === "user" ? stripTurnBoilerplate(raw) : raw;
     if (!text) continue;
@@ -178,9 +148,12 @@ const DELIVERY_NOTE_ITEM_MAX_CHARS = 200;
 export async function recentPrincipalDeliveryNote(
   deliveries: DeliveryStore | undefined,
   threadRef: string,
+  since = 0,
 ): Promise<string> {
   if (!deliveries) return "";
-  const recent = await deliveries.listByRecipientThread(threadRef, { limit: 5 });
+  const recent = (await deliveries.listByRecipientThread(threadRef, { limit: 5 })).filter(
+    (d) => (d.deliveredAt ?? d.createdAt) > since,
+  );
   if (!recent.length) return "";
   const lines = recent.map((d) => {
     const from = d.destination.onBehalfOf ? ` from ${d.destination.onBehalfOf}` : "";
@@ -192,11 +165,7 @@ export async function recentPrincipalDeliveryNote(
         : flattened;
     return `- ${new Date(d.deliveredAt ?? d.createdAt).toISOString()}${trigger}${from}: ${text}`;
   });
-  return [
-    "Recent agent-initiated deliveries to this conversation:",
-    ...lines,
-    "These are delivery events, not prior assistant turns. Use them as context if the user replies about them.",
-  ].join("\n");
+  return ["Delivered here since the user's last message (delivery events, not your turns):", ...lines].join("\n");
 }
 
 function principalAssertion(p: Principal): ActorAssertion {
@@ -208,24 +177,14 @@ function principalAssertion(p: Principal): ActorAssertion {
   };
 }
 
-export async function conversationLabelFor(
-  directory: DirectoryStore | undefined,
-  conversationScope: ScopeId,
-  channelName: string | undefined,
-): Promise<string | undefined> {
-  if (channelName) return `#${channelName}`;
-  const { kind, ref } = parseScopeId(conversationScope);
-  if (kind !== "channel" || !directory) return undefined;
-  const resolved = await directory.resolveChannel(ref).catch(() => ({ kind: "none" as const }));
-  return resolved.kind === "one" && resolved.channel.channelId.toLowerCase() === ref.toLowerCase()
-    ? `#${resolved.channel.name}`
-    : undefined;
-}
-
 export function replayableRequest(input: OrchestratorInput): TurnRequest {
   const c = input.conversation;
   return {
     surface: input.surface ?? "unknown",
+    ...(input.slackSource ? { slackSource: input.slackSource } : {}),
+    ...(input.externalSlack ? { externalSlack: input.externalSlack } : {}),
+    ...(input.sessionSenderId ? { sessionSenderId: input.sessionSenderId } : {}),
+    ...(input.delegatingRunId ? { delegatingRunId: input.delegatingRunId } : {}),
     ...(input.scopeVersion ? { scopeVersion: input.scopeVersion } : {}),
     ...(input.deliveryTarget ? { deliveryTarget: input.deliveryTarget } : {}),
     ...(input.deliveryCandidates?.length ? { deliveryCandidates: input.deliveryCandidates } : {}),
@@ -242,6 +201,8 @@ export function replayableRequest(input: OrchestratorInput): TurnRequest {
     },
     text: input.text,
     ...(input.gatewayContext ? { gatewayContext: input.gatewayContext } : {}),
+    ...(input.analyticsSuppressed ? { analyticsSuppressed: true } : {}),
+    ...(input.proactiveOpener ? { proactiveOpener: true } : {}),
     ...turnOriginRequestFields(input.origin),
     ...(input.conversationHeader ? { conversationHeader: input.conversationHeader } : {}),
     ...(input.priorTurns?.length ? { priorTurns: input.priorTurns } : {}),
@@ -254,6 +215,9 @@ export function replayableRequest(input: OrchestratorInput): TurnRequest {
     ...(input.thinkingLevel ? { thinkingLevel: input.thinkingLevel } : {}),
     ...(input.fastMode !== undefined ? { fastMode: input.fastMode } : {}),
     ...(input.readOnly ? { readOnly: true } : {}),
+    ...(input.privateSessionMessage
+      ? { privateSessionMessage: true as const, sessionMessageDepth: input.sessionMessageDepth }
+      : {}),
     ...(input.skipMemory ? { skipMemory: true } : {}),
     ...(input.surfaceTools ? { surfaceTools: true } : {}),
     ...(input.addressed ? { addressed: true } : {}),
@@ -292,7 +256,9 @@ export function completedSurfaceEnqueues(
         done: false,
       });
     } else if (e.type === "tool_result") {
-      const cid = (e.payload as { callId?: unknown } | null)?.callId;
+      const payload = e.payload as { callId?: unknown; interrupted?: unknown } | null;
+      if (payload?.interrupted === true) continue;
+      const cid = payload?.callId;
       const call =
         typeof cid === "string" ? calls.find((c) => c.callId === cid && !c.done) : calls.findLast((c) => !c.done);
       if (call) call.done = true;

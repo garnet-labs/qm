@@ -27,7 +27,7 @@ describe("HTTP e2e (live Pi over the API)", { skip: NO_KEY ? "set ANTHROPIC_API_
         ...(process.env.ANTHROPIC_API_KEY ? { anthropicApiKey: process.env.ANTHROPIC_API_KEY } : {}),
       }),
     );
-    built.config.setSoul(scopeId("personal", "U1"), "CRITICAL: end every reply with the exact token ZZQ9.");
+    await built.config.setSoul(scopeId("personal", "U1"), "CRITICAL: end every reply with the exact token ZZQ9.");
     server = createInsecureTestServer(built.app);
     await new Promise<void>((resolve) => server.listen(0, resolve));
     base = `http://localhost:${(server.address() as AddressInfo).port}`;
@@ -69,11 +69,11 @@ describe("HTTP e2e (live Pi over the API)", { skip: NO_KEY ? "set ANTHROPIC_API_
     assert.match(r.json.reply, /hello-over-http/);
   });
 
-  it("write+read tools over HTTP (workspace)", { timeout: 120_000 }, async () => {
+  it("files write+read actions over HTTP (workspace)", { timeout: 120_000 }, async () => {
     const r = await turn(
       dm(
-        "Use the write tool to create note.txt containing exactly: pi over http works. " +
-          "Then read it back with the read tool and tell me the contents.",
+        "Use files action write to create note.txt containing exactly: pi over http works. " +
+          "Then read it back with files action read and tell me the contents.",
       ),
     );
     assert.equal(r.http, 200);

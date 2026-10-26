@@ -21,7 +21,7 @@ function capturingRunPrompt(reply = "one-shot reply"): {
 test("harness adapters forward tool-result screening into their tool bridge", () => {
   const screenToolResult: NonNullable<HarnessTurnInput["screenToolResult"]> = async () => ({ outcome: "allow" });
   const toolApprovalGate: NonNullable<HarnessTurnInput["toolApprovalGate"]> = () => true;
-  const ref = harnessToolContext({ screenToolResult, toolApprovalGate } as HarnessTurnInput);
+  const ref = harnessToolContext({ screenToolResult, toolApprovalGate, history: [] } as unknown as HarnessTurnInput);
   assert.equal(ref.screenToolResult, screenToolResult);
   assert.equal(ref.toolApprovalGate, toolApprovalGate);
   assert.equal(ref.pausedOnApproval, false);
@@ -97,6 +97,16 @@ test("without a configured judge model, judge falls back to the harness default 
   assert.equal(turns[0]!.runtime, undefined);
 });
 
+test("routing judge cancellation reaches the model turn", async () => {
+  const { turns, runPrompt } = capturingRunPrompt();
+  const utilities = oneShotModelUtilities(oneShotRunner(runPrompt));
+  const controller = new AbortController();
+  await utilities.judge!("s", "p", controller.signal);
+  assert.equal(turns[0]!.cancel, controller.signal);
+  controller.abort();
+  assert.equal(turns[0]!.cancel?.aborted, true);
+});
+
 test("security screening passes the abort signal and instrumentation through the one-shot runner", async () => {
   const { turns, runPrompt } = capturingRunPrompt('{"decision":"auto"}');
   const utilities = oneShotModelUtilities(oneShotRunner(runPrompt));
@@ -135,4 +145,22 @@ test("shared harness security screens use auxiliary coordinates", async () => {
   assert.equal(recorded[0]!.turnSeq, null);
   assert.equal(recorded[0]!.step, SECURITY_SCREEN_STEP);
   assert.equal(recorded[0]!.model, "claude-oneshot");
+});
+
+test("harness adapters hand the session goal and its saver to the tool context, ignoring legacy snapshots", async () => {
+  const { createGoalRecord } = await import("../src/harness/goal.ts");
+  const goal = createGoalRecord({ objective: "carry the goal across turns" });
+  const history = [
+    { type: "system", payload: { kind: "goal", goal }, seq: 0 },
+  ] as unknown as HarnessTurnInput["history"];
+  assert.equal(harnessToolContext({ history } as unknown as HarnessTurnInput).goal, null);
+  const saveGoal = async () => {};
+  const ref = harnessToolContext({ history: [], goal, saveGoal } as unknown as HarnessTurnInput);
+  assert.equal(ref.goal, goal);
+  assert.equal(ref.saveGoal, saveGoal);
+  assert.equal(ref.goalRound, undefined);
+  assert.equal(
+    harnessToolContext({ history: [], goal, goalContinuation: true } as unknown as HarnessTurnInput).goalRound,
+    1,
+  );
 });

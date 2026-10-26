@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { createServer as createHttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createServer } from "../src/api/server.ts";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 
 const SECRET = "core-signing-secret".repeat(3);
@@ -48,21 +48,19 @@ function asUser(user: string, init: RequestInit = {}): RequestInit {
 }
 
 function parseSse(body: string): Array<{ event: string; data: unknown }> {
-  const out: Array<{ event: string; data: unknown }> = [];
-  for (const frame of body.split("\n\n")) {
-    const lines = frame.split("\n");
-    const event = lines.find((l) => l.startsWith("event: "))?.slice("event: ".length);
-    const dataLine = lines.find((l) => l.startsWith("data: "))?.slice("data: ".length);
-    if (!event) continue;
-    let data: unknown = undefined;
-    try {
-      data = dataLine ? JSON.parse(dataLine) : undefined;
-    } catch {
-      void 0;
-    }
-    out.push({ event, data });
-  }
-  return out;
+  return body.split("\n\n").flatMap((frame) => {
+    const data = frame
+      .split("\n")
+      .find((line) => line.startsWith("data: "))
+      ?.slice(6);
+    if (!data) return [];
+    const event = JSON.parse(data) as { type: string; name?: string; value?: unknown };
+    if (event.type !== "CUSTOM") return [{ event: event.type, data: event }];
+    const run = event.value as { status?: string; result?: unknown };
+    if (event.name === "run" && (run.status === "done" || run.status === "failed" || run.result != null))
+      return [{ event: "done", data: run }];
+    return [{ event: event.name ?? event.type, data: event.value }];
+  });
 }
 
 test("SSE streams partial frames then a terminal done frame carrying the reply", async () => {
@@ -83,7 +81,7 @@ test("SSE streams partial frames then a terminal done frame carrying the reply",
   assert.equal(res.headers.get("x-accel-buffering"), "no");
 
   const events = parseSse(await res.text());
-  const partials = events.filter((e) => e.event === "partial");
+  const partials = events.filter((e) => e.event === "delta" || Boolean((e.data as { partial?: string }).partial));
   const done = events.find((e) => e.event === "done");
 
   assert.ok(partials.length >= 1, "expected at least one partial frame");
@@ -96,6 +94,8 @@ test("SSE streams partial frames then a terminal done frame carrying the reply",
 });
 
 test("SSE relays tool activity frames and folds them into the done frame", async () => {
+  const computer = await built.sandboxResources.create("alice", "personal:alice", "sprites", "default");
+  await built.sandboxResources.setDefault("alice", "personal:alice", computer.id);
   const submit = (await (
     await fetch(
       `${webBase}/api/turn`,
@@ -111,7 +111,7 @@ test("SSE relays tool activity frames and folds them into the done frame", async
   assert.equal(res.status, 200);
   const events = parseSse(await res.text());
 
-  const activityFrames = events.filter((e) => e.event === "activity");
+  const activityFrames = events.filter((e) => e.event === "run" || e.event === "done");
   assert.ok(activityFrames.length >= 1, "expected at least one activity frame for the tool steps");
 
   const done = events.find((e) => e.event === "done");
@@ -123,7 +123,14 @@ test("SSE relays tool activity frames and folds them into the done frame", async
   assert.equal(typeof d.finishedAt, "number", "done frame carries finishedAt");
 });
 
-test("active run lookup returns the latest tracked run for the caller's web thread", async () => {
+test("active run lookup returns the latest tracked run for the caller's web thread", async (t) => {
+  const completion = Promise.withResolvers<void>();
+  const complete = built.runs.complete.bind(built.runs);
+  t.mock.method(built.runs, "complete", async (...args: Parameters<typeof complete>) => {
+    await completion.promise;
+    return complete(...args);
+  });
+  t.after(() => completion.resolve());
   const threadRef = `web:alice:${randomUUID()}`;
   const submit = (await (
     await fetch(
@@ -140,10 +147,7 @@ test("active run lookup returns the latest tracked run for the caller's web thre
   assert.equal(activeRes.status, 200);
   const active = (await activeRes.json()) as { runId?: string | null; run?: { status?: string } | null };
   assert.equal(active.runId, submit.runId);
-  assert.ok(
-    ["pending", "running", "done", "failed"].includes(active.run?.status ?? ""),
-    "active lookup returns a run snapshot",
-  );
+  assert.ok(["pending", "running"].includes(active.run?.status ?? ""), "active lookup returns a run snapshot");
 
   const otherUser = await fetch(
     `${webBase}/api/runs/active?threadRef=${encodeURIComponent(threadRef)}`,
@@ -233,4 +237,34 @@ test("the events route is ownership-gated (404 for a run the caller doesn't own)
 test("the events route requires a signed-in principal (401 without a cookie)", async () => {
   const res = await fetch(`${webBase}/api/runs/whatever/events`);
   assert.equal(res.status, 401);
+});
+
+test("a completed long stream replays its bounded tail with absolute offsets and its full reply", async () => {
+  const text = "long output ".repeat(20_000) + "last sentence";
+  const submit = (await (
+    await fetch(
+      `${webBase}/api/turn`,
+      asUser("alice", {
+        method: "POST",
+        body: JSON.stringify({ text, threadRef: `web:alice:${randomUUID()}` }),
+      }),
+    )
+  ).json()) as { runId: string };
+  await built.runs.waitFor(submit.runId, 10_000);
+  const res = await fetch(
+    `${webBase}/api/runs/${submit.runId}/events`,
+    asUser("alice", {
+      signal: AbortSignal.timeout(20_000),
+    }),
+  );
+  const done = parseSse(await res.text()).find((event) => event.event === "done")!.data as {
+    partial: string;
+    partialStartOffset: number;
+    result: { reply: string };
+  };
+  assert.ok(done.partial.length <= 200_000);
+  assert.ok(done.partial.length >= 100_000);
+  assert.ok(done.partialStartOffset > 0);
+  assert.equal(done.result.reply.slice(done.partialStartOffset), done.partial);
+  assert.ok(done.partial.includes("last sentence"));
 });

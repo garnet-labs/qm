@@ -1,5 +1,6 @@
 import { request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { signedHeaders } from "../../chassis/src/core-client.ts";
+import { withVary } from "../../chassis/src/http.ts";
 import { mintPortalIdentity, PORTAL_IDENTITY_HEADER } from "../../chassis/src/portal-identity.ts";
 
 const IDENTITY_TTL_MS = 60_000;
@@ -53,7 +54,7 @@ function relay(
     hostname: string;
     port?: string;
     path: string;
-    headers: Record<string, string>;
+    headers: Record<string, string | string[]>;
     honorFramePolicy?: boolean;
     forwardCookies?: boolean;
   },
@@ -75,6 +76,7 @@ function relay(
           continue;
         out[k] = v;
       }
+      if (out.vary !== undefined) out.vary = withVary(res, String(out.vary));
       if (target.honorFramePolicy && declaresFrameAncestors(out)) res.removeHeader("x-frame-options");
       res.writeHead(upRes.statusCode ?? 502, out);
       upRes.on("error", () => res.destroy());
@@ -105,6 +107,7 @@ export interface SurfaceTarget {
   displayName?: string;
   impersonator?: string;
   identitySecret?: string;
+  authenticatedPrincipal?: string;
   nowMs?: number;
 }
 
@@ -120,6 +123,7 @@ export function proxyToSurface(req: IncomingMessage, res: ServerResponse, t: Sur
     base[PORTAL_IDENTITY_HEADER] = mintPortalIdentity(
       {
         p: t.principal,
+        ...(t.authenticatedPrincipal ? { authenticatedAs: t.authenticatedPrincipal } : {}),
         ...(t.displayName ? { n: t.displayName } : {}),
         ...(t.impersonator ? { imp: t.impersonator } : {}),
         exp: now + IDENTITY_TTL_MS,
@@ -147,6 +151,7 @@ export const FORWARD_WEBHOOK_HEADERS = [
   "x-slack-signature",
   "x-slack-request-timestamp",
   "stripe-signature",
+  "linear-signature",
   "x-signature",
   "x-delivery-id",
 ];
@@ -237,3 +242,39 @@ export function proxyToUpstream(
 }
 
 export const FORWARD_BROKER_HEADERS = ["accept", "accept-language", "user-agent", "content-type", "content-length"];
+
+export function proxyToAppHost(req: IncomingMessage, res: ServerResponse, coreBase: string, clientIp?: string): void {
+  const upstream = new URL(coreBase);
+  const blocked = new Set([
+    ...DROP_RESPONSE_HEADERS,
+    "x-signature",
+    "x-timestamp",
+    "x-as-principal",
+    "x-admin-actor",
+    "x-agent-capability",
+    PORTAL_IDENTITY_HEADER,
+    "x-qm-app-host",
+    "x-qm-client-ip",
+    "forwarded",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-for",
+    ...(req.headers.connection ?? "").split(",").map((name) => name.trim().toLowerCase()),
+  ]);
+  const headers: Record<string, string | string[]> = {
+    "x-qm-app-host": "1",
+    ...(clientIp ? { "x-qm-client-ip": clientIp } : {}),
+  };
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (value !== undefined && !blocked.has(name)) headers[name] = value;
+  }
+  res.removeHeader("x-frame-options");
+  relay(req, res, {
+    protocol: upstream.protocol,
+    hostname: upstream.hostname,
+    port: requestPort(upstream),
+    path: req.url ?? "/",
+    headers,
+    forwardCookies: true,
+  });
+}

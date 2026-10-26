@@ -1,10 +1,9 @@
-export { isBoundaryRefusal, refusalDelivery, postThenAckRunDelivery, refusalNote } from "./refusals.ts";
+export { refusalDelivery, postThenAckRunDelivery, refusalNote } from "./refusals.ts";
 export { inlineCode, clip, sleep } from "./util.ts";
 export { safeChunks } from "./safe-cut.ts";
 export {
   decodeSlackEntities,
   resolveMentionsInText,
-  stripMention,
   neutralizeMassMentions,
   neutralizeMentions,
   wireMentionKeys,
@@ -57,8 +56,6 @@ export {
   hydrateSlackFiles,
   MAX_ATTACHMENT_BYTES,
   isOversize,
-  type ThreadMessage,
-  collectEarlierThreadFiles,
   isTrustedSlackHost,
   attachmentFromBytes,
   MAX_ATTACHMENTS_PER_TURN,
@@ -73,19 +70,12 @@ export {
   APPROVAL_ACTION_IDS,
   approvalCardDestination,
   approvalMessage,
+  approvalDecisionMessage,
+  type ApprovalDecisionRecord,
   type StoredApproval,
   recoveredApprovalContext,
   createApprovalRegistry,
 } from "./approval-cards.ts";
-export {
-  type AgentRequestActionId,
-  AGENT_REQUEST_ACTION_IDS,
-  type AgentRequestDirective,
-  agentRequestMessage,
-  AGENT_REQUEST_INSTRUCTION,
-  extractAgentRequests,
-  stripAgentRequestDirectives,
-} from "./agent-requests.ts";
 export {
   encodeTs,
   decodeTs,
@@ -109,7 +99,6 @@ export {
   buildContextWindow,
   type RecentMessage,
   MAX_RECENT_MESSAGES,
-  MAX_TOP_LEVEL_CONTEXT_AGE_S,
   recentWindow,
   resolveMentions,
   type ConversationView,
@@ -142,6 +131,7 @@ export {
   postWithVerify,
   findPostedByKey,
   recoveryVerifyOldest,
+  statusPlaceholderKey,
   deliveryMetadata,
   type DeliveryMetadata,
   type PostedPart,
@@ -154,10 +144,6 @@ export {
   CURATED_ACK_EMOJI,
   stripAckPrefix,
   createAckPresenter,
-  type RunTaskView,
-  renderTaskList,
-  type TaskListPresenter,
-  createTaskListPresenter,
   renderGoalNotice,
   type GoalNoticeView,
   type GoalNoticePresenter,

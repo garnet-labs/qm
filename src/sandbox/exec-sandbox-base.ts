@@ -1,3 +1,4 @@
+import { cleanupFailedProvision } from "./sandbox.ts";
 import { randomUUID } from "node:crypto";
 import type { WorkspaceLayer } from "../types.ts";
 import type { WorkspaceStore } from "../workspace/workspace-store.ts";
@@ -19,12 +20,26 @@ const RO_LAYERS_TAR = ".ro-layers.tar";
 const RO_LAYERS_MANIFEST = ".ro-layers.manifest";
 const PREP_TIMEOUT_SEC = 60;
 
+// Provider instance names are DNS-style labels; Sprites rejects anything over 63 chars.
+const MAX_SANDBOX_NAME = 63;
+const HASH_LEN = 6;
+
 export const sandboxScopeName = (prefix: string, id: string): string => {
   const cleaned = id
     .toLowerCase()
     .replace(/[^a-z0-9-]+/g, "-")
     .replace(/^-+|-+$/g, "");
-  return `${prefix}-${cleaned.slice(0, 40).replace(/-+$/, "") || "scope"}-${shortHash(id)}`;
+  const name = `${prefix}-${cleaned.slice(0, 40).replace(/-+$/, "") || "scope"}-${shortHash(id)}`;
+  // Names that already fit are kept byte-for-byte so existing computers stay addressable.
+  if (name.length <= MAX_SANDBOX_NAME) return name;
+  // Over budget (long deployment prefix, or prefix + "-scratch"): shorten the readable parts and
+  // hash the full untruncated name so distinct prefixes/ids still map to distinct names.
+  const hash = shortHash(name);
+  const slugBudget = MAX_SANDBOX_NAME - prefix.length - HASH_LEN - 2;
+  const slug = slugBudget > 0 ? cleaned.slice(0, slugBudget).replace(/-+$/, "") : "";
+  if (slug) return `${prefix}-${slug}-${hash}`;
+  const head = prefix.slice(0, MAX_SANDBOX_NAME - HASH_LEN - 1).replace(/-+$/, "");
+  return head ? `${head}-${hash}` : hash;
 };
 
 export interface ExecSandboxBaseDeps {
@@ -47,6 +62,7 @@ export interface ExecSandboxBaseDeps {
   forgetInstance?(name: string): void;
   ensureEgress?(name: string): Promise<void>;
   installLayerTools?: LayerToolInstaller;
+  combineLayerToolPrep?: boolean;
 }
 
 export interface ExecSandboxBase {
@@ -78,7 +94,20 @@ export function createExecSandboxBase(deps: ExecSandboxBaseDeps): ExecSandboxBas
     return provisionQueue(`scratch:${key}`, async () => {
       scratchKeyByName.set(name, key);
       const active = activeScratch.get(name) ?? 0;
-      if (active === 0 && !deps.isProvisioned(name)) await deps.recreateScratch(name);
+      if (active === 0 && !deps.isProvisioned(name)) {
+        try {
+          await deps.recreateScratch(name);
+        } catch (error) {
+          deps.forgetInstance?.(name);
+          await cleanupFailedProvision(
+            { teardown: () => deps.deleteInstance(name) },
+            { id: name, rootDir: workspaceDir, scratch: true, backend: label },
+            error,
+          );
+          scratchKeyByName.delete(name);
+          throw error;
+        }
+      }
       activeScratch.set(name, active + 1);
       return { name, coldStart: active === 0 };
     });
@@ -114,6 +143,7 @@ export function createExecSandboxBase(deps: ExecSandboxBaseDeps): ExecSandboxBas
         deps.forgetInstance?.(handle.id);
         if (tdOpts?.destroy) await deps.deleteInstance(handle.id);
         else await deps.deleteInstance(handle.id).catch(swallowAs(`${label}-sandbox: scratch delete`, undefined));
+        scratchKeyByName.delete(handle.id);
       });
     }
     if (!tdOpts?.destroy) return;
@@ -157,15 +187,21 @@ export function createExecSandboxBase(deps: ExecSandboxBaseDeps): ExecSandboxBas
       const turnEnv = Object.fromEntries(
         Object.entries(provOpts?.env ?? {}).filter(([k]) => !DROPPED_PROXY_ENV.has(k)),
       );
-      const env = {
-        ...turnEnv,
-        ...(forceEgress ? forceThroughProxyEnv(deps.egressProxyUrl!, provOpts!.egressToken!) : {}),
-      };
+      const env = forceEgress ? forceThroughProxyEnv(deps.egressProxyUrl!, provOpts!.egressToken!, turnEnv) : turnEnv;
       if (Object.keys(env).length) handle.env = env;
       const credLinks = scratch ? "" : ` && ${ephemeralCredLinkScript(homeDir, deps.credentialPaths)}`;
-      const prep = await deps.exec(name, `mkdir -p ${shq(workspaceDir)}${credLinks}`, PREP_TIMEOUT_SEC);
-      if (prep.code !== 0)
-        throw new Error(`${label} provision prep failed: ${execFailureDetail(prep, PREP_TIMEOUT_SEC).slice(0, 200)}`);
+      const prepare = `mkdir -p ${shq(workspaceDir)}${credLinks}`;
+      const toolIo = {
+        exec: (script: string, t: number) => deps.exec(name, script, t),
+        writeAbs: (abs: string, data: Uint8Array) => deps.writeAbsBytes(name, abs, data),
+      };
+      if (deps.combineLayerToolPrep && deps.installLayerTools) {
+        await deps.installLayerTools(toolIo, prepare);
+      } else {
+        const prep = await deps.exec(name, prepare, PREP_TIMEOUT_SEC);
+        if (prep.code !== 0)
+          throw new Error(`${label} provision prep failed: ${execFailureDetail(prep, PREP_TIMEOUT_SEC).slice(0, 200)}`);
+      }
 
       await materializeRoLayers(
         workspace,
@@ -178,14 +214,11 @@ export function createExecSandboxBase(deps: ExecSandboxBaseDeps): ExecSandboxBas
         },
         { manifest: RO_LAYERS_MANIFEST, tar: RO_LAYERS_TAR, label },
       );
-      await deps.installLayerTools?.({
-        exec: (script, t) => deps.exec(name, script, t),
-        writeAbs: (abs, data) => deps.writeAbsBytes(name, abs, data),
-      });
+      if (!deps.combineLayerToolPrep) await deps.installLayerTools?.(toolIo);
 
       return handle;
     } catch (err) {
-      await teardown(handle).catch(swallowAs(`${label}-sandbox: teardown after failed provision`, undefined));
+      await cleanupFailedProvision({ teardown }, handle, err);
       throw err;
     }
   }

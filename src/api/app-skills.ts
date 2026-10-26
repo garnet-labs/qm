@@ -15,6 +15,36 @@ import { principalEntitledToScope } from "../resolution/context-filter.ts";
 import type { Principal } from "../types.ts";
 import type { AppHelpers } from "./app-helpers.ts";
 
+export async function skillVisibilityContext(
+  deps: AppDeps,
+  h: AppHelpers,
+  principalId: string,
+  homes: readonly ScopeId[],
+) {
+  const actor = deps.identity.classify(principalId);
+  const sharedHomes = [
+    ...new Set(
+      homes.filter((sid) => {
+        const k = parseScopeId(sid).kind;
+        return k === "channel" || k === "group";
+      }),
+    ),
+  ];
+  const accessibleScopes = new Set(await h.currentResourceScopesForViewer(principalId));
+  const member = sharedHomes.map((sid) => (accessibleScopes.has(sid) ? sid : null));
+  const shared = member.filter((sid): sid is ScopeId => sid !== null);
+  const teams = (actor.teamIds ?? []).map((t) => scopeId("team", t));
+  const ordered = [...new Set([scopeId("personal", principalId), ...shared, ...teams, scopeId("org", orgIdOf())])];
+  const entitled = (p: Principal, label: ScopeId, sess: ScopeId, org: ScopeId) =>
+    principalEntitledToScope(p, label, sess, org) || accessibleScopes.has(label);
+  const granted = (
+    await deps.acl
+      .sharedOfKindForAudience("skill", [actor], scopeId("personal", principalId), scopeId("org", orgIdOf()), entitled)
+      .catch(() => [])
+  ).map((g) => ({ id: parseRef(g.ref).id, ownerScopeId: g.ownerScopeId }));
+  return { ordered, granted };
+}
+
 function requireRegistry(deps: AppDeps): { packs: SkillPackStore; fetcher: SkillPackFetcher } {
   if (!deps.skillPacks || !deps.skillFetcher) throw new Error("skill registry not configured");
   return { packs: deps.skillPacks, fetcher: deps.skillFetcher };
@@ -23,7 +53,9 @@ function requireRegistry(deps: AppDeps): { packs: SkillPackStore; fetcher: Skill
 async function nativeNamesFor(deps: AppDeps, packId: string, scope: ScopeId): Promise<Set<string>> {
   const all = await deps.skills.list();
   return new Set(
-    all.filter((s) => s.scopeId === scope && s.createdBy !== `pack:${packId}`).map((s) => s.manifest.name),
+    all
+      .filter((s) => s.scopeId === scope && s.status !== "archived" && s.pack?.packId !== packId)
+      .map((s) => s.manifest.name),
   );
 }
 
@@ -41,7 +73,7 @@ async function importedPackSkills(
 async function buildClaimedPaths(deps: AppDeps, exceptPackId: string, scopeId: ScopeId): Promise<Map<string, string>> {
   const claimed = new Map<string, string>();
   for (const s of await deps.skills.list()) {
-    if (s.status !== "published" || s.createdBy === `pack:${exceptPackId}` || s.scopeId !== scopeId) continue;
+    if (s.status !== "published" || s.pack?.packId === exceptPackId || s.scopeId !== scopeId) continue;
     for (const p of persistedSkillRecordPaths(s.manifest.name, s.manifest.files)) claimed.set(p, s.createdBy);
   }
   return claimed;
@@ -62,7 +94,7 @@ async function archiveRemoved(deps: AppDeps, packId: string, scopeId: ScopeId, k
   const keptSet = new Set(kept);
   const archived: string[] = [];
   for (const s of await deps.skills.list()) {
-    if (s.createdBy !== `pack:${packId}` || s.scopeId !== scopeId || s.status === "archived") continue;
+    if (s.pack?.packId !== packId || s.scopeId !== scopeId || s.status === "archived") continue;
     const upstream = s.pack?.upstreamName;
     if (upstream && !keptSet.has(upstream)) {
       await deps.skills.archive(s.id);
@@ -209,7 +241,7 @@ export function createSkillMethods(
   | "createOwnedSkill"
   | "deleteOwnedSkill"
 > {
-  const { canManageSkill, republishIfShared, currentResourceScopesForViewer } = h;
+  const { canManageSkill, republishIfShared } = h;
   return {
     listSkills() {
       return deps.skills.list();
@@ -221,35 +253,12 @@ export function createSkillMethods(
       return deps.skills.archive(id);
     },
     async listVisibleSkills(principalId) {
-      const actor = deps.identity.classify(principalId);
-      const sharedHomes = [
-        ...new Set(
-          (await deps.skills.list())
-            .map((s) => s.scopeId)
-            .filter((sid) => {
-              const k = parseScopeId(sid).kind;
-              return k === "channel" || k === "group";
-            }),
-        ),
-      ];
-      const accessibleScopes = new Set(await currentResourceScopesForViewer(principalId));
-      const member = sharedHomes.map((sid) => (accessibleScopes.has(sid) ? sid : null));
-      const shared = member.filter((sid): sid is ScopeId => sid !== null);
-      const teams = (actor.teamIds ?? []).map((t) => scopeId("team", t));
-      const ordered = [...new Set([scopeId("personal", principalId), ...shared, ...teams, scopeId("org", orgIdOf())])];
-      const entitled = (p: Principal, label: ScopeId, sess: ScopeId, org: ScopeId) =>
-        principalEntitledToScope(p, label, sess, org) || accessibleScopes.has(label);
-      const granted = (
-        await deps.acl
-          .sharedOfKindForAudience(
-            "skill",
-            [actor],
-            scopeId("personal", principalId),
-            scopeId("org", orgIdOf()),
-            entitled,
-          )
-          .catch(() => [])
-      ).map((g) => ({ id: parseRef(g.ref).id, ownerScopeId: g.ownerScopeId }));
+      const { ordered, granted } = await skillVisibilityContext(
+        deps,
+        h,
+        principalId,
+        (await deps.skills.list()).map((s) => s.scopeId),
+      );
       return deps.skills.visibleFor(ordered, granted);
     },
     canManageSkill(skill, principalId) {
@@ -371,7 +380,7 @@ export function createSkillMethods(
     async removeSkillPack(id) {
       const { packs } = requireRegistry(deps);
       return withSkillMutationLock(deps, async () => {
-        const mine = (await deps.skills.list()).filter((s) => s.createdBy === `pack:${id}`);
+        const mine = (await deps.skills.list()).filter((s) => s.pack?.packId === id);
         for (const s of mine) await deps.skills.delete(s.id);
         await deps.skillBundles?.delete(id);
         await packs.remove(id);

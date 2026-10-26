@@ -32,6 +32,7 @@ export interface DeployEndpoint {
   tls?: boolean;
   httpVersion?: "1.1" | "2";
   proxyHeaders?: Record<string, string>;
+  socksProxyPort?: number;
 }
 
 export function publicUrlOf(endpoint: DeployEndpoint | null | undefined): string | undefined {
@@ -67,9 +68,15 @@ export interface Deployment {
   endpoint: DeployEndpoint | null;
 
   alwaysOn?: boolean;
+  embedAncestors?: string[];
+  public?: true;
   lastAccessAt?: number;
   appliedVersion?: number;
   versions: DeploymentVersion[];
+}
+
+export function currentVersionOf(d: Deployment | null): DeploymentVersion | undefined {
+  return d?.versions.find((v) => v.version === d.currentVersion);
 }
 
 interface VersionInput {
@@ -83,6 +90,7 @@ interface VersionInput {
 export interface DeployStore {
   create(
     input: {
+      id?: string;
       ownerScopeId: ScopeId;
       createdBy: string;
       name?: string;
@@ -103,11 +111,14 @@ export interface DeployStore {
   setOwnerScope(id: string, ownerScopeId: ScopeId): Promise<void>;
   setDisplayName(id: string, displayName: string | undefined): Promise<void>;
   setAlwaysOn(id: string, alwaysOn: boolean): Promise<void>;
+  setEmbedAncestors(id: string, embedAncestors: string[]): Promise<void>;
+  setPublic(id: string, isPublic: boolean): Promise<void>;
   setDefaultAudience(id: string, snapshot: DefaultAudienceSnapshot): Promise<void>;
   setAppliedVersion(id: string, version: number): Promise<void>;
   touch(id: string, at: number): Promise<void>;
   versionOf(id: string, version: number): Promise<DeploymentVersion | null>;
   treeOf(id: string, version: number): Promise<DeployGitTreeFile[] | null>;
+  commitTreeOf(id: string, commit: string): Promise<DeployGitTreeFile[]>;
   filesOf(id: string, version: number, paths?: string[]): Promise<DeployGitInputFile[] | null>;
   diffVersions(id: string, fromVersion: number | undefined, toVersion: number): Promise<DeployGitDiff | null>;
   bundleOf(id: string, version: number): Promise<Uint8Array | null>;
@@ -305,7 +316,7 @@ export function createDeployStore(backing?: DurableMap<Deployment> | DeployStore
 
   return {
     async create(input) {
-      const id = randomUUID();
+      const id = input.id ?? randomUUID();
       const v = await makeVersion(id, 1, input);
       const d: Deployment = {
         id,
@@ -327,7 +338,7 @@ export function createDeployStore(backing?: DurableMap<Deployment> | DeployStore
       const d = await backingMap.get(id);
       if (!d) throw new Error(`unknown deployment: ${id}`);
       const version = d.versions.length + 1;
-      const parentCommit = d.versions.find((x) => x.version === d.currentVersion)?.commit;
+      const parentCommit = currentVersionOf(d)?.commit;
       const v = await makeVersion(id, version, input, parentCommit);
       d.versions.push(v);
       d.currentVersion = version;
@@ -338,7 +349,7 @@ export function createDeployStore(backing?: DurableMap<Deployment> | DeployStore
     async addVersionFromCommit(id, commit) {
       const d = await backingMap.get(id);
       if (!d) throw new Error(`unknown deployment: ${id}`);
-      const current = d.versions.find((x) => x.version === d.currentVersion);
+      const current = currentVersionOf(d);
       if (current?.commit === commit) return null;
       const version = d.versions.length + 1;
       const v: DeploymentVersion = {
@@ -426,6 +437,12 @@ export function createDeployStore(backing?: DurableMap<Deployment> | DeployStore
     async setAlwaysOn(id, alwaysOn) {
       await backingMap.merge(id, { alwaysOn } as Partial<Deployment>);
     },
+    async setEmbedAncestors(id, embedAncestors) {
+      await backingMap.merge(id, { embedAncestors } as Partial<Deployment>);
+    },
+    async setPublic(id, isPublic) {
+      await backingMap.merge(id, { public: isPublic ? true : undefined });
+    },
     async setDefaultAudience(id, snapshot) {
       const d = await backingMap.get(id);
       if (d) {
@@ -454,6 +471,7 @@ export function createDeployStore(backing?: DurableMap<Deployment> | DeployStore
       const v = (await backingMap.get(id))?.versions.find((x) => x.version === version);
       return v?.commit ? git.treeOf(id, v.commit) : null;
     },
+    commitTreeOf: (id, commit) => git.treeOf(id, commit),
     async filesOf(id, version, paths) {
       const v = (await backingMap.get(id))?.versions.find((x) => x.version === version);
       return v?.commit ? git.filesOf(id, v.commit, paths) : null;

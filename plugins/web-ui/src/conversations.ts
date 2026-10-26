@@ -1,19 +1,20 @@
 import { createChatSurface } from "./chat";
-import { createComposerSurface } from "./composer";
+import { createComposerSurface, type ComposerOptions } from "./composer";
 import { densityTierFor, type DensityTier } from "./density";
 import { subscribeDeliveries } from "./core-bridge";
 import { applySessionState } from "./session-list";
 import { refreshSessions, renderList, sessionsState } from "./sessions";
 import { appState } from "./shell-state";
+import { handleUiSignal, releaseUiCanvas, resyncUiCanvas } from "./ui-canvas";
 import type { Conversation, ConvCtx, ConvHost } from "./conv-types";
 
 const live = new Set<Conversation>();
 let main: Conversation | null = null;
 
-export function createConversation(host: ConvHost): Conversation {
+export function createConversation(host: ConvHost, composerOptions?: ComposerOptions): Conversation {
   const ctx = { ...host } as ConvCtx;
   ctx.chat = createChatSurface(ctx);
-  ctx.composer = createComposerSurface(ctx);
+  ctx.composer = createComposerSurface(ctx, composerOptions);
   const conv = ctx.chat as Conversation;
   conv.composer = ctx.composer;
   live.add(conv);
@@ -22,6 +23,7 @@ export function createConversation(host: ConvHost): Conversation {
 
 export function disposeConversation(conv: Conversation): void {
   live.delete(conv);
+  releaseUiCanvas(conv);
   if (main === conv) main = null;
   conv.composer.dispose();
   conv.dispose();
@@ -88,20 +90,31 @@ export function ensureDeliveryStream(): void {
       for (const conv of live) conv.onDelivery(threadRef);
     },
     (event) => {
-      const { list, matched } = applySessionState(sessionsState.list, event);
+      if (event.state === "ui") {
+        handleUiSignal(event as Parameters<typeof handleUiSignal>[0], [...live], sessionsState.list);
+        return;
+      }
+      if (event.state === "metadata") {
+        void refreshSessions({ silent: true });
+        return;
+      }
+      const { list, matched } = applySessionState(sessionsState.list, { ...event, state: event.state });
       if (matched) {
         sessionsState.list = list;
         renderList();
+        const parentId = list.find((session) => session.threadRef === event.threadRef)?.parentSessionId;
+        if (event.state === "idle" || parentId) void refreshSessions({ silent: true });
+        if (parentId) for (const conv of live) if (conv.state.sessionId === parentId) conv.redraw();
       } else {
         void refreshSessions({ silent: true });
       }
-      // A run can start server-side for an open conversation without this tab asking
-      // for it (a steer replayed as a fresh turn after its run ended, a cron wake, a
-      // message from another surface). Attach the open view instead of waiting for a
-      // visibilitychange, so the new turn — and its triggering message — show up live.
       if (event.state === "working") for (const conv of live) conv.resumeIfIdle();
+      else for (const conv of live) conv.onDelivery(event.threadRef);
     },
-    () => void refreshSessions({ silent: true }),
+    () => {
+      void refreshSessions({ silent: true });
+      resyncUiCanvas([...live].map((conv) => conv.state.sessionId));
+    },
     (event) => inboxItemHandler?.(event),
     () => inboxResyncHandler?.(),
   );

@@ -31,6 +31,7 @@ test("provider skills are visible only for connectors configured by the admin", 
     skill("linear"),
     skill("x"),
     skill("slack-drafts"),
+    skill("zoom"),
   ];
   assert.deepEqual(
     filterConnectorSkills(all, []).map((entry) => entry.skill?.manifest.name),
@@ -43,5 +44,14 @@ test("provider skills are visible only for connectors configured by the admin", 
   assert.deepEqual(
     filterConnectorSkills(all, ["slack"]).map((entry) => entry.skill?.manifest.name),
     ["memory", "slack-drafts"],
+  );
+});
+
+test("the credential-backed Composio skill needs no dedicated OAuth configuration", () => {
+  assert.deepEqual(
+    filterConnectorSkills([skill("composio"), skill("google-workspace")], []).map(
+      (entry) => entry.skill?.manifest.name,
+    ),
+    ["composio"],
   );
 });

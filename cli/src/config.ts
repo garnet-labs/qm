@@ -15,11 +15,15 @@ import {
 } from "./services.ts";
 import {
   hostingProviderChoices,
+  isSandboxBackendId,
   isTarget,
+  type SandboxBackendId,
   type Target,
   SANDBOX_BACKEND_POLICY,
+  SANDBOX_BACKENDS,
   targetsAllowingSandboxBackend,
 } from "./providers.ts";
+import { TARGET_ENV_DEFAULTS } from "./target-env-defaults.ts";
 import { envNum, isEnvVarName, isMissingOrPlaceholder } from "./util.ts";
 
 export const CONFIG_FILENAME = "qm.config.jsonc";
@@ -46,7 +50,7 @@ export interface PluginEntry {
 }
 
 export interface SandboxConfig {
-  backend?: "local" | "sprites" | "aws" | "agent37";
+  backend?: SandboxBackendId;
   app?: string;
   image?: string;
   baseImage?: string;
@@ -54,12 +58,11 @@ export interface SandboxConfig {
   secretEnv?: string[];
 }
 
-export interface SecurityScreenConfig {
-  backend: "proxy";
-  provider: string;
-  endpoint: string;
-  rollout: "shadow" | "enforce";
-}
+type SecurityScreenMode = "off" | "observe" | "enforce";
+
+export type SecurityScreenConfig =
+  | { mode: SecurityScreenMode; classifier: "model" }
+  | { mode: SecurityScreenMode; classifier: "proxy"; provider: string; endpoint: string };
 
 export interface AwsServiceConfig {
   ecrRepository: string;
@@ -80,6 +83,7 @@ export interface AwsServiceConfig {
 }
 
 export interface AwsConfig {
+  deploymentState?: { table: string; namespace: string };
   accountId: string;
   region: string;
   cluster: string;
@@ -87,7 +91,10 @@ export interface AwsConfig {
   secretsPrefix: string;
   imageLabel: string;
   alb?: string;
+  sharedAlb?: boolean;
+  backgroundWorkControl?: boolean;
   rdsInstance?: string;
+  dbInstanceClass?: string;
   predeployDbSnapshot?: boolean;
   dbRetentionMinDays?: number;
   deployBranch?: string;
@@ -110,7 +117,7 @@ export function awsWorkloadArchitecture(config: QmConfig, workload: string): "ar
       `aws.services.${workload}.architecture is required because ${workload} uses an external prebuilt image`,
     );
   }
-  return service.architecture ?? "arm64";
+  return service.architecture ?? (isServiceName(workload) ? "amd64" : "arm64");
 }
 
 export const MODEL_PROVIDERS = ["anthropic", "openai", "openrouter"] as const;
@@ -123,9 +130,9 @@ export const MODEL_PROVIDER_KEYS: Readonly<Record<ModelProvider, string>> = {
 };
 
 export const MODEL_PROVIDER_HARNESSES: Readonly<Record<ModelProvider, readonly string[]>> = {
-  anthropic: ["pi", "opencode", "claude", "mock"],
-  openai: ["pi", "opencode", "codex", "mock"],
-  openrouter: ["pi", "mock"],
+  anthropic: ["pi", "claude"],
+  openai: ["pi"],
+  openrouter: ["pi"],
 };
 
 export const isModelProvider = (value: unknown): value is ModelProvider =>
@@ -167,12 +174,13 @@ export interface QmConfig {
 
 export function securityScreenEnv(config: Pick<QmConfig, "securityScreen">): Record<string, string> {
   const screen = config.securityScreen;
-  if (!screen) return {};
+  const base = { SECURITY_SCREEN: screen?.mode ?? "off" };
+  if (screen?.classifier !== "proxy") return base;
   return {
-    SECURITY_SCREEN_BACKEND: screen.backend,
+    ...base,
+    SECURITY_SCREEN_CLASSIFIER: "proxy",
     SECURITY_SCREEN_PROXY_PROVIDER: screen.provider,
     SECURITY_SCREEN_PROXY_ENDPOINT: screen.endpoint,
-    SECURITY_SCREEN_PROXY_ROLLOUT: screen.rollout,
   };
 }
 
@@ -206,8 +214,14 @@ export const dockerBasePort = (config: QmConfig): number => envNum("QM_BASE_PORT
 
 export const isDigestPinned = (ref: string): boolean => /@sha256:[0-9a-f]{64}$/.test(ref);
 
+const effectiveSandboxBackend = (config: Pick<QmConfig, "env" | "sandbox">): string | undefined =>
+  config.env.core?.SANDBOX_BACKEND?.trim() || config.sandbox?.backend;
+
 export const localSandboxActive = (config: QmConfig): boolean =>
-  config.target === "docker" && config.sandbox?.backend === "local";
+  config.target === "docker" &&
+  (config.sandbox?.backend === "superserve"
+    ? effectiveSandboxBackend(config) === "local"
+    : config.sandbox?.backend === "local" && effectiveSandboxBackend(config) !== "superserve");
 
 export function sandboxCoreEnv(
   config: QmConfig,
@@ -222,8 +236,12 @@ export function sandboxCoreEnv(
     if (sb.image) env.LOCAL_SANDBOX_IMAGE = sb.image;
     return { env, missingSecrets };
   }
-  if (sb.backend === "agent37") {
-    env.SANDBOX_BACKEND = "agent37";
+  const backend =
+    sb.backend === "superserve" || effectiveSandboxBackend(config) === "superserve"
+      ? effectiveSandboxBackend(config)
+      : sb.backend;
+  if (backend === "agent37" || backend === "superserve" || backend === "e2b") {
+    env.SANDBOX_BACKEND = backend;
     return { env, missingSecrets };
   }
   for (const [k, v] of Object.entries(sb.env ?? {})) env[`FLY_RESIDENT_ENV_${k}`] = v;
@@ -418,11 +436,31 @@ const isPlainObject = (x: unknown): x is Record<string, unknown> =>
 function validateSecurityScreen(raw: unknown, path: string): SecurityScreenConfig | undefined {
   if (raw === undefined) return undefined;
   if (!isPlainObject(raw)) throw new CliError(`${path}: "securityScreen" must be an object`);
-  const allowed = new Set(["backend", "provider", "endpoint", "rollout"]);
+  if (Object.keys(raw).length === 1 && raw.backend === "off") {
+    warn(`${path}: securityScreen.backend "off" is retired and read as mode "off" — use { "mode": "off" }`);
+    return { mode: "off", classifier: "model" };
+  }
+  const retired = ["backend", "allPostures", "rollout"].filter((key) => key in raw);
+  if (retired.length) {
+    throw new CliError(
+      `${path}: securityScreen.${retired.join(", securityScreen.")} ${retired.length === 1 ? "is" : "are"} retired — use securityScreen.mode ("off", "observe", or "enforce") and securityScreen.classifier ("model" or "proxy")`,
+    );
+  }
+  if (raw.mode !== "off" && raw.mode !== "observe" && raw.mode !== "enforce") {
+    throw new CliError(`${path}: "securityScreen.mode" must be "off", "observe", or "enforce"`);
+  }
+  const classifier = raw.classifier ?? "model";
+  if (classifier === "model") {
+    if (Object.keys(raw).some((key) => key !== "mode" && key !== "classifier")) {
+      throw new CliError(`${path}: securityScreen provider and endpoint require classifier proxy`);
+    }
+    return { mode: raw.mode, classifier };
+  }
+  if (classifier !== "proxy") throw new CliError(`${path}: "securityScreen.classifier" must be "model" or "proxy"`);
+  const allowed = new Set(["mode", "classifier", "provider", "endpoint"]);
   for (const key of Object.keys(raw)) {
     if (!allowed.has(key)) throw new CliError(`${path}: "securityScreen.${key}" is not recognized`);
   }
-  if (raw.backend !== "proxy") throw new CliError(`${path}: "securityScreen.backend" must be "proxy"`);
   if (
     typeof raw.provider !== "string" ||
     raw.provider.length > 63 ||
@@ -452,15 +490,7 @@ function validateSecurityScreen(raw: unknown, path: string): SecurityScreenConfi
       `${path}: "securityScreen.endpoint" must be an HTTPS URL without credentials, a fragment, or a trailing hostname dot`,
     );
   }
-  if (raw.rollout !== "shadow" && raw.rollout !== "enforce") {
-    throw new CliError(`${path}: "securityScreen.rollout" must be "shadow" or "enforce"`);
-  }
-  return {
-    backend: raw.backend,
-    provider: raw.provider,
-    endpoint: raw.endpoint,
-    rollout: raw.rollout,
-  };
+  return { mode: raw.mode, classifier, provider: raw.provider, endpoint: raw.endpoint };
 }
 
 export function readConfigOrgId(path: string): string | undefined {
@@ -601,9 +631,12 @@ function validate(raw: unknown, path: string): QmConfig {
   });
   const securityScreen = validateSecurityScreen(o["securityScreen"], path);
   const managedSecurityScreenEnv = [
-    "SECURITY_SCREEN_BACKEND",
+    "SECURITY_SCREEN",
+    "SECURITY_SCREEN_CLASSIFIER",
     "SECURITY_SCREEN_PROXY_PROVIDER",
     "SECURITY_SCREEN_PROXY_ENDPOINT",
+    "SECURITY_SCREEN_BACKEND",
+    "SECURITY_SCREEN_ALL_POSTURES",
     "SECURITY_SCREEN_PROXY_ROLLOUT",
   ];
   for (const [service, values] of Object.entries(env)) {
@@ -625,11 +658,11 @@ function validate(raw: unknown, path: string): QmConfig {
       throw new CliError(`${path}: SECURITY_SCREEN_PROXY_TOKEN may be routed only to core`);
     }
   }
-  if (securityScreen && secretEnv.core?.SECURITY_SCREEN_PROXY_TOKEN === undefined) {
-    throw new CliError(`${path}: securityScreen requires secretEnv.core.SECURITY_SCREEN_PROXY_TOKEN`);
+  if (securityScreen?.classifier === "proxy" && secretEnv.core?.SECURITY_SCREEN_PROXY_TOKEN === undefined) {
+    throw new CliError(`${path}: securityScreen classifier proxy requires secretEnv.core.SECURITY_SCREEN_PROXY_TOKEN`);
   }
-  if (!securityScreen && secretEnv.core?.SECURITY_SCREEN_PROXY_TOKEN !== undefined) {
-    throw new CliError(`${path}: secretEnv.core.SECURITY_SCREEN_PROXY_TOKEN requires securityScreen`);
+  if (securityScreen?.classifier !== "proxy" && secretEnv.core?.SECURITY_SCREEN_PROXY_TOKEN !== undefined) {
+    throw new CliError(`${path}: secretEnv.core.SECURITY_SCREEN_PROXY_TOKEN requires securityScreen classifier proxy`);
   }
   for (const [service, values] of Object.entries(env)) {
     if (!isServiceName(service)) continue;
@@ -670,6 +703,20 @@ function validate(raw: unknown, path: string): QmConfig {
     return v;
   });
   const sandbox = validateSandbox(o["sandbox"], path, target);
+  if (
+    sandbox?.backend === "superserve" &&
+    env.core?.SANDBOX_BACKEND !== undefined &&
+    !env.core.SANDBOX_BACKEND.trim()
+  ) {
+    throw new CliError(
+      `${path}: "env.core.SANDBOX_BACKEND" is blank — name the backend core should run, or remove the key; every target forwards env.core verbatim, so a blank value leaves core with no backend`,
+    );
+  }
+  if (effectiveSandboxBackend({ env, sandbox }) === "superserve" && !env.core?.SUPERSERVE_TEMPLATE?.trim()) {
+    throw new CliError(
+      `${path}: the superserve sandbox backend requires env.core.SUPERSERVE_TEMPLATE (the ready qm-agent-<release> template); core refuses to start without it`,
+    );
+  }
 
   const out: QmConfig = {
     contract,
@@ -738,6 +785,13 @@ function validate(raw: unknown, path: string): QmConfig {
   validatePortalTrust(out, path);
   if (target === "aws") {
     validateAwsFrontDoor(out, path);
+    if (
+      out.env.core?.BACKGROUND_DEPLOYMENT_ID !== undefined ||
+      out.secretEnv?.core?.BACKGROUND_DEPLOYMENT_ID !== undefined
+    )
+      throw new CliError(
+        `${path}: BACKGROUND_DEPLOYMENT_ID is allocated by aws.backgroundWorkControl and cannot be configured directly`,
+      );
     const externalImages = [
       ...plugins.filter((plugin) => plugin.image).map((plugin) => plugin.name),
       ...Object.keys(imageOverrides).filter((service) => services.includes(service as DeclaredServiceName)),
@@ -766,13 +820,7 @@ function validate(raw: unknown, path: string): QmConfig {
 }
 
 function configuredHarness(config: QmConfig): string {
-  return config.env.core?.HARNESS?.trim() || (config.target === "fly" ? "pi" : "mock");
-}
-
-export function mockHarnessWarning(config: QmConfig): string | undefined {
-  if (configuredHarness(config) !== "mock") return undefined;
-  const unset = !config.env.core?.HARNESS?.trim();
-  return `env.core.HARNESS is ${unset ? "unset, which means" : "set to"} "mock": this deployment answers every message with canned text and calls no model provider. Set it to "pi" for a deployment that runs real agent turns.`;
+  return config.env.core?.HARNESS?.trim() || TARGET_ENV_DEFAULTS[config.target](config, "core", "HARNESS") || "pi";
 }
 
 export function effectiveModelProvider(config: QmConfig): ModelProvider | undefined {
@@ -780,7 +828,15 @@ export function effectiveModelProvider(config: QmConfig): ModelProvider | undefi
   return isModelProvider(override) ? override : config.modelProvider;
 }
 
+const HARNESSES = ["pi", "claude"];
+
 function validateModelProvider(config: QmConfig, path: string): void {
+  const harness = configuredHarness(config);
+  if (!HARNESSES.includes(harness)) {
+    throw new CliError(
+      `${path}: env.core.HARNESS "${harness}" is not recognized — use ${HARNESSES.join(", ")}, or unset it.`,
+    );
+  }
   const override = config.env.core?.MODEL_PROVIDER?.trim();
   if (override === "") delete config.env.core!.MODEL_PROVIDER;
   if (override !== undefined && override !== "" && !isModelProvider(override)) {
@@ -790,7 +846,6 @@ function validateModelProvider(config: QmConfig, path: string): void {
   }
   const provider = effectiveModelProvider(config);
   if (!provider) return;
-  const harness = configuredHarness(config);
   if (!MODEL_PROVIDER_HARNESSES[provider].includes(harness)) {
     throw new CliError(
       `${path}: model provider "${provider}" cannot serve a base model on env.core.HARNESS "${harness}" — that harness runs no ${provider} model, so every agent turn would be refused. Use ${MODEL_PROVIDER_HARNESSES[provider].join(", ")}, or pick a provider that harness can bill.`,
@@ -926,6 +981,13 @@ export function validatePortalTrust(config: QmConfig, path = "config", secrets?:
   }
 }
 
+export function requiresAwsMicrovmImage(config: QmConfig): boolean {
+  if (config.target !== "aws") return false;
+  const core = config.env.core;
+  if ((core?.DEPLOY_PROVIDER?.trim() || "aws") === "aws") return true;
+  return (core?.SANDBOX_BACKEND?.trim() || config.sandbox?.backend || "aws") === "aws";
+}
+
 function validateAwsFrontDoor(config: QmConfig, path: string): void {
   const hasPortal = config.services.includes("portal");
   const hasWebUi = config.services.includes("web-ui");
@@ -938,7 +1000,10 @@ function validateAwsFrontDoor(config: QmConfig, path: string): void {
     throw new CliError(`${path}: AWS apiUrl must use the same protocol as publicUrl`);
   }
   const deployImage = config.env.core?.AWS_DEPLOY_IMAGE?.trim();
-  if (isMissingOrPlaceholder(deployImage) || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(deployImage!)) {
+  if (
+    (requiresAwsMicrovmImage(config) || Boolean(deployImage)) &&
+    (isMissingOrPlaceholder(deployImage) || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(deployImage!))
+  ) {
     throw new CliError(
       `${path}: AWS requires env.core.AWS_DEPLOY_IMAGE to name a non-placeholder, stack-owned Lambda MicroVM image`,
     );
@@ -957,8 +1022,8 @@ function validateAwsFrontDoor(config: QmConfig, path: string): void {
   if (hasPortal && protocol !== "https:") {
     throw new CliError(`${path}: AWS portal requires an HTTPS publicUrl and ACM certificate`);
   }
-  const harness = config.env.core?.HARNESS?.trim() || "mock";
-  if (protocol !== "https:" && harness !== "mock") {
+  const harness = configuredHarness(config);
+  if (protocol !== "https:") {
     throw new CliError(
       `${path}: AWS HARNESS=${harness} requires an HTTPS publicUrl so sandbox capabilities never cross the Internet in cleartext`,
     );
@@ -1076,6 +1141,22 @@ function validateAws(
       `${path}: "aws.imageLabel" must be a valid OCI/ECR tag (1-128 letters, digits, underscores, periods, or hyphens; the first character cannot be a period or hyphen)`,
     );
   }
+  let deploymentState: AwsConfig["deploymentState"];
+  if (raw["deploymentState"] !== undefined) {
+    const state = raw["deploymentState"];
+    if (
+      !isPlainObject(state) ||
+      typeof state.table !== "string" ||
+      !/^[A-Za-z0-9_.-]{3,255}$/.test(state.table) ||
+      typeof state.namespace !== "string" ||
+      !/^[a-z0-9][a-z0-9-]{0,62}$/.test(state.namespace)
+    ) {
+      throw new CliError(
+        `${path}: "aws.deploymentState" requires a valid DynamoDB table name and a lowercase company namespace`,
+      );
+    }
+    deploymentState = { table: state.table, namespace: state.namespace };
+  }
   let alb: string | undefined;
   if (raw["alb"] !== undefined) {
     alb = requiredString(raw["alb"], "alb");
@@ -1084,6 +1165,15 @@ function validateAws(
         `${path}: "aws.alb" must be a valid load balancer name (at most 32 letters, digits, and interior hyphens, not starting with "internal-")`,
       );
     }
+  }
+  if (raw["backgroundWorkControl"] !== undefined && typeof raw["backgroundWorkControl"] !== "boolean") {
+    throw new CliError(`${path}: "aws.backgroundWorkControl" must be a boolean`);
+  }
+  if (raw["sharedAlb"] !== undefined && typeof raw["sharedAlb"] !== "boolean") {
+    throw new CliError(`${path}: "aws.sharedAlb" must be a boolean`);
+  }
+  if (raw["sharedAlb"] === true && !alb) {
+    throw new CliError(`${path}: "aws.sharedAlb" requires "aws.alb"`);
   }
   let rdsInstance: string | undefined;
   if (raw["rdsInstance"] !== undefined) {
@@ -1095,6 +1185,13 @@ function validateAws(
     }
   }
   let predeployDbSnapshot: boolean | undefined;
+  let dbInstanceClass: string | undefined;
+  if (raw["dbInstanceClass"] !== undefined) {
+    dbInstanceClass = requiredString(raw["dbInstanceClass"], "dbInstanceClass");
+    if (!/^db\.[a-z0-9]+\.[a-z0-9]+$/.test(dbInstanceClass)) {
+      throw new CliError(`${path}: "aws.dbInstanceClass" must be a valid RDS DB instance class such as db.t4g.small`);
+    }
+  }
   if (raw["predeployDbSnapshot"] !== undefined) {
     if (typeof raw["predeployDbSnapshot"] !== "boolean") {
       throw new CliError(
@@ -1377,8 +1474,16 @@ function validateAws(
     networking: netOut,
     services,
   };
+  if (deploymentState) out.deploymentState = deploymentState;
   if (alb) out.alb = alb;
+  if (raw["sharedAlb"] !== undefined) out.sharedAlb = raw["sharedAlb"] as boolean;
+  if (raw["backgroundWorkControl"] !== undefined) out.backgroundWorkControl = raw["backgroundWorkControl"] as boolean;
+  if (out.backgroundWorkControl && (services.core?.ecsService.length ?? 0) > 219)
+    throw new CliError(
+      `${path}: controlled core service names must leave room for a unique deployment identity (maximum 219 characters)`,
+    );
   if (rdsInstance) out.rdsInstance = rdsInstance;
+  if (dbInstanceClass) out.dbInstanceClass = dbInstanceClass;
   if (predeployDbSnapshot !== undefined) out.predeployDbSnapshot = predeployDbSnapshot;
   if (dbRetentionMinDays !== undefined) out.dbRetentionMinDays = dbRetentionMinDays;
   if (deployBranch) out.deployBranch = deployBranch;
@@ -1400,15 +1505,9 @@ function validateSandbox(raw: unknown, path: string, target: Target): SandboxCon
   };
   const out: SandboxConfig = {};
   if (o["backend"] !== undefined) {
-    if (
-      o["backend"] !== "local" &&
-      o["backend"] !== "sprites" &&
-      o["backend"] !== "aws" &&
-      o["backend"] !== "agent37"
-    ) {
-      throw new CliError(
-        `${path}: "sandbox.backend" must be "local" (Docker containers on the deployment host), "sprites" (Fly Sprites), "aws" (Lambda MicroVM sandboxes), or "agent37"`,
-      );
+    if (!isSandboxBackendId(o["backend"])) {
+      const choices = Object.entries(SANDBOX_BACKENDS).map(([id, label]) => (label ? `"${id}" (${label})` : `"${id}"`));
+      throw new CliError(`${path}: "sandbox.backend" must be ${choices.slice(0, -1).join(", ")}, or ${choices.at(-1)}`);
     }
     out.backend = o["backend"];
   }
@@ -1471,21 +1570,16 @@ function validateSandbox(raw: unknown, path: string, target: Target): SandboxCon
       );
     }
   }
-  if (out.backend === "agent37") {
+  if (out.backend === "agent37" || out.backend === "superserve" || out.backend === "e2b") {
     const stray = (["app", "image", "baseImage", "env", "secretEnv"] as const).filter((key) => out[key] !== undefined);
     if (stray.length) {
       throw new CliError(
-        `${path}: "sandbox.backend": "agent37" ignores ${stray.map((key) => `"sandbox.${key}"`).join(", ")} — remove them`,
+        `${path}: "sandbox.backend": "${out.backend}" ignores ${stray.map((key) => `"sandbox.${key}"`).join(", ")} — remove them`,
       );
     }
   }
   if (out.image && !out.app && out.backend !== "local") {
     throw new CliError(`${path}: "sandbox.image" requires "sandbox.app" unless "sandbox.backend" is "local"`);
-  }
-  if (out.backend === "sprites" && !out.app) {
-    throw new CliError(
-      `${path}: "sandbox.backend": ${JSON.stringify(out.backend)} requires "sandbox.app" (the Fly app agents execute in)`,
-    );
   }
   if (SANDBOX_BACKEND_POLICY[target].requireExplicit && out.backend === undefined) {
     throw new CliError(

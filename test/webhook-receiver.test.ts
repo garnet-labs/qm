@@ -253,27 +253,7 @@ test("silent-failure surfacing: a refused turn delivers a notice (the sender alr
   assert.match((await webhooks.get(wh.id))?.lastError ?? "", /internal-only/);
 });
 
-test("a third-party principal destination without recipient consent skips delivery and notifies the owner", async () => {
-  const { webhooks, deliveries, calls, receiver } = harness();
-  const wh = await webhooks.create({
-    ownerScopeId: scopeId("personal", "U1"),
-    owner: "U1",
-    createdBy: "U1",
-    action: "x",
-    verification: { scheme: "github", secret: SECRET },
-    destination: { type: "principal", target: "U2" },
-  });
-  const out = await receiver.deliver(wh.id, githubReq("{}"));
-  assert.equal(out.status, 202);
-  await flush();
-  assert.equal(calls.length, 1);
-  const pending = await deliveries.pending("principal");
-  assert.equal(pending.length, 1);
-  assert.equal(pending[0]?.destination.target, "U1");
-  assert.match(pending[0]?.text ?? "", /consent/i);
-});
-
-test("a third-party principal destination with accepted consent delivers to the recipient", async () => {
+test("a third-party principal destination delivers to the recipient", async () => {
   const { webhooks, deliveries, receiver } = harness();
   const wh = await webhooks.create({
     ownerScopeId: scopeId("personal", "U1"),
@@ -282,7 +262,6 @@ test("a third-party principal destination with accepted consent delivers to the 
     action: "x",
     verification: { scheme: "github", secret: SECRET },
     destination: { type: "principal", target: "U2" },
-    recipientConsent: { recipientId: "U2", status: "accepted" },
   });
   await receiver.deliver(wh.id, githubReq("{}"));
   await flush();
@@ -322,4 +301,92 @@ test("linear rejects signed untimed deliveries without firing a turn", async () 
   assert.equal(out.status, 202);
   await flush();
   assert.equal(calls.length, 1);
+});
+
+const historyWebhook = {
+  ownerScopeId: scopeId("personal", "U1"),
+  owner: "U1",
+  createdBy: "U1",
+  action: "summarize",
+  verification: { scheme: "github" as const, secret: SECRET },
+};
+
+test("history records the agent payload once per delivery without request headers", async () => {
+  const { webhooks, receiver } = harness();
+  const wh = await webhooks.create(historyWebhook);
+  const req = githubReq(JSON.stringify({ message: "<script>alert(1)</script>", long: "x".repeat(20_000) }));
+  await Promise.all([receiver.deliver(wh.id, req), receiver.deliver(wh.id, req)]);
+  await flush();
+  const events = await webhooks.listEvents(wh.id);
+  assert.equal(events.length, 1);
+  assert.match(events[0]?.payload ?? "", /truncated/);
+  assert.ok(events[0]!.payload.length < 16_100);
+  assert.equal(JSON.stringify(events).includes(SECRET), false);
+  assert.equal(JSON.stringify(events).includes("x-hub-signature"), false);
+});
+
+test("history excludes rejected signatures, handshakes and filtered deliveries", async () => {
+  const { webhooks, receiver } = harness();
+  const wh = await webhooks.create({
+    ...historyWebhook,
+    filters: [{ path: "action", in: ["opened"] }],
+  });
+  const bad = githubReq('{"action":"opened"}');
+  bad.headers["x-hub-signature-256"] = "invalid";
+  await receiver.deliver(wh.id, bad);
+  await receiver.deliver(wh.id, githubReq("{}", "ping", "ping"));
+  await receiver.deliver(wh.id, githubReq('{"action":"closed"}'));
+  await flush();
+  assert.deepEqual(await webhooks.listEvents(wh.id), []);
+});
+
+test("history capture failure rejects before acknowledging or starting a turn", async () => {
+  const { webhooks, calls, receiver } = harness();
+  const wh = await webhooks.create(historyWebhook);
+  webhooks.recordEvent = async () => {
+    throw new Error("history unavailable");
+  };
+  await assert.rejects(receiver.deliver(wh.id, githubReq("{}")), /history unavailable/);
+  await flush();
+  assert.equal(calls.length, 0);
+});
+
+test("webhook fire accounting failures remain contained when recording the failure also rejects", async (t) => {
+  const { webhooks, calls, receiver } = harness();
+  const wh = await webhooks.create({
+    ownerScopeId: scopeId("personal", "U1"),
+    owner: "U1",
+    createdBy: "U1",
+    action: "triage",
+    verification: { scheme: "github", secret: SECRET },
+  });
+  const record = t.mock.method(webhooks, "recordFire", async () => {
+    throw new Error("database unavailable");
+  });
+  const errors = t.mock.method(console, "error", () => {});
+  assert.deepEqual(await receiver.deliver(wh.id, githubReq("{}")), { status: 202 });
+  await flush();
+  assert.equal(record.mock.callCount(), 2);
+  assert.ok(errors.mock.calls.some(({ arguments: args }) => String(args[0]).includes("persist fire failure")));
+  record.mock.restore();
+  assert.deepEqual(await receiver.deliver(wh.id, githubReq('{"next":true}', "d-2")), { status: 202 });
+  await flush();
+  assert.equal(calls.length, 2);
+  assert.equal((await webhooks.get(wh.id))?.lastError, undefined);
+});
+
+test("an edited task applies to the next delivery at the same URL and secret", async () => {
+  const { webhooks, calls, receiver } = harness();
+  const wh = await webhooks.create({
+    ownerScopeId: scopeId("personal", "U1"),
+    owner: "U1",
+    createdBy: "U1",
+    action: "old orders",
+    verification: { scheme: "github", secret: SECRET },
+  });
+  await webhooks.update(wh.id, { action: "new orders" });
+  assert.deepEqual(await receiver.deliver(wh.id, githubReq(JSON.stringify({ n: 1 }), "d-edit")), { status: 202 });
+  await flush();
+  assert.match(calls[0]?.text ?? "", /new orders/);
+  assert.doesNotMatch(calls[0]?.text ?? "", /old orders/);
 });

@@ -7,6 +7,8 @@ import {
   AwsApiError,
   type AwsMicrovmApi,
 } from "../src/sandbox/aws-microvm-api.ts";
+import { SignatureV4 } from "@smithy/signature-v4";
+import { Sha256 } from "@aws-crypto/sha256-js";
 
 interface Recorded {
   url: string;
@@ -15,7 +17,9 @@ interface Recorded {
   headers: Record<string, string>;
 }
 
-function fakeFetch(reply: (rec: Recorded, n: number) => { status: number; body?: unknown }): {
+function fakeFetch(
+  reply: (rec: Recorded, n: number) => { status: number; body?: unknown; headers?: Record<string, string> },
+): {
   fetchImpl: typeof fetch;
   calls: Recorded[];
 } {
@@ -32,7 +36,7 @@ function fakeFetch(reply: (rec: Recorded, n: number) => { status: number; body?:
     calls.push(rec);
     const r = reply(rec, calls.length - 1);
     const text = r.body === undefined ? "" : JSON.stringify(r.body);
-    return new Response(text, { status: r.status, headers: { "content-type": "application/json" } });
+    return new Response(text, { status: r.status, headers: { "content-type": "application/json", ...r.headers } });
   }) as unknown as typeof fetch;
   return { fetchImpl, calls };
 }
@@ -166,4 +170,142 @@ test("waitDaemon: a transient 429 blip still proves readiness on the next probe"
   const client = createMicrovmClient(api, { agentPort: 8080, tokenTtlMinutes: 30, fetchImpl });
   await client.waitDaemon("mvm-1", "mvm-1.example.on.aws");
   assert.equal(calls.length, 2, "the blip is ridden out and the 200 proves the daemon");
+});
+
+test("readiness reuses only the supplied observation and checks again on the next call", async () => {
+  let reads = 0;
+  const api = {
+    getMicrovm: async (id: string) => {
+      reads++;
+      return { microvmId: id, state: "TERMINATED" };
+    },
+  } as AwsMicrovmApi;
+  const client = createMicrovmClient(api, { agentPort: 8080, tokenTtlMinutes: 30 });
+  await client.ensureRunning("one", "endpoint", { microvmId: "one", state: "RUNNING" });
+  assert.equal(reads, 0);
+  await assert.rejects(client.ensureRunning("one", "endpoint"), /TERMINATED/);
+  assert.equal(reads, 1);
+  await assert.rejects(client.ensureRunning("one", "endpoint", { microvmId: "two", state: "RUNNING" }), /another body/);
+});
+
+test("control-plane reads retry throttling and outages, and failures carry the AWS request id", async () => {
+  const replies = [
+    { status: 429, body: { message: "Rate exceeded" }, headers: { "retry-after": "0" } },
+    { status: 503, body: { message: "unavailable" }, headers: { "retry-after": "0" } },
+    { status: 200, body: { microvmId: "mvm-1", endpoint: "e", state: "RUNNING" } },
+  ];
+  const { fetchImpl, calls } = fakeFetch((_rec, n) => replies[n]!);
+  const api = createMicrovmApi({ region: "us-west-2", credentials: creds, fetchImpl });
+  assert.equal((await api.getMicrovm("mvm-1")).state, "RUNNING");
+  assert.equal(calls.length, 3);
+
+  const failing = fakeFetch(() => ({
+    status: 500,
+    body: { message: "boom" },
+    headers: { "x-amzn-requestid": "aws-req-1" },
+  }));
+  const api2 = createMicrovmApi({ region: "us-west-2", credentials: creds, fetchImpl: failing.fetchImpl });
+  await assert.rejects(api2.getMicrovm("mvm-1"), (e: unknown) => {
+    assert.ok(e instanceof AwsApiError);
+    assert.equal(e.status, 500);
+    assert.match(e.message, /-> 500: boom \[request id aws-req-1\]$/);
+    return true;
+  });
+  assert.equal(failing.calls.length, 4, "an idempotent read is retried until attempts run out");
+});
+
+test("runMicrovm retries a throttled create but never an ambiguous server error", async () => {
+  const throttled = fakeFetch((_rec, n) =>
+    n === 0
+      ? { status: 429, body: { message: "Rate exceeded" }, headers: { "retry-after": "0" } }
+      : { status: 200, body: { microvmId: "mvm-2", endpoint: "e", state: "PENDING" } },
+  );
+  const api = createMicrovmApi({ region: "us-west-2", credentials: creds, fetchImpl: throttled.fetchImpl });
+  const run = { imageIdentifier: "img", ingressNetworkConnectors: [], egressNetworkConnectors: [] };
+  assert.equal((await api.runMicrovm(run)).microvmId, "mvm-2");
+  assert.equal(throttled.calls.length, 2);
+
+  const broken = fakeFetch(() => ({ status: 502, body: { message: "bad gateway" } }));
+  const api2 = createMicrovmApi({ region: "us-west-2", credentials: creds, fetchImpl: broken.fetchImpl });
+  await assert.rejects(api2.runMicrovm(run), /-> 502: bad gateway/);
+  assert.equal(broken.calls.length, 1);
+});
+
+test("writeAbs splits writes above the chunk size into parts, joins them in the MicroVM, and removes the parts", async () => {
+  const writes: Array<{ path: string; bytes: number }> = [];
+  const execs: string[] = [];
+  let failWrite: RegExp | null = null;
+  const { fetchImpl } = fakeFetch((rec) => {
+    const body = JSON.parse(rec.body ?? "{}") as { path?: string; b64?: string; cmd?: string };
+    if (rec.url.endsWith("/write")) {
+      if (failWrite?.test(body.path!)) return { status: 500, body: { error: "disk full" } };
+      writes.push({ path: body.path!, bytes: Buffer.from(body.b64!, "base64").length });
+    }
+    if (rec.url.endsWith("/exec")) {
+      execs.push(body.cmd!);
+      return { status: 200, body: { stdout: "", stderr: "", code: 0 } };
+    }
+    return { status: 200, body: { ok: true } };
+  });
+  const api = { createAuthToken: async () => "tok" } as unknown as AwsMicrovmApi;
+  const client = createMicrovmClient(api, { agentPort: 8080, tokenTtlMinutes: 30, writeChunkBytes: 4, fetchImpl });
+  await client.writeAbs("mvm-1", "mvm-1.example.on.aws", "/app/small", new Uint8Array(4));
+  assert.deepEqual(writes, [{ path: "/app/small", bytes: 4 }]);
+  assert.equal(execs.length, 0);
+  writes.length = 0;
+  await client.writeAbs("mvm-1", "mvm-1.example.on.aws", "/app/big", new Uint8Array(10));
+  const stem = writes[0]!.path.replace(/\.part-0$/, "");
+  assert.match(stem, /^\/app\/big\.qm-[0-9a-f]{12}$/);
+  assert.deepEqual(writes, [
+    { path: `${stem}.part-0`, bytes: 4 },
+    { path: `${stem}.part-1`, bytes: 4 },
+    { path: `${stem}.part-2`, bytes: 2 },
+  ]);
+  assert.deepEqual(execs, [
+    `cat '${stem}.part-0' '${stem}.part-1' '${stem}.part-2' > '${stem}.joined' && [ "$(wc -c < '${stem}.joined')" -eq 10 ] && { chmod --reference='/app/big' '${stem}.joined' 2>/dev/null || true; } && mv -fT '${stem}.joined' '/app/big'`,
+    `rm -f '${stem}'.part-* '${stem}'.joined`,
+  ]);
+  execs.length = 0;
+  writes.length = 0;
+  failWrite = /^\/app\/other\.qm-[0-9a-f]{12}\.part-1$/;
+  await assert.rejects(
+    client.writeAbs("mvm-1", "mvm-1.example.on.aws", "/app/other", new Uint8Array(10)),
+    /part-1 failed \(500\)/,
+  );
+  const other = writes[0]!.path.replace(/\.part-0$/, "");
+  assert.deepEqual(execs, [`rm -f '${other}'.part-* '${other}'.joined`]);
+});
+
+test("findImage filters by name, follows nextToken, and signs the query string it sends", async () => {
+  const { fetchImpl, calls } = fakeFetch((rec) =>
+    rec.url.includes("nextToken=")
+      ? { status: 200, body: { items: [{ name: "b-qm-sandbox", imageArn: "arn:b" }] } }
+      : { status: 200, body: { items: [{ name: "b-qm-sandbox-old", imageArn: "arn:old" }], nextToken: "p/2" } },
+  );
+  const api = createMicrovmApi({ region: "us-west-2", credentials: creds, fetchImpl });
+  assert.equal((await api.findImage("b-qm-sandbox"))?.imageArn, "arn:b");
+  assert.deepEqual(
+    calls.map((c) => new URL(c.url).search),
+    ["?nameFilter=b-qm-sandbox", "?nameFilter=b-qm-sandbox&nextToken=p%2F2"],
+  );
+  const signer = new SignatureV4({ service: "lambda", region: "us-west-2", credentials: creds, sha256: Sha256 });
+  const { url, headers } = calls[1]!;
+  const u = new URL(url);
+  const expected = await signer.sign(
+    {
+      method: "GET",
+      protocol: "https:",
+      hostname: u.hostname,
+      path: u.pathname,
+      headers: { host: u.hostname, "content-type": "application/json" },
+      body: "",
+      query: Object.fromEntries(u.searchParams),
+    },
+    {
+      signingDate: new Date(
+        headers["x-amz-date"]!.replace(/(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z/, "$1-$2-$3T$4:$5:$6Z"),
+      ),
+    },
+  );
+  assert.equal(headers.authorization, (expected.headers as Record<string, string>).authorization);
 });

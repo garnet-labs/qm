@@ -1,6 +1,8 @@
 import assert from "node:assert";
 import { SlackClient, sleep, type SlackMessage } from "./slack.ts";
 import { CoreClient } from "./core.ts";
+import { modelGatewayFromEnv } from "../../src/config.ts";
+import { modelGatewayRequest } from "../../src/model/provider-endpoints.ts";
 
 export interface Scenario {
   name: string;
@@ -42,12 +44,33 @@ export interface Env {
   botUserId: string;
   qaUserId: string;
   teamId: string;
-  anthropicApiKey: string;
-  judgeModel: string;
+  judge: JudgeEndpoint;
   targetChannel?: string;
   sandbox: boolean;
   actors: Map<string, Actor>;
   twin?: import("./arga.ts").TwinAdmin;
+}
+
+export interface JudgeEndpoint {
+  url: string;
+  headers: Record<string, string>;
+  model: string;
+}
+
+export function judgeEndpoint(env: NodeJS.ProcessEnv, model: string): JudgeEndpoint {
+  const gateway = modelGatewayFromEnv(env);
+  if (gateway) {
+    const request = modelGatewayRequest(gateway, { id: model, baseUrl: gateway.url, api: "anthropic-messages" });
+    if (!request) throw new Error(`MODEL_GATEWAY_MODELS has no route for judge model ${model}`);
+    return {
+      url: `${request.model.baseUrl}/v1/messages`,
+      headers: request.headers,
+      model: request.target,
+    };
+  }
+  const apiKey = env.ANTHROPIC_API_KEY;
+  if (!apiKey) throw new Error("ANTHROPIC_API_KEY or MODEL_GATEWAY_URL is required");
+  return { url: "https://api.anthropic.com/v1/messages", headers: { "x-api-key": apiKey }, model };
 }
 
 export interface Actor {
@@ -81,8 +104,10 @@ const STABLE_MS = 5000;
 export interface WaitOpts {
   timeoutMs?: number;
   match?: RegExp;
+  accept?: (message: SlackMessage) => boolean;
   afterTs?: string;
   onFrame?: (text: string) => void;
+  onMessages?: (messages: SlackMessage[]) => void;
   record?: (msgTs: string, text: string) => void;
 }
 
@@ -98,6 +123,7 @@ async function waitForFinalBotMessage(
   let lastSeen = "";
   while (Date.now() < deadline) {
     const messages = await fetchMessages();
+    opts.onMessages?.(messages);
     const fromBot = messages.filter((m) => m.user === botUserId && Number(m.ts) > Number(afterTs));
     for (const m of fromBot) {
       const text = m.text ?? "";
@@ -115,6 +141,7 @@ async function waitForFinalBotMessage(
       const text = m.text ?? "";
       if (isLiveStatusText(text)) continue;
       if (opts.match && !opts.match.test(text)) continue;
+      if (opts.accept && !opts.accept(m)) continue;
       const entry = seen.get(m.ts);
       if (entry && entry.text === text && Date.now() - entry.firstSeen >= STABLE_MS) return m;
     }
@@ -251,9 +278,16 @@ export class ChannelHandle {
     return ts;
   }
 
-  async waitForBotReply(rootTs: string, opts: WaitOpts = {}): Promise<SlackMessage> {
+  async waitForBotReply(rootTs: string, opts: WaitOpts & { includeChannel?: boolean } = {}): Promise<SlackMessage> {
     const msg = await waitForFinalBotMessage(
-      () => this.env.qa.replies(this.id, rootTs),
+      async () => {
+        const replies = await this.env.qa.replies(this.id, rootTs);
+        if (!opts.includeChannel) return replies;
+        const channel = await this.env.qa.history(this.id, rootTs);
+        return [...replies, ...channel.filter((m) => !m.thread_ts || m.thread_ts === m.ts)].sort(
+          (a, b) => Number(a.ts) - Number(b.ts),
+        );
+      },
       this.env.botUserId,
       opts.afterTs ?? rootTs,
       {
@@ -353,23 +387,24 @@ export class Ctx {
   }
 
   async judge(question: string, content: string): Promise<void> {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
+    const res = await fetch(this.env.judge.url, {
       method: "POST",
       headers: {
-        "x-api-key": this.env.anthropicApiKey,
+        ...this.env.judge.headers,
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
       },
       body: JSON.stringify({
-        model: this.env.judgeModel,
+        model: this.env.judge.model,
         max_tokens: 300,
+        thinking: { type: "disabled" },
         system: `You are a strict test judge for an AI assistant's Slack replies. Today's date is ${new Date().toISOString().slice(0, 10)}. Answer with exactly PASS or FAIL on the first line, then a one-sentence reason. Judge only what is asked; tone and verbosity are irrelevant unless the question asks about them.`,
         messages: [{ role: "user", content: `Question: ${question}\n\nContent to judge:\n${content}` }],
       }),
     });
-    const data = (await res.json()) as { content?: Array<{ text?: string }> };
+    const data = (await res.json()) as { content?: Array<{ type?: string; text?: string }> };
     if (!res.ok) throw new Error(`judge call failed: ${res.status} ${JSON.stringify(data).slice(0, 300)}`);
-    const verdict = (data.content?.[0]?.text ?? "").trim();
+    const verdict = (data.content?.find((block) => block.type === "text")?.text ?? "").trim();
     assert.ok(/^PASS\b/i.test(verdict), `judge failed: ${question}\n${verdict}`);
   }
 

@@ -10,8 +10,9 @@ type ActionHandler = (args: any) => Promise<void>;
 
 function fixture() {
   const submitted: any[] = [];
+  const posts: any[] = [];
   const state: {
-    stored: { requesterId: string; text: string } | null;
+    stored: { requesterId: string; text: string; threadRef?: string } | null;
     result: TurnResult;
     hold: Promise<void> | null;
     fetchFails: boolean;
@@ -39,21 +40,25 @@ function fixture() {
             reason: "destructive",
             request: {
               actor: { externalId: state.stored.requesterId },
-              conversation: { kind: "channel", threadRef: "ch:C1:1.0", channelRef: "C1", audience: [] },
+              conversation: {
+                kind: "channel",
+                threadRef: state.stored.threadRef ?? "ch:C1:1.0",
+                channelRef: "C1",
+                audience: [],
+              },
               deliveryTarget: "C1:1.0",
               text: state.stored.text,
             },
           }
         : null;
     },
-    agentRequestForApproval: async () => null,
   } as unknown as SlackCoreClient;
   const flow = createTurnFlow(core);
   const directory = {
     classifyActor: async (_client: any, userId: string) => ({ externalId: userId, displayName: userId }),
     classifyUserCached: async (_client: any, userId: string) => ({ actor: { externalId: userId } }),
   } as never;
-  const approvals = createApprovals({ core, flow, directory, threads: createThreadTracker(), ids: {} as never });
+  const approvals = createApprovals({ core, flow, directory, threads: createThreadTracker() });
   const handlers: Array<{ pattern: RegExp; handler: ActionHandler }> = [];
   approvals.registerActions({ action: (pattern, handler) => void handlers.push({ pattern, handler }) });
   const ephemerals: any[] = [];
@@ -64,7 +69,10 @@ function fixture() {
         updates.push(body);
         return { ok: true };
       },
-      postMessage: async () => ({ ok: true, ts: "9.9" }),
+      postMessage: async (body: any) => {
+        posts.push(body);
+        return { ok: true, ts: "9.9" };
+      },
       postEphemeral: async (body: any) => {
         ephemerals.push(body);
         return { ok: true };
@@ -94,7 +102,7 @@ function fixture() {
       },
     });
   };
-  return { state, submitted, ephemerals, updates, click, rememberStale };
+  return { state, submitted, ephemerals, updates, posts, click, rememberStale };
 }
 
 test("a click resumes from the stored record, not from whatever the card registry last cached", async () => {
@@ -198,4 +206,80 @@ test("a sealed-out deny never claims the command was denied", async () => {
   await f.click("U2", "hilo_deny");
   assert.equal(f.submitted.length, 2, "the restored card still denies once the conversation is unblocked");
   assert.match(String(f.updates.at(-1)?.text ?? ""), /Denied/);
+});
+
+test("cold delegated approval resumes the child without posting its reply a second time", async () => {
+  const f = fixture();
+  f.state.stored = { requesterId: "U2", text: "run delegated command", threadRef: "agent:main:subagent:child" };
+  f.state.result = { status: "ok", reply: "delegated result" };
+  await f.click("U2");
+  assert.equal(f.submitted.length, 1);
+  assert.equal(f.submitted[0].conversation.threadRef, "agent:main:subagent:child");
+  assert.equal(f.posts.length, 0);
+  assert.match(JSON.stringify(f.updates), /original conversation/);
+});
+
+test("a rejected grant scope preserves the same approval card instead of promising a replacement", async () => {
+  const f = fixture();
+  f.state.result = {
+    status: "pending_approval",
+    pendingApprovals: [
+      {
+        requestId: "req-1",
+        command: "publish",
+        reason: "only once allowed",
+        grantModes: { session: false, always: false },
+      },
+    ],
+  };
+  await f.click("U2", "hilo_allow_session");
+  const last = JSON.stringify(f.updates.at(-1));
+  assert.match(last, /hilo_allow_once/);
+  assert.doesNotMatch(last, /hilo_allow_session/);
+  assert.doesNotMatch(last, /new command needs approval/);
+  assert.equal(f.posts.length, 0);
+});
+
+test("a deny click replaces the buttons before the resumed turn runs, then records who denied", async () => {
+  const f = fixture();
+  let release!: () => void;
+  f.state.hold = new Promise<void>((resolve) => (release = resolve));
+  f.state.result = { status: "ok", reply: "Understood, I won't run it." };
+
+  const clicked = f.click("U2", "hilo_deny");
+  for (let i = 0; i < 20 && !f.submitted.length; i++) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(f.submitted.length, 1, "the resumed turn is in flight");
+  assert.equal(f.updates.length, 1, "the card was rewritten before the turn finished");
+  assert.match(String(f.updates[0].text), /^:hourglass_flowing_sand: Denying · `rm -rf \/tmp\/x`…$/);
+  assert.equal(JSON.stringify(f.updates[0].blocks).includes("hilo_"), false, "no buttons remain to click again");
+
+  release();
+  await clicked;
+  const final = f.updates.at(-1);
+  assert.match(String(final.text), /^Denied by <@U2> · `rm -rf \/tmp\/x` · <!date\^\d+\^/);
+  assert.equal(JSON.stringify(final.blocks).includes("hilo_"), false);
+  assert.equal(f.ephemerals.length, 0);
+});
+
+test("an allow click shows who allowed it while running and keeps that record under the reply", async () => {
+  const f = fixture();
+  let release!: () => void;
+  f.state.hold = new Promise<void>((resolve) => (release = resolve));
+  f.state.result = { status: "ok", reply: "Removed it." };
+
+  const clicked = f.click("U2", "hilo_allow_once");
+  for (let i = 0; i < 20 && !f.submitted.length; i++) await new Promise((resolve) => setImmediate(resolve));
+  assert.match(
+    String(f.updates[0]?.text),
+    /^:hourglass_flowing_sand: Allowed once by <@U2> · `rm -rf \/tmp\/x` — running…$/,
+  );
+  assert.equal(JSON.stringify(f.updates[0].blocks).includes("hilo_"), false);
+
+  release();
+  await clicked;
+  const final = f.updates.at(-1);
+  assert.equal(final.text, "Removed it.");
+  const decision = final.blocks.at(-1);
+  assert.equal(decision.type, "section");
+  assert.match(decision.text.text, /^:white_check_mark: Allowed once by <@U2> · `rm -rf \/tmp\/x` · /);
 });

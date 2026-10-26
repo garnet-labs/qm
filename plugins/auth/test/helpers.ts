@@ -3,7 +3,7 @@ import { createServer, type Server } from "node:http";
 import { createHash, generateKeyPairSync, randomBytes } from "node:crypto";
 import { emailConfigured, readConfig, type AuthConfig } from "../src/config.ts";
 import type { ClaimStore } from "../../chassis/src/claims.ts";
-import type { Mailer, OutgoingEmail } from "../src/email.ts";
+import type { Mailer, OutgoingEmail } from "../../chassis/src/resend.ts";
 import { loadSigningKey } from "../src/keys.ts";
 import { TokenSigner } from "../src/tokens.ts";
 import { createAuthHandler } from "../src/server.ts";
@@ -74,9 +74,6 @@ export function captureMailer(): Mailer & { sent: OutgoingEmail[]; failNext: boo
       state.sent.push(message);
       return "test-message-id";
     },
-    async verify(): Promise<string> {
-      return "ok";
-    },
   };
   return state;
 }
@@ -98,6 +95,7 @@ export async function startHarness(
     env?: Record<string, string | undefined>;
     claims?: ClaimStore & { calls: string[][] };
     brandName?: () => string;
+    trustedSignInLabel?: string;
     emailAllowed?: (email: string) => Promise<boolean>;
     sessions?: RememberedSessions;
   } = {},
@@ -130,6 +128,7 @@ export async function startHarness(
   const pending: Array<Promise<void>> = [];
   const handle = createAuthHandler({
     cfg,
+    trustedSignInLabel: options.trustedSignInLabel,
     signingKey: await loadSigningKey(cfg.signingJwk!),
     signer: new TokenSigner(cfg.tokenSecret, cfg.issuer),
     claims,

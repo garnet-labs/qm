@@ -1,6 +1,9 @@
+import { litFixture } from "./lit-fixture.ts";
+import { renderDesign } from "./design-source.ts";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { spendWindow } from "../ui/spend.ts";
 
 const html = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
 
@@ -19,6 +22,7 @@ function routerAt(pathname: string, search = "", base = "/admin") {
     "location",
     "scope",
     "orgId",
+    "governanceUI",
     `${grab("decodePathSegment")};
      ${grab("stateToUrl")};
      ${grab("urlToState")};
@@ -26,8 +30,10 @@ function routerAt(pathname: string, search = "", base = "/admin") {
   );
   return factory(
     base,
-    new Set(["history", "files", "memory", "live", "audit", "errors", "skills", "crons", "deployments"]),
+    new Function(`${html.match(/const SCOPED = new Set\(\[[\s\S]*?\]\);/)?.[0]}; return SCOPED;`)(),
     [
+      "connectors",
+      "slack-settings",
       "history",
       "files",
       "memory",
@@ -40,22 +46,29 @@ function routerAt(pathname: string, search = "", base = "/admin") {
       "slack",
       "judgments",
       "user",
+      "spend",
     ],
     "history",
     (scopeId: string) => String(scopeId || "").split(":")[0] || "scope",
     { pathname, search },
     "channel:LAST-VIEWED",
     "acme",
+    { spend: { spendWindow } },
   ) as {
     stateToUrl: (st: Record<string, unknown>) => string;
     urlToState: () => {
       view: string;
+      setup: string | null;
       scope: string;
       session: string | null;
       historyKind: string;
       cron: string | null;
       turn: string | null;
+      range: string | null;
+      from: string | null;
+      to: string | null;
       page: number;
+      cursor: string | null;
     };
   };
 }
@@ -80,10 +93,55 @@ test("scoped history addresses the scope as a path segment; kind stays a query p
     `/admin/history/scopes/${SCOPE_ENC}?kind=cron`,
   );
   assert.equal(
-    stateToUrl({ view: "history", scope: SCOPE, session: null, historyKind: "cron", cron: "c1", page: 2 }),
-    `/admin/history/scopes/${SCOPE_ENC}?cron=c1&kind=cron&page=2`,
+    stateToUrl({ view: "history", scope: SCOPE, session: null, historyKind: "cron", cron: "c1", cursor: "17~s9" }),
+    `/admin/history/scopes/${SCOPE_ENC}?cron=c1&kind=cron&cursor=17%7Es9`,
+  );
+  assert.equal(
+    routerAt(`/admin/history/scopes/${SCOPE_ENC}`, "?kind=cron&cursor=17%7Es9").urlToState().cursor,
+    "17~s9",
+    "the keyset cursor round-trips through the URL",
   );
   assert.equal(stateToUrl({ view: "history", scope: "org:acme", session: null }), "/admin/history");
+});
+
+test("the spend window round-trips through the URL so Back restores the prior range", () => {
+  const { stateToUrl } = routerAt("/admin/spend");
+  assert.equal(stateToUrl({ view: "spend", scope: "org:acme", range: "7d" }), "/admin/spend?range=7d");
+  assert.equal(stateToUrl({ view: "spend", scope: "org:acme", range: null }), "/admin/spend");
+  assert.equal(
+    stateToUrl({ view: "spend", scope: "org:acme", range: "constructor" }),
+    "/admin/spend?range=30d",
+    "an unknown preset neither throws nor survives into the URL",
+  );
+  const router = routerAt("/admin/spend", "?range=90d");
+  const st = router.urlToState();
+  assert.equal(st.view, "spend");
+  assert.equal(st.range, "90d");
+  assert.equal(router.stateToUrl(st), "/admin/spend?range=90d");
+  assert.equal(routerAt("/admin/spend").urlToState().range, null);
+});
+
+test("a custom spend window round-trips through the URL and replaces the preset range", () => {
+  const { stateToUrl } = routerAt("/admin/spend");
+  assert.equal(
+    stateToUrl({ view: "spend", scope: "org:acme", range: "7d", from: "2026-09-01", to: "2026-10-01" }),
+    "/admin/spend?from=2026-09-01&to=2026-10-01",
+  );
+  assert.equal(
+    stateToUrl({ view: "spend", scope: "org:acme", range: "7d", from: null, to: null }),
+    "/admin/spend?range=7d",
+  );
+  assert.equal(
+    stateToUrl({ view: "spend", scope: "org:acme", range: "7d", from: "2026-02-30", to: "2026-03-02" }),
+    "/admin/spend?range=7d",
+    "an impossible custom window never displaces the preset",
+  );
+  const router = routerAt("/admin/spend", "?from=2026-09-01&to=2026-10-01");
+  const st = router.urlToState();
+  assert.equal(st.from, "2026-09-01");
+  assert.equal(st.to, "2026-10-01");
+  assert.equal(router.stateToUrl(st), "/admin/spend?from=2026-09-01&to=2026-10-01");
+  assert.equal(routerAt("/admin/spend", "?range=7d").urlToState().from, null);
 });
 
 test("non-history views keep their query-param scope", () => {
@@ -128,11 +186,7 @@ test("a mangled ?scopecom link still lands on the session and canonicalizes", ()
 
 test("session deep-link entries synthesize a list back-stop and repair it from the session's own scope", () => {
   assert.match(html, /history\.pushState\(\{ \.\.\.st, deepLink: true \}, "", stateToUrl\(st\)\);/);
-  assert.match(
-    html,
-    /if \(history\.state\?\.deepLink\)\s*go\(\{ view: "history", scope: sessionScope \|\| scope, session: null, historyKind \}\);\s*else history\.back\(\);/,
-  );
-  assert.match(html, /onClick: backToList\(session\.scopeId\)/);
+  assert.match(html, /governanceUI.transcript.show/);
 });
 
 test("a scope whose encoding the portal would reject stays in the query form", () => {
@@ -151,11 +205,142 @@ test("an undecodable scope segment falls back instead of throwing", () => {
   assert.equal(st.scope, "org:acme");
 });
 
-test("cron fire rows surface the fire's result digest and keep the silent styling", () => {
-  assert.match(html, /\} else if \(isBackground && s\.result\) \{\s*name = s\.result;/);
-  assert.match(html, /previewText = s\.result \|\| s\.lastMessage \|\| s\.firstMessage \|\| "";/);
-  assert.match(html, /s\.result \|\| "\(no messages\)"/);
-  assert.match(html, /isBackground && typeof s\.delivered === "number" && !s\.delivered \? "history-silent" : ""/);
+test("cron fire rows surface the result digest", () => {
+  const f = litFixture();
+  f.ui.history.history(
+    f.root,
+    {
+      sessions: [{ id: "fire1", category: "background", result: "Digest result", lastMessage: "Tool chatter" }],
+    },
+    {
+      historyKind: "cron",
+      cron: "job1",
+      scope: "org:acme",
+      orgScope: "org:acme",
+      environments: [],
+      historyKindMatches: () => true,
+      historyModeLabel: () => "Crons",
+      kindLabels: { conversation: "Conversations", cron: "Crons" },
+      pageShell() {},
+      cronName: () => "Job",
+      scopeKind: () => "org",
+      plural: String,
+      stateToUrl: () => "/session/fire1",
+      go() {},
+      scopeRows: () => [],
+      shortName: String,
+    },
+  );
+  assert.equal(f.root.querySelector(".dense-name")!.textContent, "Digest result");
+  assert.equal(f.root.querySelector(".dense-preview")!.textContent, "Tool chatter");
+  f.dom.window.close();
+});
+
+test("the org-wide landing lists sessions with a scope tag, a scope filter, and only precomputed tab counts", () => {
+  const f = litFixture();
+  const went: Record<string, unknown>[] = [];
+  let shell: any = null;
+  const render = (d: Record<string, unknown>) => {
+    f.root.textContent = "";
+    f.ui.history.history(
+      f.root,
+      { sessions: [{ id: "s1", category: "conversation", scopeId: "channel:C1", firstMessage: "hello" }], ...d },
+      {
+        historyKind: "conversation",
+        cron: null,
+        cursor: null,
+        scope: "org:acme",
+        orgScope: "org:acme",
+        title: "Sessions",
+        environments: [],
+        historyKindMatches: () => true,
+        historyModeLabel: () => "Conversations",
+        kindLabels: { conversation: "Conversations", cron: "Cron runs", background: "Background" },
+        pageShell: (opts: any) => (shell = opts),
+        cronName: () => "Job",
+        scopeKind: (id: string) => id.split(":")[0],
+        shortName: (id: string) => (id === "channel:C1" ? "#eng" : id),
+        plural: (n: number, w: string) => `${n} ${w}s`,
+        stateToUrl: () => "/x",
+        relTime: () => "now",
+        go: (st: Record<string, unknown>) => went.push(st),
+        scopeRows: () => [{ scopeId: "channel:C1" }, { scopeId: "personal:U1" }],
+      },
+    );
+  };
+  render({});
+  assert.equal(shell.title, "Sessions");
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(shell.tabs.map((t: any) => [t.label, t.count ?? null]))),
+    [
+      ["Conversations", null],
+      ["Cron runs", null],
+      ["Background", null],
+    ],
+    "no counts until the background snapshot exists",
+  );
+  assert.equal(f.root.querySelector(".dense-tag")!.textContent, "#eng", "org-wide rows name their scope");
+  assert.equal(f.root.querySelector(".pager"), null, "a single page shows no pager and no total");
+  const select = shell.actions[0].querySelector("select") as HTMLSelectElement;
+  assert.deepEqual(
+    [...select.options].map((o) => [o.value, o.textContent!.trim()]),
+    [
+      ["org:acme", "All scopes"],
+      ["channel:C1", "#eng"],
+      ["personal:U1", "personal:U1"],
+    ],
+  );
+  select.value = "channel:C1";
+  select.dispatchEvent(new f.dom.window.Event("change"));
+  assert.equal(went.at(-1)!.scope, "channel:C1", "choosing a scope narrows the same list");
+  render({ counts: { conversation: 12, cron: 3400, background: 7 } });
+  assert.deepEqual(JSON.parse(JSON.stringify(shell.tabs.map((t: any) => t.count))), [12, 3400, 7]);
+  f.dom.window.close();
+});
+
+test("history pages older rows by keyset cursor, never by offset", () => {
+  const f = litFixture();
+  const went: Record<string, unknown>[] = [];
+  const render = (cursor: string | null, nextCursor?: string) => {
+    f.root.textContent = "";
+    f.ui.history.history(
+      f.root,
+      {
+        sessions: [{ id: "s1", category: "conversation", firstMessage: "hello" }],
+        ...(nextCursor ? { nextCursor } : {}),
+      },
+      {
+        historyKind: "conversation",
+        cron: null,
+        cursor,
+        scope: "org:acme",
+        orgScope: "org:acme",
+        environments: [],
+        historyKindMatches: () => true,
+        historyModeLabel: () => "Conversations",
+        kindLabels: { conversation: "Conversations", cron: "Crons" },
+        pageShell() {},
+        cronName: () => "Job",
+        scopeKind: () => "org",
+        plural: (n: number, w: string) => `${n} ${w}s`,
+        stateToUrl: () => "/x",
+        go: (st: Record<string, unknown>) => went.push(st),
+        scopeRows: () => [],
+        shortName: String,
+      },
+    );
+    return [...f.root.querySelectorAll<HTMLButtonElement>(".pager .page")];
+  };
+  const [newest, older] = render(null, "50~s50");
+  assert.equal(newest!.disabled, true, "the first page has nothing newer");
+  older!.click();
+  assert.equal(went.at(-1)!.cursor, "50~s50", "Older follows the server's nextCursor");
+  const [newestLater, olderLast] = render("50~s50");
+  assert.equal(olderLast!.disabled, true, "the last page has no nextCursor");
+  newestLater!.click();
+  assert.equal(went.at(-1)!.cursor, null, "Newest drops the cursor");
+  assert.equal(render(null).length, 0, "a single page renders no pager");
+  f.dom.window.close();
 });
 
 test("a bare history URL is the org scope, not whatever scope was viewed last", () => {
@@ -181,3 +366,49 @@ test("Errors pagination round-trips arbitrary pages without losing scope", () =>
     `/admin/errors?scope=${SCOPE_ENC}&page=37`,
   );
 });
+
+test("Slack setup links select Slack settings and preserve the guide through canonical routing", () => {
+  for (const pathname of ["/admin", "/admin/", "/admin/connectors"]) {
+    const { stateToUrl, urlToState } = routerAt(pathname, "?setup=slack");
+    const state = urlToState();
+    assert.equal(state.view, "slack-settings");
+    assert.equal(state.setup, "slack");
+    assert.equal(stateToUrl(state), "/admin/slack-settings?setup=slack");
+  }
+  const { stateToUrl } = routerAt("/admin/connectors", "?setup=slack");
+  assert.equal(stateToUrl({ view: "connectors" }), "/admin/connectors");
+  assert.equal(stateToUrl({ view: "files", setup: "slack" }), "/admin/files");
+});
+
+test("navigation drops retired design parameters while retaining route state", () => {
+  const { stateToUrl } = routerAt("/admin/history", "?variant=original");
+  assert.equal(
+    stateToUrl({ view: "history", scope: SCOPE, session: "sess-1", turn: 4 }),
+    "/admin/history/s/sess-1?turn=4",
+  );
+  assert.equal(stateToUrl({ view: "files", scope: SCOPE }), `/admin/files?scope=${SCOPE_ENC}`);
+});
+
+for (const base of ["", "/admin", "/control"]) {
+  test(`catalog live links use the configured base (${base || "root"})`, () => {
+    const { stateToUrl } = routerAt(`${base}/design-system`, "", base);
+    const dom = renderDesign(stateToUrl, SCOPE);
+    const links = [...dom.window.document.querySelectorAll<HTMLAnchorElement>(".design-page-links a")];
+    assert.deepEqual(
+      links.map((link) => link.dataset.designView),
+      ["governance", "skills", "files", "history", "audit", "egress"],
+    );
+    assert.deepEqual(
+      links.map((link) => link.getAttribute("href")),
+      [
+        `${base}/governance?scope=${SCOPE_ENC}`,
+        `${base}/skills?scope=${SCOPE_ENC}`,
+        `${base}/files?scope=${SCOPE_ENC}`,
+        `${base}/history/scopes/${SCOPE_ENC}`,
+        `${base}/audit?scope=${SCOPE_ENC}`,
+        `${base}/egress?scope=${SCOPE_ENC}`,
+      ],
+    );
+    dom.window.close();
+  });
+}

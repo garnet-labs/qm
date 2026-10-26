@@ -7,16 +7,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { createInsecureTestServer } from "../src/api/server.ts";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { createKeychain } from "../src/credentials/keychain.ts";
 import { deriveConnectorKey } from "../src/connectors/connector-client-store.ts";
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
 import { scopeId, type TurnRequest } from "../src/types.ts";
 import { testConfig } from "./support/test-config.ts";
+import { createMemoryAdvisoryLock } from "../src/persistence/advisory-lock.ts";
 
 function start() {
   const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "admin-keychain-")) }));
   const keychain = createKeychain({
+    lock: createMemoryAdvisoryLock(),
     creds: createMemoryMap(),
     grants: createMemoryMap(),
     asks: createMemoryMap(),
@@ -92,4 +94,88 @@ test("/v1/admin/keychain returns metadata, grants, and asks without secrets; non
   } finally {
     await s.close();
   }
+});
+
+test("credentials-page summary avoids unrelated history and exposes counts only", async (t) => {
+  const s = start();
+  t.after(s.close);
+  const credential = await s.keychain.save({
+    ownerId: "U1",
+    service: "github",
+    secret: "summary-test-secret",
+    envKey: "GITHUB_TOKEN",
+    accountLabel: "test",
+  });
+  await s.keychain.createGrant({
+    credentialId: credential.id,
+    ownerId: "U1",
+    audienceScopeId: scopeId("channel", "C1"),
+    mode: "standing",
+    purpose: "test",
+  });
+  const fail = () => {
+    throw new Error("Summary must not scan unrelated data");
+  };
+  t.mock.method(s.keychain, "listAsks", fail);
+  t.mock.method(s.built.sessions, "distinctParticipants", fail);
+  t.mock.method(s.built.app, "directoryMembers", fail);
+  const response = await fetch(s.base + "/v1/admin/keychain?summary=1", {
+    headers: { "x-admin-actor": "admin-alice@default-org" },
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { users: 1, standing: 1 });
+  const denied = await fetch(s.base + "/v1/admin/keychain?summary=1", {
+    headers: { "x-admin-actor": "nobody@default-org" },
+  });
+  assert.equal(denied.status, 403);
+});
+
+test("user keychain reads only the selected owner's metadata and grants", async (t) => {
+  const s = start();
+  t.after(s.close);
+  const credential = await s.keychain.save({
+    ownerId: "alice@example.com",
+    service: "github",
+    secret: "private-user-secret",
+    envKey: "GITHUB_TOKEN",
+  });
+  await s.keychain.save({
+    ownerId: "bob@example.com",
+    service: "github",
+    secret: "other-user-secret",
+    envKey: "GITHUB_TOKEN",
+  });
+  const grant = await s.keychain.createGrant({
+    credentialId: credential.id,
+    ownerId: "alice@example.com",
+    audienceScopeId: scopeId("channel", "C1"),
+    mode: "standing",
+    purpose: "test",
+  });
+  const fail = () => {
+    throw new Error("User keychain must not load unrelated org data");
+  };
+  t.mock.method(s.keychain, "listAllMetadata", fail);
+  t.mock.method(s.keychain, "listAsks", fail);
+  t.mock.method(s.built.sessions, "distinctParticipants", fail);
+  t.mock.method(s.built.app, "directoryMembers", fail);
+  const response = await fetch(s.base + "/v1/admin/keychain?principal=Alice%40example.com", {
+    headers: { "x-admin-actor": "admin-alice@default-org" },
+  });
+  assert.equal(response.status, 200);
+  const data = (await response.json()) as any;
+  assert.deepEqual(
+    data.credentials.map((c: { id: string }) => c.id),
+    [credential.id],
+  );
+  assert.deepEqual(
+    data.grants.map((g: { id: string }) => g.id),
+    [grant.id],
+  );
+  assert.equal(JSON.stringify(data).includes("private-user-secret"), false);
+  assert.equal(JSON.stringify(data).includes("bob@example.com"), false);
+  const denied = await fetch(s.base + "/v1/admin/keychain?principal=alice%40example.com", {
+    headers: { "x-admin-actor": "nobody@default-org" },
+  });
+  assert.equal(denied.status, 403);
 });

@@ -9,7 +9,10 @@ import { setOnboardingStatus } from "../../src/onboarding/onboarding.ts";
 import { assertSandboxExecution } from "./scenarios-sandbox-providers.ts";
 
 async function main(): Promise<void> {
-  assert.ok(process.env.ANTHROPIC_API_KEY, "a live model credential is required");
+  assert.ok(
+    process.env.ANTHROPIC_API_KEY || process.env.MODEL_GATEWAY_URL,
+    "a live model credential or model gateway is required",
+  );
   assert.ok(process.env.LOCAL_SANDBOX_IMAGE?.startsWith("sha256:"), "use an immutable local sandbox image ID");
   assert.ok(process.env.QM_CORE_CONTAINER, "the candidate core container name is required");
   assert.ok(process.env.EXPECTED_SOURCE_SHA, "the expected source pin is required");
@@ -22,7 +25,7 @@ async function main(): Promise<void> {
     runStore: "memory",
     harness: "pi",
     sandboxBackend: "local",
-    sandboxResourcesEnabled: true,
+
     backgroundWorkEnabled: false,
     turnWallClockMs: 180_000,
     localSandbox: { ...config.localSandbox, coreContainer: process.env.QM_CORE_CONTAINER },
@@ -35,11 +38,7 @@ async function main(): Promise<void> {
     await built.identity.hydrate();
     await built.deploymentLayerReady;
     await built.sandboxResources.initialize();
-    await built.memory.replace(
-      scopeId,
-      setOnboardingStatus("", "completed", new Date().toISOString().slice(0, 10)),
-      actorId,
-    );
+    await setOnboardingStatus(built.memory, scopeId, "completed", new Date().toISOString().slice(0, 10), actorId);
     const sandbox = await built.sandboxResources.create(actorId, scopeId, "local", name);
     assert.equal(sandbox.backend, "local");
     await built.sandboxResources.setDefault(actorId, scopeId, sandbox.id);
@@ -49,7 +48,7 @@ async function main(): Promise<void> {
       surface: "qualification",
       actor: { externalId: actorId },
       conversation: { kind: "dm", threadRef: `qualification:${randomUUID()}` },
-      text: `Use sandbox action exec with sandbox_id ${sandbox.id} to run exactly: printf '%s%s\\n' '${left}' '${right}'. Set timeout_seconds to 30. Report the result.`,
+      text: `Use execute with sandbox_id ${sandbox.id} to run exactly: printf '%s%s\\n' '${left}' '${right}'. Set timeout_seconds to 30. Report the result.`,
     });
     assert.equal(result.status, "ok", result.reason ?? result.reply);
     assert.ok(result.sessionId);

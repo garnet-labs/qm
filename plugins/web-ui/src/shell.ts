@@ -1,8 +1,14 @@
-import { openModelConnectManager, renderModelConnectGate } from "./model-connect";
+import { loadMessageTranscript, messageLinkSeq } from "./message-link.ts";
+import { initializeBrowserErrors, stopBrowserErrors } from "./browser-errors";
+import { initializeAnalytics, capturePageview, stopAnalytics } from "./product-analytics";
+import { captureSlackReturn } from "./slack-account";
+import { captureConnectionReturn } from "./connection-return";
+import { renderModelConnectGate } from "./model-connect";
 import { html, nothing, render, type TemplateResult } from "lit";
 import {
   Box,
   Brain,
+  CalendarDays,
   Clock,
   Files,
   Folder,
@@ -25,6 +31,7 @@ import {
 } from "lucide";
 import {
   api,
+  ApiError,
   setSigninRequiredHandler,
   type SigninRequired,
   fetchRuntimeConfig,
@@ -33,19 +40,24 @@ import {
   TAIL_TURNS,
   webFetch,
   withBase,
+  type CoreSession,
+  type PendingApproval,
+  type TranscriptPage,
+  loadChatPrefs,
+  fetchSessionRow,
 } from "./core-bridge";
-import { applyRuntimeOptions } from "./model-options";
-import { errMessage, swallow } from "../../chassis/src/errors";
-import { brandMark, brandName, icon } from "./ui";
+import { seedRuntimeConfig } from "./runtime-config-store";
+import { errMessage, swallow, swallowAs } from "../../chassis/src/errors";
+import { brandMark, brandName } from "./ui";
+import { icon } from "./icons";
 import { PHONE_MAX_WIDTH, trackVisualViewport } from "./viewport";
 import { markConnectorConnected } from "./chat";
-import { clearSkillsCache, resyncModelSelection, seedRuntimeConfig } from "./composer";
-import { ensureDeliveryStream, mainConversation, onExitCanvas } from "./conversations";
-import { clearAllDrafts, saveDraft, storedDraft } from "./drafts";
-import { deepLinkPath, isPlainLeftClick, parseDeepLink, UI_BASE } from "./deep-link";
+import { clearSkillsCache, resyncModelSelection } from "./composer";
+import { allConversations, ensureDeliveryStream, mainConversation, onExitCanvas } from "./conversations";
+import { clearAllDrafts, newChatDraftKey, saveDraft, storedDraft } from "./drafts";
+import { deepLinkPath, isPlainLeftClick, parseDeepLink, sessionLinkTarget, UI_BASE } from "./deep-link";
 import {
   adoptRemoteSplit,
-  canvasToast,
   beginPaneKindDrag,
   drawCanvas,
   endPaneDrag,
@@ -56,6 +68,7 @@ import {
   mountRestoredCanvas,
   restoredCanvasNeedsSessionList,
   splitState,
+  singlePaneSessionId,
 } from "./split";
 import { activityOf } from "./session-list";
 import { replaceChildrenPreservingFocus } from "./pane-focus";
@@ -82,11 +95,11 @@ import { openChatSearch } from "./search";
 import { closeBrowse, openBrowse } from "./browse";
 import { attachTooltip, hideTooltip, tip } from "./tooltip";
 import { clearConnectorNotice, noteConnectorResult, renderConnectors, resetKeychainState } from "./connectors";
-import { renderDeploys } from "./deploys";
+import { openDeployById, renderDeploys } from "./deploys";
 import { renderMemory, resetMemoryState } from "./memory";
+import { renderCalendar } from "./calendar";
 import {
   inboxOpenCount,
-  openInboxItemById,
   refreshInbox,
   renderInbox,
   resetActiveInboxItem,
@@ -94,7 +107,8 @@ import {
   routeInboxHistory,
 } from "./inbox";
 import { openSkillById, renderSkills, resetActiveSkill, routeSkillsHistory } from "./skills";
-import { applyTheme, renderSettings, watchSystemTheme } from "./settings";
+import { watchAppAnnotations } from "./app-annotations";
+import { applyTheme, renderSettings, loadOpenNewChat, watchSystemTheme } from "./settings";
 import { contextsState, ensureContexts, renderContexts, resetContextsState, resolveProjectScope } from "./contexts";
 import { appState, can, canView, isView, type AuthMode, type Me, type View } from "./shell-state";
 import { trapDialogFocus } from "./dialog-focus";
@@ -127,6 +141,7 @@ function signOutFromMenu(): void {
 
 let authMode: AuthMode = "portal";
 let shellMounted = false;
+let pendingCanvasRestore: Promise<void> | null = null;
 
 setSigninRequiredHandler((detail) => {
   authMode = detail.mode ?? authMode;
@@ -145,8 +160,11 @@ export function syncUrlFromState(sessionOverride?: string | null): void {
   const chatState = mainConversation().state;
   const fromState =
     sessionOverride !== undefined ? sessionOverride : (chatState.sessionId ?? chatState.rememberedSessionId);
-  const sessionId = splitState.active ? null : fromState;
-  const next = deepLinkPath(UI_BASE, appState.currentView, sessionId, contextsState.selected);
+  const sessionId = splitState.active ? singlePaneSessionId() : fromState;
+  let next = deepLinkPath(UI_BASE, appState.currentView, sessionId, contextsState.selected);
+  const linked = parseDeepLink(UI_BASE, location.pathname, location.search);
+  const seq = messageLinkSeq(location.search);
+  if (appState.currentView === "chats" && linked.session === sessionId && seq !== null) next += `?seq=${seq}`;
   if (`${location.pathname}${location.search}` !== next) history.replaceState(null, "", next);
 }
 
@@ -202,6 +220,7 @@ function resetSidebarWidth(): void {
 const ICON = {
   newChat: Plus,
   inbox: InboxGlyph,
+  calendar: CalendarDays,
   chats: MessageSquare,
   contexts: Folder,
   files: Files,
@@ -217,6 +236,8 @@ const ICON = {
 };
 
 export async function signOut(): Promise<void> {
+  stopAnalytics();
+  stopBrowserErrors();
   const portal = authMode === "portal";
   if (!portal) {
     try {
@@ -244,9 +265,11 @@ export async function signOut(): Promise<void> {
     return;
   }
   let endedSession: boolean;
+  let redirectTo = "/";
   try {
     const r = await fetch("/auth/logout", { method: "POST", headers: { accept: "application/json" } });
     endedSession = r.ok;
+    if (r.ok) redirectTo = ((await r.json()) as { redirectTo?: string }).redirectTo ?? "/";
   } catch {
     endedSession = false;
   }
@@ -255,7 +278,7 @@ export async function signOut(): Promise<void> {
     return;
   }
   clearPortalAttempt();
-  location.href = "/";
+  location.href = redirectTo;
 }
 
 export async function exitImpersonation(): Promise<void> {
@@ -434,6 +457,8 @@ export type AuthGate =
   | { kind: "dev"; value?: string; error?: string; pending?: boolean };
 
 export function renderAuthGate(gate: AuthGate): void {
+  stopAnalytics();
+  stopBrowserErrors();
   shellMounted = false;
   const body = (() => {
     switch (gate.kind) {
@@ -493,7 +518,6 @@ export function mountShell(): void {
           role="separator"
           aria-orientation="vertical"
           aria-label="Resize sidebar"
-          ${tip("Drag to resize · double-click to reset")}
           @pointerdown=${startSidebarResize}
           @dblclick=${resetSidebarWidth}
         ></div>
@@ -552,12 +576,11 @@ export function renderSidebarFooter(): void {
           aria-expanded=${userMenuOpen ? "true" : "false"}
           @click=${toggleUserMenu}
         >
-          <span class="user-name">${appState.me?.user ?? ""}</span>
+          <span class="user-name">${appState.me?.displayName?.trim() || appState.me?.user || ""}</span>
         </button>
         ${
           userMenuOpen
             ? html`<div class="session-menu-popover user-menu-popover" role="menu">
-                ${appState.me?.individualModelAuth ? html`<button class="session-menu-option" type="button" role="menuitem" @click=${openModelConnectManager}>Manage AI account</button>` : nothing}
                 <button class="session-menu-option" type="button" role="menuitem" @click=${signOutFromMenu}>
                   ${icon(LogOut, 15)}<span>Sign out</span>
                 </button>
@@ -611,7 +634,8 @@ export function renderSidebarTop(): void {
   render(
     html`
       <nav class="nav quick-nav" @click=${onNavClick}>
-        ${navRow("chats", ICON.home, "Home")} ${can("inbox") ? inboxNavRow() : nothing}
+        ${navRow("chats", ICON.home, "Home")}
+        ${can("inbox") ? html`${inboxNavRow()} ${navRow("calendar", ICON.calendar, "Calendar")}` : nothing}
         ${actionRow(Search, "Search", () => {
           hideTooltip();
           openChatSearch();
@@ -627,7 +651,7 @@ export function renderSidebarTop(): void {
           startNewChatInLastScope();
         })}
       </div>
-      ${sessionSelectionBar() ?? html` <div class="section-label recents-label"><span>Sessions</span></div> `}
+      ${sessionSelectionBar() ?? nothing}
     `,
     appState.topEl,
   );
@@ -673,6 +697,7 @@ export function switchView(v: View): void {
     return;
   }
   appState.currentView = v;
+  capturePageview(v);
   appState.viewRenderSeq++;
   sessionsState.openMenuId = null;
   sessionsState.renamingId = null;
@@ -684,13 +709,27 @@ export function switchView(v: View): void {
   syncUrlFromState();
   resetActiveDetail(v);
   switch (v) {
-    case "chats":
-      if (splitState.active) drawCanvas();
-      else void renderChatsPage();
-      renderList();
+    case "chats": {
+      const seq = appState.viewRenderSeq;
+      const showChats = () => {
+        if (appState.currentView !== "chats" || appState.viewRenderSeq !== seq) return;
+        if (mountRestoredCanvas()) drawCanvas();
+        else void renderChatsPage();
+        renderList();
+      };
+      if (pendingCanvasRestore) {
+        appState.mainEl?.replaceChildren(
+          Object.assign(document.createElement("div"), { className: "empty", textContent: "Loading conversations…" }),
+        );
+        void pendingCanvasRestore.then(showChats);
+      } else showChats();
       break;
+    }
     case "inbox":
       void renderInbox();
+      break;
+    case "calendar":
+      renderCalendar();
       break;
     case "webhooks":
       void renderWebhooksPage();
@@ -756,6 +795,9 @@ function refreshActiveView(v: View): void {
     case "inbox":
       void renderInbox();
       break;
+    case "calendar":
+      renderCalendar();
+      break;
     case "contexts":
       void renderContexts();
       break;
@@ -797,6 +839,32 @@ export function showMainEmpty(text: string): void {
     appState.mainEl.replaceChildren(
       Object.assign(document.createElement("div"), { className: "empty", textContent: text }),
     );
+}
+
+function showConversationError(unavailable: boolean): void {
+  showMainEmpty("");
+  if (!appState.mainEl) return;
+  render(
+    html`
+      <section class="conversation-error" aria-labelledby="conversation-error-title">
+        <span class="conversation-error-code">${unavailable ? "Connection problem" : "404"}</span>
+        <h1 id="conversation-error-title" tabindex="-1">
+          ${unavailable ? "Couldn't load conversation" : "Conversation not found"}
+        </h1>
+        <p>
+          ${unavailable ? "Something went wrong loading this conversation. Please try again." : "This conversation may have been deleted, or you may be signed into an account that doesn’t have access."}
+        </p>
+        <div class="conversation-error-actions">
+          <a class="btn" href=${withBase("/")}>Back to chats</a>
+          ${unavailable ? html`<button class="btn" @click=${() => location.reload()}>Try again</button>` : nothing}
+        </div>
+      </section>
+    `,
+    appState.mainEl,
+  );
+  appState.mainEl.querySelector<HTMLElement>("h1")?.focus();
+  renderList();
+  document.title = `${unavailable ? "Couldn't load conversation" : "Conversation not found"} · ${brandName()}`;
 }
 
 function toggleSidebar(): void {
@@ -931,15 +999,17 @@ function warmDeferredChunks(): void {
   else setTimeout(warm, 1500);
 }
 
-function openAppEditChat(slug: string): void {
+async function openAppEditChat(slug: string): Promise<void> {
   const user = appState.me?.user ?? "anon";
   const threadRef = `web:${user}:app-edit:${slug}`;
-  const existing = sessionsState.list.find((s) => s.threadRef === threadRef);
+  if (storedDraft(threadRef) === `Update my deployed app "${slug}": `) saveDraft(threadRef, "");
+  const existing =
+    sessionsState.list.find((s) => s.threadRef === threadRef) ??
+    (await fetchSessionRow({ threadRef }).catch(swallowAs("web-ui: find app edit chat", null)));
   if (existing) {
     void openSession(existing);
     return;
   }
-  if (!storedDraft(threadRef)) saveDraft(threadRef, `Update my deployed app "${slug}": `);
   startNewChat(null, null, threadRef);
   renderList();
 }
@@ -953,19 +1023,78 @@ export async function bootSafely(): Promise<void> {
   }
 }
 
+async function showLinkedSession(
+  linked: CoreSession,
+  transcript: Promise<TranscriptPage | null>,
+  seq: number | null,
+  approvals?: Promise<{ approvals: PendingApproval[] } | null>,
+): Promise<void> {
+  if (!sessionsState.list.some((s) => s.id === linked.id)) sessionsState.list = [linked, ...sessionsState.list];
+  revealSessionSurface(linked);
+  await openSession(linked, transcript, approvals);
+  if (seq !== null)
+    requestAnimationFrame(() => {
+      for (const conversation of allConversations())
+        if (conversation.state.sessionId === linked.id) conversation.revealEntry(seq);
+    });
+}
+
+// Session links nobody else handled (chat messages, markdown) switch the view instead of opening a new
+// tab or desktop window. Modified clicks fall through, so cmd/ctrl-click still opens a new tab.
+document.addEventListener("click", (e) => {
+  if (!shellMounted || e.defaultPrevented || !isPlainLeftClick(e)) return;
+  const anchor = e.composedPath().find((node): node is HTMLAnchorElement => node instanceof HTMLAnchorElement);
+  if (!anchor?.href || anchor.hasAttribute("download")) return;
+  const target = sessionLinkTarget(anchor.href, location.origin, UI_BASE);
+  if (!target) return;
+  e.preventDefault();
+  const open = allConversations().find(
+    (conversation) => conversation.state.sessionId === target.session && conversation.state.host?.isConnected,
+  );
+  if (open) {
+    if (target.seq !== null) open.revealEntry(target.seq);
+    return;
+  }
+  const transcript = loadMessageTranscript(
+    (window) => fetchTranscript(target.session, window),
+    target.seq,
+    TAIL_TURNS,
+  ).catch(() => null);
+  void (async () => {
+    const linked = sessionsState.list.find((s) => s.id === target.session) ?? (await transcript)?.session;
+    if (linked) await showLinkedSession(linked, transcript, target.seq);
+    else location.assign(anchor.href);
+  })();
+});
+
 export async function boot(): Promise<void> {
+  if (new URLSearchParams(location.search).get("themeOnly") === "1") return;
+  captureConnectionReturn(location.href);
+  captureSlackReturn(location.href);
   const params = new URLSearchParams(location.search);
   const {
     view: wanted,
     session: wantedSession,
     item: wantedItem,
   } = parseDeepLink(UI_BASE, location.pathname, location.search);
+  document.body.classList.toggle("app-edit-embed", wanted === "app-edit" && params.get("embed") === "1");
+  const prefillRoute = wanted === null || wanted === "new";
+  const prefill = prefillRoute && !wantedSession ? (params.get("q")?.slice(0, 20_000) ?? null) : null;
   const chatsLink = wanted === null || wanted === "chats";
   const linkedId = wantedSession && chatsLink ? wantedSession : null;
-  const entriesPrefetch = linkedId ? fetchTranscript(linkedId, { tailTurns: TAIL_TURNS }).catch(() => null) : null;
+  let transcriptUnavailable = false;
+  const wantedSeq = messageLinkSeq(location.search);
+  const loadLinkedTranscript = (id: string) =>
+    loadMessageTranscript((window) => fetchTranscript(id, window), wantedSeq, TAIL_TURNS).catch((error: unknown) => {
+      transcriptUnavailable = !(error instanceof ApiError && (error.status === 404 || error.status === 403));
+      return null;
+    });
+  const entriesPrefetch = linkedId ? loadLinkedTranscript(linkedId) : null;
   const approvalsPrefetch = linkedId ? fetchSessionApprovals(linkedId) : null;
   const runtimeConfigFetch = fetchRuntimeConfig();
   const remoteSplitFetch = fetchRemoteSplit();
+  const openNewChatFetch = loadOpenNewChat();
+  void loadChatPrefs();
 
   let r: Response;
   try {
@@ -986,6 +1115,8 @@ export async function boot(): Promise<void> {
   }
   resetKeychainState();
   appState.me = (await r.json()) as Me;
+  void initializeBrowserErrors(appState.me);
+  void initializeAnalytics(appState.me, isView(wanted) && canView(wanted) ? wanted : "chats");
   authMode = appState.me.mode ?? "portal";
   clearPortalAttempt();
   if (appState.me.individualModelAuth && !appState.me.modelAuthConnected) {
@@ -993,46 +1124,46 @@ export async function boot(): Promise<void> {
     renderModelConnectGate();
     return;
   }
+  const sessions = refreshSessions({ showLoading: true });
   const personalScope = `personal:${appState.me.user}`;
   const prefetchedConfig = await runtimeConfigFetch;
   const runtimeConfig =
     prefetchedConfig?.scopeId === personalScope ? prefetchedConfig : await fetchRuntimeConfig(personalScope);
   if (runtimeConfig) {
-    applyRuntimeOptions(
-      personalScope,
-      runtimeConfig.approvedHarnesses,
-      runtimeConfig.modelsByHarness,
-      runtimeConfig.effective,
-      runtimeConfig.modelCatalog,
-    );
     seedRuntimeConfig(personalScope, runtimeConfig);
   }
   resyncModelSelection();
   mountShell();
+  renderList();
   shellMounted = true;
   ensureDeliveryStream();
   warmDeferredChunks();
   void refreshInbox({ silent: true });
-  loadPersistedSplit();
-  await adoptRemoteSplit(remoteSplitFetch);
-
   const connectedProvider = params.get("status") === "connected" ? params.get("connector") : null;
   if (connectedProvider) markConnectorConnected(connectedProvider);
   const viewIntent = isView(wanted) && canView(wanted) && wanted !== "chats";
+  const restoreLast = viewIntent || !(await openNewChatFetch);
+  if (restoreLast) loadPersistedSplit();
+  if (restoreLast && !wantedSession && wanted !== "app-edit" && prefill === null) {
+    const restore = adoptRemoteSplit(remoteSplitFetch).then(async () => {
+      if (viewIntent && restoredCanvasNeedsSessionList()) await sessions;
+    });
+    pendingCanvasRestore = restore;
+    void restore.then(() => {
+      if (pendingCanvasRestore === restore) pendingCanvasRestore = null;
+    });
+    if (!viewIntent) await restore;
+  }
 
   const bareEntry = !viewIntent && !wantedSession && wanted !== "app-edit" && !connectedProvider;
-  if (bareEntry && !restoredCanvasNeedsSessionList()) mountRestoredCanvas();
-
-  const sessions = refreshSessions({ showLoading: true });
+  if (restoreLast && bareEntry && !restoredCanvasNeedsSessionList()) mountRestoredCanvas(true);
 
   if (wantedSession && !viewIntent && wanted !== "app-edit") {
-    const transcript = entriesPrefetch ?? fetchTranscript(wantedSession, { tailTurns: TAIL_TURNS }).catch(() => null);
+    const transcript = entriesPrefetch ?? loadLinkedTranscript(wantedSession);
     const linked = (await transcript)?.session;
     if (linked) {
       exitSplitIfActive();
-      if (!sessionsState.list.some((s) => s.id === linked.id)) sessionsState.list = [linked, ...sessionsState.list];
-      revealSessionSurface(linked);
-      await openSession(linked, transcript, approvalsPrefetch ?? undefined);
+      await showLinkedSession(linked, transcript, wantedSeq, approvalsPrefetch ?? undefined);
       return;
     }
     await sessions;
@@ -1041,49 +1172,65 @@ export async function boot(): Promise<void> {
       exitSplitIfActive();
       revealSessionSurface(match);
       await openSession(match);
-    } else if (mountRestoredCanvas()) {
-      canvasToast("That conversation wasn't found, or you don't have access to it.");
-      syncUrlFromState();
     } else {
-      showMainEmpty("That conversation wasn't found, or you don't have access to it.");
-      renderList();
+      showConversationError(transcriptUnavailable);
     }
+    return;
+  }
+
+  if (viewIntent) {
+    if (wanted === "keychain") {
+      const provider = params.get("connector");
+      const status = params.get("status");
+      if (provider && status) noteConnectorResult(provider, status);
+    }
+    if (wanted === "contexts" || wanted === "files" || wanted === "deploys") {
+      const scope =
+        params.get("scope") ?? (wantedItem ? resolveProjectScope(await ensureContexts(), wantedItem) : null);
+      if (scope) contextsState.selected = scope;
+    }
+    if (wanted === "deploys" && wantedItem) openDeployById(wantedItem);
+    if (wanted === "crons" && wantedItem) openCronById(wantedItem);
+    if (wanted === "webhooks" && wantedItem) openWebhookById(wantedItem);
+    if (wanted === "skills" && wantedItem) openSkillById(wantedItem);
+    switchView(wanted as View);
+    if (wanted === "inbox") routeInboxHistory(wantedItem);
     return;
   }
 
   await sessions;
 
+  if (prefill !== null) {
+    history.replaceState(null, "", deepLinkPath(UI_BASE, "chats", null));
+    saveDraft(newChatDraftKey(appState.me.user), prefill);
+    exitSplitIfActive();
+    mainConversation().newChat();
+    return;
+  }
+
   if (wanted === "app-edit") {
     const slug = (params.get("slug") ?? "").toLowerCase();
     if (/^[a-z0-9-]{1,63}$/.test(slug)) {
-      openAppEditChat(slug);
+      await openAppEditChat(slug);
+      if (params.get("embed") === "1")
+        watchAppAnnotations(slug, (text, files, id, remove) =>
+          mainConversation().composer.addAnnotations(text, files, id, remove),
+        );
       return;
     }
     showMainEmpty("This edit link is missing a valid app name.");
     return;
   }
 
-  if (wanted === "keychain") {
-    const provider = params.get("connector");
-    const status = params.get("status");
-    if (provider && status) noteConnectorResult(provider, status);
-    switchView("keychain");
-  } else if (viewIntent) {
-    if (wanted === "contexts" || wanted === "files" || wanted === "deploys") {
-      const scope =
-        params.get("scope") ?? (wantedItem ? resolveProjectScope(await ensureContexts(), wantedItem) : null);
-      if (scope) contextsState.selected = scope;
-    }
-    if (wanted === "crons" && wantedItem) openCronById(wantedItem);
-    if (wanted === "webhooks" && wantedItem) openWebhookById(wantedItem);
-    if (wanted === "inbox" && wantedItem) openInboxItemById(wantedItem);
-    if (wanted === "skills" && wantedItem) openSkillById(wantedItem);
-    switchView(wanted as View);
-  } else if (connectedProvider && sessionsState.list.length) {
+  if (connectedProvider && sessionsState.list.length) {
     const recent = [...sessionsState.list].sort((a, b) => activityOf(b) - activityOf(a))[0]!;
     exitSplitIfActive();
     await openSession(recent);
-  } else if (!mountRestoredCanvas() && !mainConversation().state.threadRef) {
+  } else if (!(restoreLast && mountRestoredCanvas()) && !mainConversation().state.threadRef) {
     mainConversation().newChat();
   }
 }
+
+window.addEventListener("qm:prepare-update", (event) => {
+  (event as CustomEvent<{ ready: boolean }>).detail.ready = true;
+});

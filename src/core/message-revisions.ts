@@ -1,10 +1,5 @@
 import type { ScopeId, SessionEntry } from "../types.ts";
-import {
-  appendEntryOutsideTurn,
-  type Lease,
-  type SessionStore,
-  type TranscriptAppendSessions,
-} from "../sessions/session-store.ts";
+import type { Lease, SessionStore } from "../sessions/session-store.ts";
 import { parseSlackThreadRef, slackThreadRefCandidates } from "../slack/message-gating.ts";
 import type { IngestEvent, SurfaceCache } from "../surface-cache/types.ts";
 import { isoFromTs, xmlAttrEscape, xmlEscape } from "../util/message-tag.ts";
@@ -16,16 +11,20 @@ export interface MessageRevisionPayload {
   ts: string;
   text?: string;
   name?: string;
+  sourceRole?: "agent";
 }
 
 interface MessageRevisionSource {
+  self?: boolean;
   ts: string;
   deleted?: boolean;
   text?: string;
 }
 
-export type RevisionSessions = TranscriptAppendSessions &
-  Pick<SessionStore, "sessionsByThreadRefs" | "acquireLease" | "releaseLease" | "getEntries">;
+export type RevisionSessions = Pick<
+  SessionStore,
+  "append" | "sessionsByThreadRefs" | "acquireLease" | "releaseLease" | "getEntries"
+>;
 
 interface RevisionSession {
   id: string;
@@ -44,6 +43,7 @@ export function messageRevision(e: Pick<SessionEntry, "type" | "payload">): Mess
 export function renderMessageRevision(p: MessageRevisionPayload): string {
   const attrs = [
     `id="${xmlAttrEscape(p.ts)}"`,
+    ...(p.sourceRole ? [`from="${p.sourceRole}"`] : []),
     ...(p.name?.trim() ? [`author="${xmlAttrEscape(p.name.trim())}"`] : []),
     ...(isoFromTs(p.ts) ? [`sent-at="${isoFromTs(p.ts)}"`] : []),
   ].join(" ");
@@ -53,7 +53,7 @@ export function renderMessageRevision(p: MessageRevisionPayload): string {
 }
 
 function isRevisionEvent(e: IngestEvent): boolean {
-  return !e.self && Boolean(e.ts) && (e.deleted === true || e.editedAt !== undefined);
+  return Boolean(e.ts) && (e.deleted === true || e.editedAt !== undefined);
 }
 
 export function hasRevisionEvents(events: readonly IngestEvent[]): boolean {
@@ -63,6 +63,7 @@ export function hasRevisionEvents(events: readonly IngestEvent[]): boolean {
 interface OriginalMessage {
   text: string;
   name?: string;
+  sourceRole?: "agent";
 }
 
 function findOriginal(entries: readonly SessionEntry[], ts: string): OriginalMessage | null {
@@ -73,13 +74,14 @@ function findOriginal(entries: readonly SessionEntry[], ts: string): OriginalMes
       ts?: unknown;
       text?: unknown;
       name?: unknown;
+      sourceRole?: unknown;
       hidden?: unknown;
-      securityTainted?: unknown;
     } | null;
     if (p?.ts !== ts) continue;
-    if (p.hidden === true || p.securityTainted === true) return null;
+    if (p.hidden === true) return null;
     found = {
       text: typeof p.text === "string" ? p.text : "",
+      ...(p.sourceRole === "agent" ? { sourceRole: "agent" as const } : {}),
       ...(typeof p.name === "string" && p.name.trim() ? { name: p.name.trim() } : {}),
     };
   }
@@ -91,13 +93,16 @@ function revisionToRecord(
   source: MessageRevisionSource,
 ): MessageRevisionPayload | null {
   const original = findOriginal(entries, source.ts);
-  if (!original) return null;
+  if (!original || (source.self && original.sourceRole !== "agent")) return null;
   let last: MessageRevisionPayload | null = null;
   for (const e of entries) {
     const r = messageRevision(e);
     if (r && r.ts === source.ts) last = r;
   }
-  const named = original.name ? { name: original.name } : {};
+  const named = {
+    ...(original.name ? { name: original.name } : {}),
+    ...(original.sourceRole ? { sourceRole: original.sourceRole } : {}),
+  };
   if (source.deleted) {
     if (last?.action === "deleted") return null;
     return { kind: "message_revision", action: "deleted", ts: source.ts, ...named };
@@ -109,7 +114,7 @@ function revisionToRecord(
 }
 
 async function recordRevision(
-  sessions: TranscriptAppendSessions,
+  sessions: Pick<SessionStore, "append">,
   lease: Lease,
   session: RevisionSession,
   entries: readonly SessionEntry[],
@@ -117,9 +122,7 @@ async function recordRevision(
 ): Promise<boolean> {
   const payload = revisionToRecord(entries, source);
   if (!payload) return false;
-  await appendEntryOutsideTurn(sessions, lease, { type: "system", payload, scopeLabel: session.scopeId }, () =>
-    renderMessageRevision(payload),
-  );
+  await sessions.append(lease, { type: "system", payload, scopeLabel: session.scopeId });
   return true;
 }
 
@@ -156,7 +159,9 @@ export async function recordMessageRevisions(
   retry: IdleRetry = DEFAULT_IDLE_RETRY,
 ): Promise<void> {
   for (const event of events.filter(isRevisionEvent)) {
-    const refs = await sessions.sessionsByThreadRefs(slackThreadRefCandidates(event.container, event.ts, event.sub));
+    const refs = await sessions.sessionsByThreadRefs(
+      slackThreadRefCandidates(event.container, event.ts, event.sub ?? undefined),
+    );
     for (const ref of refs) await recordWhenIdle(sessions, ref, event, retry);
   }
 }
@@ -182,7 +187,7 @@ export function slackTsToMs(ts: string | undefined): number | undefined {
 }
 
 export async function reconcileMessageRevisions(opts: {
-  sessions: TranscriptAppendSessions & Pick<SessionStore, "getEntries">;
+  sessions: Pick<SessionStore, "append" | "getEntries">;
   surfaceCache: Pick<SurfaceCache, "revisedSince">;
   lease: Lease;
   session: RevisionSession & { threadRef: string };

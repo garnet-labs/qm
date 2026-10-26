@@ -1,3 +1,4 @@
+import { isSessionTurn } from "../turn-origin.ts";
 import type {
   Conversation,
   DeliveryProvenance,
@@ -16,7 +17,7 @@ import {
   withDelete,
   type ReachResolution,
 } from "../../reach/reach.ts";
-import { hasParentPathSegment, type SandboxHandle } from "../../sandbox/sandbox.ts";
+import { type SandboxHandle } from "../../sandbox/sandbox.ts";
 import type {
   SurfaceToolDeps,
   SurfacePostResult,
@@ -27,15 +28,20 @@ import type {
   SurfaceSearchResult,
 } from "../../tools/primitives.ts";
 import { collectBlob, MAX_BLOB_BYTES, type BlobTransferStore } from "../../persistence/blob-transfer.ts";
-import { collectNamedOutbound, type ArtifactRegistration } from "../attachments.ts";
-import { parseBotLedger, type BotPolicy } from "../../surface-cache/channel-policy-store.ts";
+import {
+  collectNamedOutbound,
+  parseOutboundFiles,
+  type OutboundFile,
+  type OpenStoredFile,
+  type ArtifactRegistration,
+} from "../attachments.ts";
+import { parseBotLedger, type BotPolicy, type ChannelPolicy } from "../../surface-cache/channel-policy-store.ts";
 import { isoFromTs } from "../../util/message-tag.ts";
-import { errMessage } from "../../util/errors.ts";
+import { errMessage, swallowAs } from "../../util/errors.ts";
 import { adminSessionUrl } from "../../util/admin-links.ts";
 import { headLooksLikeText, replaceThreadSegment, type TurnPostKeys } from "./turn-helpers.ts";
 import type { OrchestratorDeps, OrchestratorInput } from "./types.ts";
 
-const SURFACE_READ_DEFAULT = 100;
 const SURFACE_READ_MAX = 200;
 const SURFACE_SEARCH_DEFAULT = 10;
 const SURFACE_SEARCH_MAX = 40;
@@ -44,7 +50,6 @@ const SURFACE_FILE_MAX_CHARS = 100_000;
 export interface SpineState {
   surfaceOutboundCount: number;
   crossConversationPosts: number;
-  staySilentReason: string | undefined;
   turnUserEntrySeq: number | undefined;
 }
 
@@ -59,7 +64,8 @@ export interface SurfaceToolsContext {
   defaultDestination: Destination | undefined;
   blobTransfer: BlobTransferStore;
   fileRegistration: ArtifactRegistration;
-  provision: () => Promise<SandboxHandle>;
+  openStored?: OpenStoredFile;
+  provision: (sandboxId?: string) => Promise<SandboxHandle>;
   postProvenance: (deliveryKey: string) => DeliveryProvenance;
   postKeys: TurnPostKeys;
   spine: SpineState;
@@ -94,6 +100,13 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
   if (strictReadOnly || !(input.surfaceTools && defaultDestination && deps.deliveries)) return undefined;
   const deliveries = deps.deliveries;
   const currentDestination = defaultDestination;
+  const rateLimitRecipient =
+    input.origin?.kind === "human" &&
+    !isSessionTurn(input) &&
+    currentDestination.type === "slack" &&
+    currentDestination.target
+      ? { rateLimitRecipient: { target: currentDestination.target, user: actor.id } }
+      : {};
   let editRefConsumed = false;
   const resolveDestination = async (
     target?: {
@@ -182,22 +195,29 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
     coverageChecked = true;
     const container = currentDestination.target ?? conversation.channelRef ?? conversation.threadRef;
     if (!deps.surfaceCache || !container) return coverageSince;
-    const st = await deps.surfaceCache.containerState(container).catch(() => null);
+    const cacheContainer = currentDestination.type === "slack" ? container.split(":")[0]! : container;
+    const st = await deps.surfaceCache
+      .containerState(cacheContainer)
+      .catch(swallowAs("surface cache: container coverage", null));
     coverageSince = st?.oldestTs ? isoFromTs(st.oldestTs) || undefined : undefined;
     return coverageSince;
   };
   const resolveFiles = async (
-    files?: readonly string[],
+    files?: readonly OutboundFile[],
+    sandboxId?: string,
   ): Promise<{ ok: true; attachments?: OutgoingAttachment[] } | { ok: false; message: string }> => {
     if (!files?.length) return { ok: true };
-    const invalid = files.filter(hasParentPathSegment);
-    if (invalid.length)
-      return {
-        ok: false,
-        message: `couldn't attach: ${invalid.map((p) => `${p} (not found)`).join(", ")} — nothing was sent; fix the path(s) and retry`,
-      };
-    const handle = await provision();
-    const r = await collectNamedOutbound(deps.sandbox, handle, files, blobTransfer, fileRegistration);
+    const parsed = parseOutboundFiles(files);
+    if (!parsed.ok) return parsed;
+    const r = await collectNamedOutbound(
+      deps.sandbox,
+      () => provision(sandboxId),
+      files,
+      blobTransfer,
+      fileRegistration,
+      [],
+      ctx.openStored,
+    );
     const bad = [
       ...r.missing.map((p) => `${p} (not found)`),
       ...r.empty.map((p) => `${p} (empty)`),
@@ -208,7 +228,7 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
     return { ok: true, attachments: r.attachments };
   };
   return {
-    post: async (postText, opts, files) => {
+    post: async (postText, opts, files, sandboxId) => {
       const seq = postKeys.take();
       let destination = currentDestination;
       if (opts?.ts && destination.type !== "principal") {
@@ -216,24 +236,22 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
       } else if (opts?.broadcast && destination.type !== "principal" && conversation.channelRef) {
         destination = { ...destination, target: conversation.channelRef };
       }
-      const f = await resolveFiles(files);
+      const f = await resolveFiles(files, sandboxId);
       if (!f.ok) return { ok: false, message: f.message };
       const footer = buildDebugFooter();
       const run = input.runId ? await deps.runs?.get(input.runId) : null;
-      const taskList = input.runId ? await deps.tasks?.list({ originRunId: input.runId }) : undefined;
       const editRef =
         !editRefConsumed && destination.target === currentDestination.target ? run?.deliveryState?.editRef : undefined;
       if (editRef) editRefConsumed = true;
       const projectedDestination = {
         ...destination,
         ...(editRef ? { editRef } : {}),
-        ...(taskList?.length ? { taskList: taskList.map(({ id, title, status }) => ({ id, title, status })) } : {}),
         ...(footer ? { debugFooter: footer } : {}),
       };
       const sent = await enqueue(projectedDestination, postText, seq, f.attachments);
       return sent.ok && f.attachments?.length ? { ...sent, attachments: postedFileMetas(f.attachments) } : sent;
     },
-    reach: async (postText, target, files) => {
+    reach: async (postText, target, files, sandboxId) => {
       const seq = postKeys.take();
       if (spine.crossConversationPosts >= 5) return { ok: false, message: "outbound limit reached for this turn" };
       const selectors = [
@@ -243,7 +261,7 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
       ].filter(Boolean).length;
       if (selectors !== 1)
         return { ok: false, message: "reach needs exactly one of: channel, recipient, or participants." };
-      const f = await resolveFiles(files);
+      const f = await resolveFiles(files, sandboxId);
       if (!f.ok) return { ok: false, message: f.message };
       const sending = postText.trim().length > 0 || (f.attachments?.length ?? 0) > 0;
       const d = await resolveDestination(target, { mayOpenGroup: sending });
@@ -289,15 +307,15 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
     readThread: async (opts?: { limit?: number }) => {
       if (!deps.surfaceContext) return { ok: false, message: "the surface can't be read from this turn" };
       if (!currentDestination.target) return { ok: false, message: "this conversation has no thread to read" };
-      const count = Math.max(1, Math.min(SURFACE_READ_MAX, opts?.limit ?? SURFACE_READ_DEFAULT));
       const result = await deps.surfaceContext.pull(input.surface ?? "unknown", {
         conversationTarget: currentDestination.target,
         viewer: actor.id,
-        count,
+        ...rateLimitRecipient,
+        ...(opts?.limit !== undefined ? { count: Math.max(1, Math.min(SURFACE_READ_MAX, opts.limit)) } : {}),
       });
       if (!result) return { ok: false, message: "the surface didn't answer in time" };
       if (result.note && !result.messages?.length) return { ok: false, message: result.note };
-      return { ok: true, messages: result.messages };
+      return { ok: true, messages: result.messages, ...(result.note ? { message: result.note } : {}) };
     },
     whatsNew: async (opts?: { since?: string }) => {
       if (!deps.surfaceContext) return { ok: false, message: "the surface can't be read from this turn" };
@@ -306,14 +324,16 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
       const result = await deps.surfaceContext.pull(input.surface ?? "unknown", {
         conversationTarget: dest.target,
         viewer: actor.id,
+        ...rateLimitRecipient,
         count: SURFACE_READ_MAX,
       });
       if (!result) return { ok: false, message: "the surface didn't answer in time" };
       if (result.note && !result.messages?.length) return { ok: false, message: result.note };
-      const msgs = (result.messages ?? []) as Array<{ ts?: string; threadTs?: string; author?: string }>;
+      const msgs = (result.messages ?? []) as Array<{ ts?: string; threadTs?: string }>;
       const since = opts?.since;
+      const self = new Set(result.selfTs);
       const newer = msgs.filter(
-        (m) => typeof m?.ts === "string" && (since === undefined || m.ts > since) && m.author !== "you",
+        (m) => typeof m?.ts === "string" && (since === undefined || m.ts > since) && !self.has(m.ts),
       );
       const isDm = conversation.kind === "dm";
       const hereRoot = dest.target.slice(dest.target.lastIndexOf(":") + 1);
@@ -332,6 +352,7 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
         ok: true,
         hereNew,
         activeSubConversations: otherRoots.size,
+        ...(result.note ? { message: result.note } : {}),
         ...(latest ? { latest } : {}),
         ...(coverage ? { coverageSince: coverage } : {}),
       };
@@ -341,7 +362,7 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
       const coverage = await coverageForTurn();
       const withCoverage = (r: SurfaceSearchResult): SurfaceSearchResult =>
         coverage ? { ...r, coverageSince: coverage } : r;
-      if (!q) return withCoverage({ ok: true, hits: [], source: deps.surfaceSearch ? "cache" : "live" });
+      if (!q) return withCoverage({ ok: true, hits: [], source: "cache" });
       const limit = Math.max(1, Math.min(SURFACE_SEARCH_MAX, opts?.limit ?? SURFACE_SEARCH_DEFAULT));
       const dest = currentDestination;
       const shapeHits = (messages: unknown[], prefiltered = false) =>
@@ -361,17 +382,19 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
         const result = await deps.surfaceContext.searchLive(input.surface ?? "unknown", {
           conversationTarget: dest.target,
           viewer: actor.id,
+          ...rateLimitRecipient,
           count: SURFACE_READ_MAX,
           searchAll: q,
         });
         if (!result) return { ok: false, message: "the surface didn't answer in time" };
-        if (result.note === "live-search-unconfigured") return { ok: false, message: "[live search isn't configured]" };
-        if (result.note === "live-search-unconnected")
+        if (result.liveSearch === "unconfigured") return { ok: false, message: "[live search isn't configured]" };
+        if (result.liveSearch === "unconnected")
           return {
             ok: false,
             message:
-              "[live search runs as the asking person's own Slack login, and this turn has no connected one — " +
-              "if a person asked, point them at " +
+              "[live search runs as the asking person's own Slack login, and this turn has no connected one. " +
+              "Reading this conversation's history needs no personal login, so read it before concluding anything is missing; " +
+              "only if the message is elsewhere, and a person asked, point them at " +
               (deps.publicWebUrl
                 ? `${deps.publicWebUrl.replace(/\/$/, "")}/connect/slack/self-connect`
                 : "the web UI's Connectors page") +
@@ -380,9 +403,32 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
               "on an autonomous turn just say what you couldn't search]",
           };
         if (result.note && !result.messages?.length) return { ok: false, message: result.note };
-        return withCoverage({ ok: true, hits: shapeHits(result.messages ?? [], true), source: "slack" });
+        return withCoverage({
+          ok: true,
+          hits: shapeHits(result.messages ?? [], true),
+          source: "slack",
+          ...(result.note ? { message: result.note } : {}),
+        });
       }
       const container = dest.target ?? conversation.channelRef ?? conversation.threadRef;
+      if (deps.surfaceCache && dest.type === "slack" && container) {
+        const channel = container.split(":")[0]!;
+        const hits = await deps.surfaceCache.search(q, { container: channel, limit });
+        return withCoverage({
+          ok: true,
+          hits: hits.map((hit) => ({
+            ref: hit.ts,
+            ...(hit.authorName ? { author: hit.authorName } : {}),
+            when: isoFromTs(hit.ts),
+            snippet: hit.text.slice(0, 200),
+          })),
+          source: "cache",
+          message: "Search covers stored Slack events only; older or missed messages may be absent.",
+        });
+      }
+      if (opts?.source === "mirror" && !deps.surfaceSearch) {
+        return { ok: false, message: "Stored Slack message search is unavailable; no live search was performed." };
+      }
       if (deps.surfaceSearch) {
         const hits = await deps.surfaceSearch.search({
           surface: input.surface ?? "unknown",
@@ -397,12 +443,18 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
       const result = await deps.surfaceContext.pull(input.surface ?? "unknown", {
         conversationTarget: dest.target,
         viewer: actor.id,
+        ...rateLimitRecipient,
         count: SURFACE_READ_MAX,
         match: q,
       });
       if (!result) return { ok: false, message: "the surface didn't answer in time" };
       if (result.note && !result.messages?.length) return { ok: false, message: result.note };
-      return withCoverage({ ok: true, hits: shapeHits(result.messages ?? []), source: "live" });
+      return withCoverage({
+        ok: true,
+        hits: shapeHits(result.messages ?? []),
+        source: "live",
+        ...(result.note ? { message: result.note } : {}),
+      });
     },
     readMembers: async () => {
       const roster = (conversation.publishMembers ?? conversation.audience).filter((p) => p.type === "internal");
@@ -450,7 +502,12 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
         ...(p?.ambientEnabled !== undefined ? { ambientEnabled: p.ambientEnabled } : {}),
       };
     },
-    setStandingOrder: async (orders: string, bots?: Record<string, BotPolicy>, ambientEnabled?: boolean | null) => {
+    setStandingOrder: async (
+      orders: string | undefined,
+      bots?: Record<string, BotPolicy>,
+      ambientEnabled?: boolean | null,
+      expectedOrders?: string,
+    ) => {
       if (!deps.channelPolicy) return { ok: false, message: "standing orders aren't available on this turn" };
       if (conversation.kind === "dm" || !conversation.channelRef)
         return { ok: false, message: "standing orders are per-channel — you can only set one from inside a channel." };
@@ -460,12 +517,18 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
         if ("error" in parsed) return { ok: false, message: parsed.error };
         parsedBots = parsed.bots;
       }
-      const p = await deps.channelPolicy.set(conversation.channelRef, orders, {
-        setBy: actor.id,
-        bots: parsedBots,
-        sessionId: session.id,
-        ambientEnabled,
-      });
+      let p: ChannelPolicy;
+      try {
+        p = await deps.channelPolicy.set(conversation.channelRef, orders, {
+          setBy: actor.id,
+          bots: parsedBots,
+          sessionId: session.id,
+          ambientEnabled,
+          expectedOrders,
+        });
+      } catch (error) {
+        return { ok: false, message: errMessage(error) };
+      }
       deps.auditLog.record({
         at: Date.now(),
         principalId: actor.id,
@@ -475,14 +538,10 @@ export function createSurfaceToolDeps(ctx: SurfaceToolsContext): SurfaceToolDeps
       });
       return {
         ok: true,
-        orders,
+        orders: p.orders,
         ...(p.bots && Object.keys(p.bots).length ? { bots: p.bots } : {}),
         ...(p.ambientEnabled !== undefined ? { ambientEnabled: p.ambientEnabled } : {}),
       };
-    },
-    staySilent: async (reason: string) => {
-      spine.staySilentReason = reason;
-      return { ok: true, message: "[staying silent]" };
     },
   };
 }

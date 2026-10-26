@@ -1,4 +1,4 @@
-import type { RecipientConsent, Webhook } from "../types.ts";
+import type { Webhook } from "../types.ts";
 import { createMemoryMap, type DurableMap } from "../persistence/durable-map.ts";
 import {
   assertNoEscalation,
@@ -6,7 +6,6 @@ import {
   contentPart,
   createDeduped,
   setTriggerEnabled,
-  setTriggerRecipientConsent,
   type CreateTriggerInput,
 } from "../triggers/trigger-store.ts";
 import { hashId } from "../util/crypto.ts";
@@ -18,17 +17,54 @@ export interface CreateWebhookInput extends CreateTriggerInput {
   filters?: Webhook["filters"];
 }
 
+export interface WebhookEvent {
+  deliveryId: string;
+  receivedAt: number;
+  payload: string;
+}
+
+export interface WebhookHistory {
+  events: WebhookEvent[];
+}
+
 export interface WebhookStore {
+  recordEvent(id: string, event: WebhookEvent): Promise<void>;
+  listEvents(id: string): Promise<WebhookEvent[]>;
   create(input: CreateWebhookInput): Promise<Webhook>;
   get(id: string): Promise<Webhook | null>;
   list(): Promise<Webhook[]>;
   setEnabled(id: string, enabled: boolean): Promise<void>;
-  setRecipientConsent(id: string, recipientConsent: RecipientConsent): Promise<void>;
+  update(id: string, patch: { action: string }): Promise<Webhook | null>;
   recordFire(id: string, info: { at: number; deliveryId?: string; error?: string }): Promise<void>;
 }
 
-export function createWebhookStore(backing: DurableMap<Webhook> = createMemoryMap<Webhook>()): WebhookStore {
+export function createWebhookStore(
+  backing: DurableMap<Webhook> = createMemoryMap<Webhook>(),
+  history: DurableMap<WebhookHistory> = createMemoryMap<WebhookHistory>(),
+): WebhookStore {
+  if (!history.update) throw new Error("webhook history requires atomic updates");
+  const updateHistory = history.update.bind(history);
   return {
+    async recordEvent(id, event) {
+      await history.putIfAbsent(id, { events: [] });
+      await updateHistory(id, (value) => {
+        if (value.events.some((e) => e.deliveryId === event.deliveryId)) return value;
+        return {
+          events: [
+            ...value.events,
+            {
+              ...event,
+              payload: event.payload.slice(0, 16_100),
+            },
+          ]
+            .sort((a, b) => b.receivedAt - a.receivedAt || a.deliveryId.localeCompare(b.deliveryId))
+            .slice(0, 50),
+        };
+      });
+    },
+    async listEvents(id) {
+      return structuredClone((await history.get(id))?.events ?? []);
+    },
     async create(input) {
       assertNoEscalation(input);
       if (!getVerifier(input.verification.scheme) || !input.verification.secret) {
@@ -65,8 +101,8 @@ export function createWebhookStore(backing: DurableMap<Webhook> = createMemoryMa
     setEnabled(id, enabled) {
       return setTriggerEnabled(backing, id, enabled);
     },
-    setRecipientConsent(id, recipientConsent) {
-      return setTriggerRecipientConsent(backing, id, recipientConsent);
+    update(id, patch) {
+      return backing.merge(id, { action: patch.action });
     },
     async recordFire(id, info) {
       await backing.merge(id, {

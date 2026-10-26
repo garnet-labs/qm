@@ -91,3 +91,40 @@ test("parseAmbientDecision reads asked_by (only on an engage)", () => {
   assert.deepEqual(parseAmbientDecision('{"act": true, "asked_by": "   "}'), { act: true });
   assert.deepEqual(parseAmbientDecision('{"act": true, "asked_by": "[2.0]"}'), { act: true, askedBy: "2.0" });
 });
+
+test("ambient rendering resolves cached mention names without changing stored messages", () => {
+  const message = {
+    container: "C1",
+    ts: "2.0",
+    authorName: "Alice",
+    text: "<@U2> ask <@U3|old label> and <@U9> about @already-named",
+    mentions: { U2: "Bob", U3: "Carol" },
+    createdAt: 2,
+  };
+  const batch = base({
+    messages: [message, { ...message, ts: "3.0", mentions: undefined }],
+    backdrop: [{ ...message, ts: "1.0", handled: true }],
+  });
+  const original = structuredClone(batch);
+  const prompt = renderAmbientPrompt(batch);
+  assert.ok(
+    prompt.includes(
+      "Alice: @Bob ask @Carol and <@U9> about @already-named [handled by the direct responder — do not re-engage]",
+    ),
+  );
+  assert.ok(prompt.includes("[2.0] Alice: @Bob ask @Carol and <@U9> about @already-named"));
+  assert.ok(prompt.includes(`[3.0] Alice: ${message.text}`));
+  assert.ok(prompt.includes("mentioned as <@U00000002>"));
+  assert.deepEqual(batch, original);
+});
+
+test("parseAmbientDecision reads the outermost object and stays linear-time on a brace flood", () => {
+  assert.deepEqual(parseAmbientDecision('Sure. {"act": true, "reason": "asked for a digest"} done'), {
+    act: true,
+    reason: "asked for a digest",
+  });
+  const started = performance.now();
+  assert.deepEqual(parseAmbientDecision("{".repeat(60_000)), { act: false });
+  const elapsed = performance.now() - started;
+  assert.ok(elapsed < 1_000, `brace flood took ${Math.round(elapsed)}ms`);
+});

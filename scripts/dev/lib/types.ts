@@ -68,6 +68,7 @@ export interface BootPhaseEvent {
 
 export interface BootResult {
   ok: boolean;
+  webEnabled?: boolean;
   slackEnabled?: boolean;
   reason?: string;
   slot: string;
@@ -95,12 +96,16 @@ export interface StatusReport {
   sandbox: { backend: string; detail: string };
   durability: { sessionStore: string; runStore: string; databaseUrl: boolean };
   harness: string;
+  webEnabled?: boolean;
   slackEnabled: boolean;
   watch: boolean;
-  turnsLive: boolean;
   publicApiUrl: string | null;
   children: Record<string, ChildStatus & { slack?: SlackHealth }>;
 }
+
+export type DevSandboxBackend =
+  "local" | "sprites" | "smolmachines" | "e2b" | "porter" | "agent37" | "superserve" | "do-managed-agents";
+export type DevSandboxChoice = DevSandboxBackend | "auto";
 
 export interface BootSpec {
   slot: string;
@@ -108,10 +113,11 @@ export interface BootSpec {
   branch: string;
   callerEnv: Record<string, string>;
   watch: boolean;
-  sandbox: "local" | "sprites" | "smolmachines" | "e2b" | "porter" | "agent37" | "auto";
+  sandbox: DevSandboxChoice;
   canaryChannel?: string;
   strict: boolean;
   slack?: boolean;
+  web?: boolean;
 }
 
 export interface LeaseInfo {
@@ -120,4 +126,11 @@ export interface LeaseInfo {
   meta: Record<string, string>;
   heartbeat: { pid: number; at: number; phase: string } | null;
   state: Record<string, unknown> | null;
+}
+
+export interface CanaryReply {
+  ok: boolean;
+  code?: "unconfigured";
+  rttMs?: number;
+  reason?: string;
 }

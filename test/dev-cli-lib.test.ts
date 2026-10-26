@@ -1,13 +1,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
+import { spawnSync } from "node:child_process";
+import { ensureDeps } from "../scripts/dev/lib/deps.ts";
+import { run, spawnCommand } from "../scripts/dev/lib/proc.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { envSha, errMessage, formatAge, readEnvFile } from "../scripts/dev/lib/util.ts";
+import { envSha, errMessage, formatAge } from "../scripts/dev/lib/util.ts";
 import {
   clearSlotFlag,
   ensureStore,
   listSlots,
+  portSlotCount,
   readSlotFlag,
   slotFlagged,
   slotPorts,
@@ -16,6 +21,8 @@ import {
   writeSlotFlag,
 } from "../scripts/dev/lib/pool.ts";
 import {
+  claimPortSlot,
+  claimSlotPorts,
   claimSlotLock,
   heartbeatFresh,
   leaseOrgId,
@@ -30,7 +37,7 @@ import {
 } from "../scripts/dev/lib/lease.ts";
 import { assembleEnv, completeDevSecuritySecrets } from "../scripts/dev/lib/envctx.ts";
 import { buildChildSpecs, type SpecInputs } from "../scripts/dev/supervisor/specs.ts";
-import { loadConfig, OPENCODE_RUNTIME_VERSION, providerKeysPresent } from "../src/config.ts";
+import { loadConfig, providerKeysPresent } from "../src/config.ts";
 import type { LeaseInfo } from "../scripts/dev/lib/types.ts";
 
 function tmpStore(): string {
@@ -64,6 +71,107 @@ test("slotPorts derive the full port block from the slot number", () => {
     slackHealth: 8163,
     supervisor: 8179,
   });
+});
+
+test("port blocks preserve legacy slots and stay disjoint through the port ceiling", () => {
+  for (const base of [0, 8080, 20000, 65423, 65424, 65535]) {
+    const used = new Set<number>();
+    const count = portSlotCount(base);
+    for (let num = 1; num <= count; num++) {
+      const ports = Object.values(slotPorts(`pool${num}`, base));
+      for (const [index, port] of ports.entries()) {
+        assert.ok(port > base && port <= 65535);
+        assert.ok(!used.has(port), `port ${port} overlaps at slot ${num}`);
+        used.add(port);
+        if (num <= 16) assert.equal(port, base + num + index * 16);
+      }
+    }
+    assert.throws(() => slotPorts(`pool${count + 1}`, base), /No valid port block/);
+  }
+  assert.equal(portSlotCount(8080), 8207);
+  assert.equal(slotPorts("pool17", 8080).core, 8193);
+});
+
+test("port allocation rejects malformed slots and invalid base ports", () => {
+  for (const slot of ["pool0", "pool-1", "pool1.5", "pool01", "17", "poolNaN", "pool9999999999999999999"]) {
+    assert.throws(() => slotPorts(slot, 8080), /No valid port block/);
+  }
+  for (const base of [-1, 65536, 8080.5, NaN, Infinity]) {
+    assert.throws(() => portSlotCount(base), /DEV_INSTANCE_BASE_PORT/);
+    assert.throws(() => slotPorts("pool1", base), /DEV_INSTANCE_BASE_PORT/);
+  }
+});
+
+test("web leases grow beyond sixteen, preserve Slack capacity, and reuse released slots", async () => {
+  const store = tmpStore();
+  try {
+    addSlot(store, 1);
+    const excluded = new Set(["pool2"]);
+    const claimed: string[] = [];
+    for (let num = 3; num <= 40; num++) {
+      const slot = await claimPortSlot(excluded, store);
+      assert.ok(slot);
+      assert.ok(Number(slot.slice(4)) >= num);
+      claimed.push(slot);
+    }
+    assert.equal(new Set(claimed).size, 38);
+    assert.equal(claimSlotLock("pool1", store), true);
+    const released = claimed[16]!;
+    releaseSlotLock(released, store);
+    assert.equal(await claimPortSlot(excluded, store), released);
+    const exhausted = new Set(Array.from({ length: portSlotCount() }, (_, i) => `pool${i + 1}`));
+    assert.equal(await claimPortSlot(exhausted, store), null);
+    exhausted.delete(released);
+    releaseSlotLock(released, store);
+    addSlot(store, Number(released.slice(4)));
+    assert.equal(await claimPortSlot(exhausted, store), released);
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
+test("occupied port blocks are skipped without killing listeners or retaining leases", async () => {
+  const store = tmpStore();
+  const server = createServer();
+  const previousBase = process.env.DEV_INSTANCE_BASE_PORT;
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as { port: number }).port;
+  process.env.DEV_INSTANCE_BASE_PORT = String(port - 97);
+  try {
+    assert.equal(await claimSlotPorts("pool1", store), false);
+    assert.equal(existsSync(lockDir("pool1", store)), false);
+    const claimed = await claimPortSlot(new Set(), store);
+    assert.notEqual(claimed, "pool1");
+    assert.equal(server.listening, true);
+    await assert.rejects(claimSlotPorts("pool999999", store), /No valid port block/);
+    assert.equal(existsSync(lockDir("pool999999", store)), false);
+  } finally {
+    if (previousBase === undefined) delete process.env.DEV_INSTANCE_BASE_PORT;
+    else process.env.DEV_INSTANCE_BASE_PORT = previousBase;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(store, { recursive: true, force: true });
+  }
+});
+
+test("status and doctor report invalid configured slots and continue", () => {
+  const store = tmpStore();
+  try {
+    addSlot(store, 1);
+    addSlot(store, 999999);
+    const env = { ...process.env, QM_POOL_STORE: store, DEV_INSTANCE_BASE_PORT: "8080" };
+    const status = spawnSync(process.execPath, ["scripts/dev/cli.ts", "status", "--json"], { encoding: "utf8", env });
+    assert.equal(status.status, 0, status.stderr);
+    const rows = JSON.parse(status.stdout);
+    assert.equal(rows.find((row: { slot: string }) => row.slot === "pool1").state, "free");
+    assert.equal(rows.find((row: { slot: string }) => row.slot === "pool999999").state, "invalid");
+    const doctor = spawnSync(process.execPath, ["scripts/dev/cli.ts", "doctor", "--json"], { encoding: "utf8", env });
+    assert.equal(doctor.status, 0, doctor.stderr);
+    const report = JSON.parse(doctor.stdout);
+    assert.ok(report.checks.some((check: { id: string }) => check.id === "slot-config:pool999999"));
+    assert.ok(report.checks.some((check: { id: string }) => check.id === "docker-daemon"));
+  } finally {
+    rmSync(store, { recursive: true, force: true });
+  }
 });
 
 test("pool listing, token parsing, and validity", () => {
@@ -198,7 +306,6 @@ test("env assembly precedence: caller > login shell > dev.env > worktree .env; h
   const fromCaller = await assembleEnv({
     worktree,
     callerEnv: { ANTHROPIC_API_KEY: "from-caller", BOTH: "caller" },
-    allowMock: false,
     log,
     probeLoginShell: async () => "",
   });
@@ -209,66 +316,53 @@ test("env assembly precedence: caller > login shell > dev.env > worktree .env; h
   assert.equal(fromCaller.env.PI_CAPTURE_REQUESTS, "1");
   assert.equal(fromCaller.anthropicKeySource, "your shell export");
 
-  const openCode = await assembleEnv({
-    worktree,
-    callerEnv: { ANTHROPIC_API_KEY: "from-caller", HARNESS: "opencode" },
-    allowMock: false,
-    log,
-    probeLoginShell: async () => "",
-  });
-  assert.equal(openCode.harness, "opencode");
-  assert.equal(openCode.env.HARNESS, "opencode");
-  assert.equal(openCode.env.PI_CAPTURE_REQUESTS, undefined);
-
-  await assert.rejects(
-    assembleEnv({
+  for (const legacy of ["opencode", "codex"]) {
+    const legacyHarness = await assembleEnv({
       worktree,
-      callerEnv: { HARNESS: "codex", CODEX_HOME: join(worktree, "empty-codex") },
-      allowMock: false,
+      callerEnv: { ANTHROPIC_API_KEY: "from-caller", HARNESS: legacy },
       log,
       probeLoginShell: async () => "",
-    }),
-    /HARNESS=codex needs OPENAI_API_KEY/,
-  );
+    });
+    assert.equal(legacyHarness.harness, "pi");
+    assert.equal(legacyHarness.env.HARNESS, "pi");
+  }
+  const defaultCodexHome = join(worktree, "default-codex");
+  mkdirSync(defaultCodexHome, { recursive: true });
+  const oauthAuth = JSON.stringify({
+    auth_mode: "chatgpt",
+    tokens: {
+      access_token: "access",
+      refresh_token: "refresh",
+      account_id: "account",
+      id_token: oauthIdToken("account"),
+    },
+  });
+  writeFileSync(join(defaultCodexHome, "auth.json"), oauthAuth);
+  chmodSync(join(defaultCodexHome, "auth.json"), 0o600);
+  const implicit = await assembleEnv({
+    worktree,
+    callerEnv: { ANTHROPIC_API_KEY: "from-caller", CODEX_HOME: defaultCodexHome },
+    log,
+    probeLoginShell: async () => "",
+  });
+  assert.equal(implicit.codexAuthSource, "");
+  assert.equal(implicit.env.CODEX_AUTH_FILE, undefined);
   const oauthAuthFile = join(worktree, "codex-auth.json");
-  writeFileSync(
-    oauthAuthFile,
-    JSON.stringify({
-      auth_mode: "chatgpt",
-      tokens: {
-        access_token: "access",
-        refresh_token: "refresh",
-        account_id: "account",
-        id_token: oauthIdToken("account"),
-      },
-    }),
-  );
+  writeFileSync(oauthAuthFile, oauthAuth);
   chmodSync(oauthAuthFile, 0o600);
-  const codexOAuth = await assembleEnv({
+  const companyChatGPT = await assembleEnv({
     worktree,
-    callerEnv: { HARNESS: "codex", CODEX_AUTH_FILE: oauthAuthFile },
-    allowMock: false,
+    callerEnv: { ANTHROPIC_API_KEY: "from-caller", CODEX_AUTH_FILE: oauthAuthFile },
     log,
     probeLoginShell: async () => "",
   });
-  assert.equal(codexOAuth.harness, "codex");
-  assert.equal(codexOAuth.env.CODEX_AUTH_FILE, oauthAuthFile);
-  assert.equal(codexOAuth.codexAuthSource, oauthAuthFile);
-  const codex = await assembleEnv({
-    worktree,
-    callerEnv: { HARNESS: "codex", OPENAI_API_KEY: "sk-openai" },
-    allowMock: false,
-    log,
-    probeLoginShell: async () => "",
-  });
-  assert.equal(codex.harness, "codex");
-  assert.equal(codex.env.HARNESS, "codex");
-  assert.equal(codex.openaiKeySource, "your shell export");
+  assert.equal(companyChatGPT.harness, "pi");
+  assert.equal(companyChatGPT.env.CODEX_AUTH_FILE, oauthAuthFile);
+  assert.equal(companyChatGPT.codexAuthSource, oauthAuthFile);
 
   const claude = await assembleEnv({
     worktree,
     callerEnv: { HARNESS: "claude" },
-    allowMock: false,
     log,
     probeLoginShell: async () => "",
   });
@@ -278,7 +372,6 @@ test("env assembly precedence: caller > login shell > dev.env > worktree .env; h
   const fromLiveEnv = await assembleEnv({
     worktree,
     callerEnv: {},
-    allowMock: false,
     log,
     probeLoginShell: async () => "",
   });
@@ -294,7 +387,6 @@ test("env assembly precedence: caller > login shell > dev.env > worktree .env; h
   const fromShell = await assembleEnv({
     worktree,
     callerEnv: {},
-    allowMock: false,
     log,
     probeLoginShell: async () => "from-shell",
   });
@@ -305,7 +397,6 @@ test("env assembly precedence: caller > login shell > dev.env > worktree .env; h
   const fromDotenv = await assembleEnv({
     worktree,
     callerEnv: {},
-    allowMock: false,
     log,
     probeLoginShell: async () => "",
   });
@@ -314,11 +405,17 @@ test("env assembly precedence: caller > login shell > dev.env > worktree .env; h
 
   writeFileSync(join(worktree, ".env"), "");
   await assert.rejects(
-    assembleEnv({ worktree, callerEnv: {}, allowMock: false, log, probeLoginShell: async () => "" }),
-    /ANTHROPIC_API_KEY is required/,
+    assembleEnv({ worktree, callerEnv: {}, log, probeLoginShell: async () => "" }),
+    /ANTHROPIC_API_KEY, OPENAI_API_KEY, or a ChatGPT login/,
   );
-  const mock = await assembleEnv({ worktree, callerEnv: {}, allowMock: true, log, probeLoginShell: async () => "" });
-  assert.equal(mock.harness, "mock");
+  const openaiOnly = await assembleEnv({
+    worktree,
+    callerEnv: { OPENAI_API_KEY: "sk-openai" },
+    log,
+    probeLoginShell: async () => "",
+  });
+  assert.equal(openaiOnly.harness, "pi");
+  assert.equal(openaiOnly.env.MODEL_PROVIDER, "openai");
   if (prevLive === undefined) delete process.env.QM_DEV_ENV;
   else process.env.QM_DEV_ENV = prevLive;
   rmSync(worktree, { recursive: true, force: true });
@@ -337,16 +434,7 @@ test("dev security secrets are stable, complete, and distinct", () => {
   );
 });
 
-test("OpenCode config is strict, pinned, and inherits the Pi model", () => {
-  assert.equal(OPENCODE_RUNTIME_VERSION, "1.17.18");
-  assert.equal(loadConfig({ HARNESS: "opencode", PI_MODEL: "pi-model" }).opencodeModel, "pi-model");
-  assert.equal(
-    loadConfig({ HARNESS: "opencode", PI_MODEL: "pi-model", OPENCODE_MODEL: "open-model" }).opencodeModel,
-    "open-model",
-  );
-  const codexEnv = { HARNESS: "codex", OPENAI_API_KEY: "sk-openai" };
-  assert.equal(loadConfig({ ...codexEnv, CODEX_MODEL: "gpt-5.4", CODEX_BIN: "/bin/codex" }).codexModel, "gpt-5.4");
-  assert.equal(loadConfig({ ...codexEnv, CODEX_BIN: "/bin/codex" }).codexBinPath, "/bin/codex");
+test("harness config is strict and a ChatGPT auth file feeds the company subscription", () => {
   assert.equal(
     loadConfig({ HARNESS: "claude", CLAUDE_MODEL: "claude-opus-4-8", CLAUDE_BIN: "/bin/claude" }).claudeModel,
     "claude-opus-4-8",
@@ -367,31 +455,23 @@ test("OpenCode config is strict, pinned, and inherits the Pi model", () => {
     }),
   );
   chmodSync(authFile, 0o600);
-  const oauthConfig = loadConfig({ HARNESS: "codex", CODEX_AUTH_FILE: authFile });
+  const oauthConfig = loadConfig({ HARNESS: "pi", CODEX_AUTH_FILE: authFile });
   assert.equal(oauthConfig.codexAuthFile, authFile);
   assert.equal(providerKeysPresent(oauthConfig).openai, false);
   assert.equal(providerKeysPresent(oauthConfig).codexOAuth, true);
   assert.throws(
-    () =>
-      loadConfig({ HARNESS: "codex", CODEX_AUTH_FILE: join(source, "missing.json"), OPENAI_API_KEY: "placeholder" }),
-    /OPENAI_API_KEY/,
+    () => loadConfig({ HARNESS: "pi", CODEX_AUTH_FILE: join(source, "missing.json") }),
+    /CODEX_AUTH_FILE is unusable/,
   );
   rmSync(source, { recursive: true, force: true });
-  assert.throws(() => loadConfig({ HARNESS: "bogus" }), /use mock, pi, opencode, codex, or claude/);
-  assert.throws(() => loadConfig({ HARNESS: "PI" }), /use mock, pi, opencode, codex, or claude/);
+  assert.throws(() => loadConfig({ HARNESS: "bogus" }), /use pi or claude/);
+  assert.throws(() => loadConfig({ HARNESS: "PI" }), /use pi or claude/);
+  assert.throws(() => loadConfig({ HARNESS: "opencode" }), /use pi or claude/);
 });
 
 test("envSha is order-independent and value-sensitive", () => {
   assert.equal(envSha({ A: "1", B: "2" }), envSha({ B: "2", A: "1" }));
   assert.notEqual(envSha({ A: "1" }), envSha({ A: "2" }));
-});
-
-test("readEnvFile keeps everything after the first '=' verbatim and skips bad keys", () => {
-  const dir = mkdtempSync(join(tmpdir(), "qm-env-"));
-  writeFileSync(join(dir, "x.env"), "GOOD=a=b=c\nHASH=abc#def\n1BAD=x\n# comment\nEMPTY=\n");
-  const env = readEnvFile(join(dir, "x.env"));
-  assert.deepEqual(env, { GOOD: "a=b=c", HASH: "abc#def", EMPTY: "" });
-  rmSync(dir, { recursive: true, force: true });
 });
 
 test("leaseOrgId reads the stale lease's booted org", () => {
@@ -438,15 +518,18 @@ test("supervised children share the selected dev org", () => {
     assert.equal(spec.env.CODEX_HOME, undefined);
   }
   for (const spec of specs) assert.equal(spec.env.CORE_ORG_ID, "beta");
+  assert.equal(specs.find((spec) => spec.name === "portal")!.env.PORTAL_LOCAL_AUTH_BYPASS, "1");
+  inputs.baseEnv.PORTAL_LOCAL_AUTH_BYPASS = "0";
+  assert.equal(buildChildSpecs(inputs).find((spec) => spec.name === "portal")!.env.PORTAL_LOCAL_AUTH_BYPASS, "0");
   inputs.baseEnv = {};
   assert.equal(buildChildSpecs(inputs).find((spec) => spec.name === "core")!.env.ORG_ID, "acme");
 });
 
-test("child specs omit Slack env when no Slack tokens are supplied", () => {
+test("child specs disable environment Slack tokens when no Slack tokens are supplied", () => {
   const inputs: SpecInputs = {
     worktree: "/tmp/worktree",
     ports: slotPorts("pool1"),
-    baseEnv: {},
+    baseEnv: { SLACK_BOT_TOKEN: "inherited-bot", SLACK_APP_TOKEN: "inherited-app" },
     watch: false,
     webUiBasePath: "/",
     sessionStore: "memory",
@@ -459,11 +542,27 @@ test("child specs omit Slack env when no Slack tokens are supplied", () => {
     sandboxEnv: {},
   };
   const core = buildChildSpecs(inputs).find((spec) => spec.name === "core")!;
-  assert.equal(core.env.SLACK_BOT_TOKEN, undefined);
-  assert.equal(core.env.SLACK_APP_TOKEN, undefined);
+  assert.equal(core.env.DEV_INSTANCE_NO_SLACK, "1");
+  assert.equal(core.env.SLACK_BOT_TOKEN, "");
+  assert.equal(core.env.SLACK_APP_TOKEN, "");
   assert.equal(core.env.DEV_INTROSPECTION, undefined);
   assert.equal(core.env.DEV_HEALTH_PORT, undefined);
   assert.equal(core.env.CORE_ORG_ID, "acme");
+  inputs.web = false;
+  inputs.slack = { botToken: "xoxb-test", appToken: "xapp-test" };
+  const slackOnly = buildChildSpecs(inputs);
+  assert.deepEqual(
+    slackOnly.map((spec) => spec.name),
+    ["core"],
+  );
+  assert.equal(slackOnly[0]!.env.SLACK_BOT_TOKEN, "xoxb-test");
+  assert.equal(slackOnly[0]!.env.DEV_INSTANCE_NO_SLACK, "0");
+  assert.equal(slackOnly[0]!.env.PUBLIC_WEB_URL, "");
+  inputs.web = true;
+  assert.deepEqual(
+    buildChildSpecs(inputs).map((spec) => spec.name),
+    ["core", "web", "portal"],
+  );
 });
 
 test("formatAge renders the bash-compatible shapes", () => {
@@ -477,4 +576,52 @@ test("dev errors preserve messages without calling custom object stringifiers", 
   const unsafe = { toString: () => assert.fail("object stringification must not run") };
   assert.equal(errMessage(unsafe), "Unknown error");
   assert.equal(errMessage({ ...unsafe, message: "actionable failure" }), "actionable failure");
+});
+
+test("Slack-only dependency preparation needs no web installation or build", async () => {
+  const worktree = mkdtempSync(join(tmpdir(), "qm-dev-deps-"));
+  try {
+    mkdirSync(join(worktree, "node_modules/emoji-datasource"), { recursive: true });
+    await ensureDeps(worktree, { web: false, watch: false, webUiBasePath: "/" }, () => {
+      assert.fail("Slack-only startup must not install or build web dependencies");
+    });
+  } finally {
+    rmSync(worktree, { recursive: true, force: true });
+  }
+});
+
+test("dev CLI rejects invalid or conflicting surface selection before startup", () => {
+  for (const args of [
+    ["up", "--surface", "invalid"],
+    ["up", "--surface", "slack", "--no-slack"],
+    ["up", "--surface", "both", "--no-slack"],
+    ["status", "--surface", "web"],
+  ]) {
+    const result = spawnSync(process.execPath, ["scripts/dev/cli.ts", ...args], { encoding: "utf8" });
+    assert.equal(result.status, 2, result.stderr);
+    assert.match(result.stderr, /surface/);
+  }
+});
+
+test("spawnCommand routes Windows batch shims through cmd.exe with quoted arguments", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm dev shim "));
+  try {
+    const shim = join(dir, "npm.cmd");
+    writeFileSync(shim, "");
+    const env = { PATH: dir, PATHEXT: ".EXE;.cmd", ComSpec: "C:\\Windows\\system32\\cmd.exe" };
+    const args = ["run", "build", "--", "a b", 'say "hi"'];
+    assert.deepEqual(spawnCommand("npm", args, env, "win32"), {
+      cmd: "C:\\Windows\\system32\\cmd.exe",
+      args: ["/d", "/s", "/c", `""${shim}" "run" "build" "--" "a b" "say ""hi""""`],
+      windowsVerbatimArguments: true,
+    });
+    assert.deepEqual(spawnCommand("npm", args, env, "darwin"), { cmd: "npm", args, windowsVerbatimArguments: false });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("run reports the exit code of a child that exits before it reads its input", async () => {
+  const result = await run(process.execPath, ["-e", "process.exit(3)"], { input: "x".repeat(8 * 1024 * 1024) });
+  assert.equal(result.code, 3);
 });

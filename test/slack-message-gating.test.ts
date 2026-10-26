@@ -205,6 +205,8 @@ test("createDeduper suppresses a redelivery of the same message with a different
 test("isBareStop accepts case-insensitive stop with optional trailing . or !", () => {
   for (const t of ["stop", "Stop", "STOP", " stop ", "stop.", "stop!"]) assert.equal(isBareStop(t), true, t);
   for (const t of ["please stop the job", "stop it", "stop?", "stopping", ""]) assert.equal(isBareStop(t), false, t);
+  for (const t of ["@qm stop", "@qm Stop!"]) assert.equal(isBareStop(t, "qm"), true, t);
+  for (const t of ["@qm stop it", "@qmstop", "@alice stop", "@here stop"]) assert.equal(isBareStop(t, "qm"), false, t);
 });
 
 test("maybeInterceptStop: bare stop with in-flight run signals abort and suppresses the turn", async () => {
@@ -287,4 +289,20 @@ test("createInFlightThreadMap: clear is runId-guarded so a finished run can't un
   assert.equal(runs.get("dm:C1"), "run-2");
   runs.clear("dm:C1", "run-2");
   assert.equal(runs.get("dm:C1"), undefined);
+});
+
+test("stop checks the conversation tree even when the coordinator is idle", async () => {
+  const calls: string[] = [];
+  const stopped = await maybeInterceptStop({
+    text: "stop",
+    threadRef: "dm:D1",
+    getInFlightRun: () => undefined,
+    signalAbort: async () => assert.fail("must stop the tree"),
+    stopConversation: async (threadRef) => {
+      calls.push(threadRef);
+      return true;
+    },
+  });
+  assert.equal(stopped, true);
+  assert.deepEqual(calls, ["dm:D1"]);
 });

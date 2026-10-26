@@ -1,9 +1,13 @@
+import { getSentEmail, listSentEmails } from "../../connectors/gmail-sent.ts";
+import { GmailApiError } from "../../connectors/gmail-api.ts";
 import { orgId as configOrgId } from "../../config.ts";
 import {
   authorizeUrl,
   exchangeCode,
   openOAuthState,
   PROVIDERS,
+  oauthProvider,
+  withPublicOAuthClients,
   sealOAuthState,
   createSecretClientResolver,
   generateCodeVerifier,
@@ -11,13 +15,15 @@ import {
   type OAuthClientResolver,
   type AccountType,
   type OAuthState,
+  ACCOUNT_TYPES,
+  isAccountType,
 } from "../../connectors/oauth.ts";
-import { bestOAuthTokenStatus, CONNECTOR_STATUS_ACCOUNT_TYPES } from "../../credentials/connector-status.ts";
-import type { OAuthTokenStatus } from "../../credentials/keychain.ts";
+import { providerTokenStatuses } from "../../credentials/connector-status.ts";
+import type { ConnectorTokenStore, DerivedOAuthAuth, OAuthTokenStatus } from "../../credentials/keychain.ts";
 import { createEnvSecretSource } from "../../credentials/secret-source.ts";
 import type { ServerDeps } from "../deps.ts";
 import { personKey, samePerson } from "../../directory/person.ts";
-import { errMessage } from "../../util/errors.ts";
+import { errMessage, swallowAs } from "../../util/errors.ts";
 import { normalizeInboundExpiresAt } from "../expiry.ts";
 import { sendJson, sendRedirect } from "../http.ts";
 import { audit } from "./shared.ts";
@@ -45,12 +51,13 @@ async function resumeOAuthFlow(deps: ServerDeps, secret: string | undefined, par
 
 export function resolverFor(deps: ServerDeps): OAuthClientResolver {
   return (
-    deps.resolveClient ?? createSecretClientResolver(deps.oauthEnv ? createEnvSecretSource(deps.oauthEnv) : undefined)
+    deps.resolveClient ??
+    withPublicOAuthClients(createSecretClientResolver(deps.oauthEnv ? createEnvSecretSource(deps.oauthEnv) : undefined))
   );
 }
 
 function parseAccountType(v: string | null | undefined): AccountType {
-  return v === "personal" || v === "company" ? v : "default";
+  return isAccountType(v) ? v : "default";
 }
 
 async function providerConfigured(deps: ServerDeps, provider: string): Promise<boolean> {
@@ -77,8 +84,6 @@ function safeReturnTo(value: string | null): string | undefined {
   return value;
 }
 
-type HostStatus = OAuthTokenStatus & { host: string };
-
 function latestRefreshFailure(
   entries: ReadonlyArray<Pick<OAuthTokenStatus, "refreshFailedAt" | "refreshError">>,
 ): Pick<OAuthTokenStatus, "refreshFailedAt" | "refreshError"> {
@@ -97,29 +102,20 @@ function latestRefreshFailure(
   return latest;
 }
 
-async function connectorProviderStatus(deps: ServerDeps, principalId: string): Promise<Record<string, unknown>> {
+async function connectorProviderStatus(
+  deps: ServerDeps,
+  tokens: ConnectorTokenStore,
+  principalId: string,
+): Promise<Record<string, unknown>> {
   const entries = await Promise.all(
-    Object.entries(PROVIDERS).map(async ([name, provider]) => {
-      const [hosts, configured] = await Promise.all([
-        Promise.all(
-          provider.hosts.map(async (host) => {
-            const probed = await Promise.all(
-              CONNECTOR_STATUS_ACCOUNT_TYPES.map(
-                async (at) =>
-                  (await deps.connectorTokens?.connectorTokenStatus(host, principalId, at)) ?? { connected: false },
-              ),
-            );
-            const best = bestOAuthTokenStatus(probed);
-            return { host, ...best };
-          }),
-        ) as Promise<HostStatus[]>,
-        providerConfigured(deps, name),
-      ]);
+    (await providerTokenStatuses(tokens, principalId)).map(async ({ name, provider, hosts }) => {
+      const configured = await providerConfigured(deps, name);
       const reconnectHosts = hosts.filter((h) => h.needsReconnect);
       const latestFailure = latestRefreshFailure(hosts);
       return [
         name,
         {
+          ...(provider.mcpLabel ? { mcpLabel: provider.mcpLabel } : {}),
           hosts,
           connected: hosts.some((h) => h.connected && !h.needsReconnect),
           ...(reconnectHosts.length ? { needsReconnect: true } : {}),
@@ -176,7 +172,7 @@ async function oauthCallback(ctx: BaseCtx): Promise<void> {
       scopeLabel: state.principalId,
     });
     if (state.consentLinkId && deps.consentLinks) {
-      await deps.consentLinks.redeem(state.consentLinkId).catch(() => null);
+      await deps.consentLinks.redeem(state.consentLinkId).catch(swallowAs("connectors: redeem consent link", null));
     }
     if (state.returnTo) {
       const dest = new URL(state.returnTo, "http://localhost");
@@ -191,13 +187,13 @@ async function oauthCallback(ctx: BaseCtx): Promise<void> {
 }
 
 async function principalHasProvider(deps: ServerDeps, provider: string, principalId: string): Promise<boolean> {
-  const p = PROVIDERS[provider];
+  const p = oauthProvider(provider);
   if (!p || !deps.connectorTokens) return false;
   for (const host of p.hosts) {
-    for (const at of CONNECTOR_STATUS_ACCOUNT_TYPES) {
+    for (const at of ACCOUNT_TYPES) {
       const st = await deps.connectorTokens
         .connectorTokenStatus(host, principalId, at)
-        .catch(() => ({ connected: false }) as OAuthTokenStatus);
+        .catch(swallowAs("connectors: token status", { connected: false } as OAuthTokenStatus));
       if (st.connected && !st.needsReconnect) return true;
     }
   }
@@ -216,7 +212,7 @@ async function consentRedeem(ctx: ApiCtx): Promise<void> {
   }
   const rec = peeked.rec;
   if (rec.orgId !== undefined && rec.orgId !== configOrgId()) return sendJson(res, 200, { status: "invalid" });
-  if (!PROVIDERS[rec.provider]) return sendJson(res, 200, { status: "invalid" });
+  if (!oauthProvider(rec.provider)) return sendJson(res, 200, { status: "invalid" });
   if (!samePerson(clicker, rec.principalId)) {
     const clickerConnected = await principalHasProvider(deps, rec.provider, clicker);
     audit(deps, {
@@ -241,7 +237,7 @@ async function consentRedeem(ctx: ApiCtx): Promise<void> {
       });
     }
     const returnTo = safeReturnTo(url.searchParams.get("returnTo")) ?? rec.returnTo;
-    const codeVerifier = PROVIDERS[rec.provider]?.pkce ? generateCodeVerifier() : undefined;
+    const codeVerifier = oauthProvider(rec.provider)?.pkce ? generateCodeVerifier() : undefined;
     const state = await beginOAuthFlow(deps, secret, {
       provider: rec.provider,
       principalId: rec.principalId,
@@ -285,7 +281,7 @@ async function consentMint(ctx: ApiCtx): Promise<void> {
     intendedPrincipalId?: unknown;
   };
   const provider = typeof b.provider === "string" ? b.provider : "";
-  if (!PROVIDERS[provider])
+  if (!oauthProvider(provider))
     return sendJson(res, 404, { error: "not_found", message: `unknown OAuth provider: ${provider}` });
   const accountType = parseAccountType(typeof b.accountType === "string" ? b.accountType : null);
   const base = deps.publicUrl ? deps.publicUrl.replace(/\/$/, "") : "";
@@ -356,7 +352,7 @@ async function oauthStart(ctx: ApiCtx): Promise<void> {
   const oauthRoute = parseOAuthRoute(pathname)!;
   if (!deps.connectorTokens)
     return sendJson(res, 501, { error: "not_configured", message: "connector token store not wired" });
-  const provider = PROVIDERS[oauthRoute.provider];
+  const provider = oauthProvider(oauthRoute.provider);
   if (!provider)
     return sendJson(res, 404, { error: "not_found", message: `unknown OAuth provider: ${oauthRoute.provider}` });
   const principalId = url.searchParams.get("principalId") ?? "";
@@ -417,7 +413,10 @@ async function oauthStatus(ctx: ApiCtx): Promise<void> {
   const principalId = url.searchParams.get("principalId") ?? "";
   if (!principalId) return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
   audit(deps, { principalId, action: "connector.oauth.status", resource: "connectors", scopeLabel: principalId });
-  return sendJson(res, 200, { principalId, providers: await connectorProviderStatus(deps, principalId) });
+  return sendJson(res, 200, {
+    principalId,
+    providers: await connectorProviderStatus(deps, deps.connectorTokens, principalId),
+  });
 }
 
 export async function oauthRevoke(ctx: ApiCtx): Promise<void> {
@@ -444,17 +443,15 @@ export async function oauthRevoke(ctx: ApiCtx): Promise<void> {
     return sendJson(res, 400, { error: "bad_request", message: "principalId and provider or host required" });
   }
   if (providerName) {
-    const provider = PROVIDERS[providerName];
+    const provider = oauthProvider(providerName);
     if (!provider)
       return sendJson(res, 404, { error: "not_found", message: `unknown OAuth provider: ${providerName}` });
     for (const h of provider.hosts)
-      for (const at of CONNECTOR_STATUS_ACCOUNT_TYPES)
-        await deps.connectorTokens.deleteConnectorToken(h, principalId, at);
+      for (const at of ACCOUNT_TYPES) await deps.connectorTokens.deleteConnectorToken(h, principalId, at);
     audit(deps, { principalId, action: "connector.oauth.revoked", resource: providerName, scopeLabel: principalId });
     return sendJson(res, 200, { ok: true, principalId, provider: providerName, hosts: provider.hosts });
   }
-  for (const at of CONNECTOR_STATUS_ACCOUNT_TYPES)
-    await deps.connectorTokens.deleteConnectorToken(host, principalId, at);
+  for (const at of ACCOUNT_TYPES) await deps.connectorTokens.deleteConnectorToken(host, principalId, at);
   audit(deps, { principalId, action: "connector.oauth.revoked", resource: host, scopeLabel: principalId });
   return sendJson(res, 200, { ok: true, principalId, host });
 }
@@ -501,12 +498,79 @@ export const connectorRawRoutes: ReadonlyArray<Route<BaseCtx>> = [
   { match: (m, p) => m === "GET" && parseOAuthRoute(p)?.action === "callback", auth: "public", handle: oauthCallback },
 ];
 
+export async function gmailSent(ctx: ApiCtx): Promise<void> {
+  const principal = ctx.actor?.p;
+  ctx.res.setHeader("Cache-Control", "no-store");
+  if (!principal) return sendJson(ctx.res, 403, { error: "forbidden", message: "Sign in to read sent mail." });
+  const requestedAccountType = ctx.url.searchParams.get("accountType");
+  if (requestedAccountType !== null && !isAccountType(requestedAccountType))
+    return sendJson(ctx.res, 400, { error: "bad_request" });
+  const pageToken = ctx.url.searchParams.get("pageToken") ?? undefined;
+  if (pageToken && pageToken.length > 2048) return sendJson(ctx.res, 400, { error: "bad_request" });
+  try {
+    let accountType: AccountType | undefined;
+    let auth: DerivedOAuthAuth | null | undefined;
+    let authError: unknown;
+    for (const candidate of requestedAccountType ? [requestedAccountType] : ACCOUNT_TYPES) {
+      try {
+        auth = await ctx.deps.connectorTokens?.connectorDerivedAuth("gmail.googleapis.com", principal, candidate);
+        if (auth) {
+          accountType = candidate;
+          break;
+        }
+      } catch (error) {
+        authError ??= error;
+      }
+    }
+    if (!auth && authError) throw authError;
+    if (!auth || !accountType)
+      return sendJson(ctx.res, 409, {
+        error: "not_connected",
+        message: "Connect this Google account in Settings to see sent mail.",
+      });
+    return sendJson(ctx.res, 200, {
+      ...(ctx.params.messageId
+        ? await getSentEmail(auth.accessToken, ctx.params.messageId)
+        : await listSentEmails(auth.accessToken, pageToken)),
+      accountType,
+    });
+  } catch (error) {
+    const upstream = error instanceof GmailApiError ? error.status : 0;
+    const reconnect = upstream === 401 || upstream === 403;
+    let status = upstream === 404 ? 404 : 502;
+    if (reconnect) status = 409;
+    return sendJson(ctx.res, status, {
+      error: "gmail_unavailable",
+      message: reconnect ? "Reconnect Google to read sent mail." : "Couldn't load sent mail from Gmail. Try again.",
+    });
+  }
+}
+
 export const connectorRoutes: ReadonlyArray<Route<ApiCtx>> = [
+  { method: "GET", path: "/v1/connectors/gmail/sent/:messageId", auth: "source", handle: gmailSent },
+  { method: "GET", path: "/v1/connectors/gmail/sent", auth: "source", handle: gmailSent },
   { method: "POST", path: "/v1/connectors/oauth/consent/mint", auth: { aud: "oauth-consent" }, handle: consentMint },
   { method: "GET", path: "/v1/connectors/oauth/consent/redeem/:linkId", auth: "source", handle: consentRedeem },
-  { match: (m, p) => m === "GET" && parseOAuthRoute(p)?.action === "start", auth: "source", handle: oauthStart },
-  { method: "GET", path: "/v1/connectors/oauth/status", auth: "source", handle: oauthStatus },
-  { method: "POST", path: "/v1/connectors/oauth/revoke", auth: "either", handle: oauthRevoke },
-  { method: "POST", path: "/v1/connectors/token", auth: "source", handle: setToken },
+  {
+    match: (m, p) => m === "GET" && parseOAuthRoute(p)?.action === "start",
+    actor: "query.principalId",
+    auth: "source",
+    handle: oauthStart,
+  },
+  {
+    method: "GET",
+    path: "/v1/connectors/oauth/status",
+    actor: "query.principalId",
+    auth: "source",
+    handle: oauthStatus,
+  },
+  {
+    method: "POST",
+    path: "/v1/connectors/oauth/revoke",
+    actor: "body.principalId",
+    auth: "either",
+    handle: oauthRevoke,
+  },
+  { method: "POST", path: "/v1/connectors/token", actor: "body.principalId", auth: "source", handle: setToken },
   { method: "GET", path: "/v1/connectors/catalog", auth: "source", handle: catalog },
 ];

@@ -3,7 +3,7 @@ import type { WebhookStore } from "./webhook-store.ts";
 import { getVerifier, type VerifierInput } from "./verifiers.ts";
 import { runTrigger, type TriggerDeps } from "../triggers/run-trigger.ts";
 import { buildWebhookWakeEnvelope, capForEscaping } from "../core/wake-envelope.ts";
-import { errMessage } from "../util/errors.ts";
+import { errMessage, reportFailure, reportFailureAs } from "../util/errors.ts";
 
 export type DeliverResult = { status: 202 } | { status: 200; body: string } | { status: 401 } | { status: 404 };
 
@@ -76,6 +76,7 @@ export function createWebhookReceiver(deps: WebhookReceiverDeps): WebhookReceive
     run: deps.run,
     ...(deps.directory ? { directory: deps.directory } : {}),
     ...(deps.currentScopeMembers ? { currentScopeMembers: deps.currentScopeMembers } : {}),
+    ...(deps.resolveRecipient ? { resolveRecipient: deps.resolveRecipient } : {}),
   };
 
   return {
@@ -106,6 +107,11 @@ export function createWebhookReceiver(deps: WebhookReceiverDeps): WebhookReceive
 
       const event = renderEvent(wh, deliveryId, parsed, req.rawBody);
       const destination: Destination | undefined = wh.destination;
+      await deps.webhooks.recordEvent(wh.id, {
+        deliveryId,
+        receivedAt: Date.now(),
+        payload: event.securityScreenData,
+      });
 
       void runTrigger(triggerDeps, {
         owner: wh.owner,
@@ -115,8 +121,6 @@ export function createWebhookReceiver(deps: WebhookReceiverDeps): WebhookReceive
         fireKey,
         surface: "webhook",
         ...(destination ? { destination } : {}),
-        recipientConsentRequired: true,
-        ...(wh.recipientConsent ? { recipientConsent: wh.recipientConsent } : {}),
         errorNotice: (s) => `⚠️ Webhook did not complete: ${s}`,
       })
         .then(async (outcome) => {
@@ -133,8 +137,10 @@ export function createWebhookReceiver(deps: WebhookReceiverDeps): WebhookReceive
         })
         .catch((e: unknown) => {
           const msg = errMessage(e);
-          void deps.webhooks.recordFire(wh.id, { at: Date.now(), error: msg });
-          console.error(`[webhook] ${wh.id} turn threw: ${msg}`);
+          void deps.webhooks
+            .recordFire(wh.id, { at: Date.now(), error: msg })
+            .catch(reportFailureAs("webhook: persist fire failure", undefined, `webhook=${wh.id}`));
+          reportFailure("webhook: fire", e, `webhook=${wh.id}`);
         });
 
       return { status: 202 };

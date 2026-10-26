@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { createInsecureTestServer } from "../src/api/server.ts";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 
 function start() {
@@ -95,6 +95,35 @@ test("per-kind artifact reads are scope-filtered, authz-gated, and audited", asy
         `${kind}: the read is audited`,
       );
     }
+  } finally {
+    await s.close();
+  }
+});
+
+test("an admin cannot repoint a grant-carrying cron; only its owner can", async () => {
+  const s = start();
+  try {
+    const cron = await s.built.app.createCron({
+      ownerScopeId: "personal:U1",
+      owner: "U1",
+      createdBy: "U1",
+      schedule: { everyMs: 60_000 },
+      action: "review spend",
+      unattendedGrants: ["admin.spend.read"],
+    });
+    const put = (destination: unknown) =>
+      fetch(`${s.base}/v1/admin/crons/${encodeURIComponent(cron.id)}/destination?scope=personal:U1`, {
+        method: "PUT",
+        headers: { ...ALICE_ADMIN, "content-type": "application/json" },
+        body: JSON.stringify({ destination }),
+      });
+    assert.equal((await put({ type: "slack", target: "C9", audienceScopeId: "channel:C9" })).status, 409);
+    assert.equal(
+      (await put({ type: "slack", target: "C9", audienceScopeId: "personal:U1" })).status,
+      409,
+      "a caller-supplied audience cannot launder a room destination",
+    );
+    assert.equal((await s.built.app.getCron(cron.id))?.destination, undefined);
   } finally {
     await s.close();
   }
@@ -341,6 +370,48 @@ test("the skills list + detail link an imported skill to its pack; built-in/pers
       { id: pack.id, url: "https://github.com/acme/skills-pack.git" },
       "the drill-in detail carries the same pack provenance",
     );
+  } finally {
+    await s.close();
+  }
+});
+
+test("admin cron runtime edits preserve task authority and reject unavailable or out-of-scope choices", async () => {
+  const s = start();
+  try {
+    const cron = await s.built.crons.create({
+      ownerScopeId: "personal:U1",
+      owner: "U1",
+      createdBy: "U1",
+      schedule: { everyMs: 60_000 },
+      action: "run the existing script",
+      unattendedGrants: ["publish"],
+      destination: { type: "principal", target: "U1" },
+    });
+    const runtime = { harnessId: "pi", modelId: "claude-sonnet-5" };
+    const put = (body: unknown, scope = "personal:U1", actor = ALICE_ADMIN) =>
+      fetch(`${s.base}/v1/admin/crons/${cron.id}/runtime?scope=${scope}`, {
+        method: "PUT",
+        headers: { ...actor, "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    assert.equal((await put({ runtime }, "personal:U1", { "x-admin-actor": "nobody@default-org" })).status, 403);
+    assert.equal((await put({ runtime }, "channel:C9")).status, 403);
+    assert.equal((await put({ runtime: { ...runtime, modelId: "unavailable" } })).status, 400);
+    assert.equal((await put({ runtime, action: "replace the task" })).status, 400);
+    assert.equal((await put({})).status, 400);
+    const result = await put({ runtime });
+    assert.equal(result.status, 200);
+    assert.deepEqual(await result.json(), { cron: { id: cron.id, runtime } });
+    const updated = await s.built.app.getCron(cron.id);
+    assert.deepEqual(updated, { ...cron, runtime });
+    const listed = await json(await fetch(`${s.base}/v1/admin/crons?scope=personal:U1`, { headers: ALICE_ADMIN }));
+    assert.deepEqual(listed.crons[0].runtime, runtime);
+    assert.deepEqual(listed.crons[0].unattendedGrants, cron.unattendedGrants);
+    assert.equal((await put({ runtime: null })).status, 200);
+    assert.deepEqual(await s.built.app.getCron(cron.id), { ...cron, runtime: null });
+    const audit = (await s.built.auditLog.events()).filter((event) => event.action === "cron.runtime.update");
+    assert.equal(audit.length, 2);
+    assert.ok(audit.every((event) => event.principalId === "admin-alice" && event.resource === cron.id));
   } finally {
     await s.close();
   }

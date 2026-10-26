@@ -1,3 +1,4 @@
+import type { Readable } from "node:stream";
 import { basename } from "node:path";
 import { randomUUID } from "node:crypto";
 import type {
@@ -9,16 +10,21 @@ import type {
   SessionEntry,
 } from "../types.ts";
 import { hasParentPathSegment, type Sandbox, type SandboxHandle } from "../sandbox/sandbox.ts";
-import { MAX_BLOB_BYTES, collectBlob, type BlobTransferStore } from "../persistence/blob-transfer.ts";
+import {
+  MAX_BLOB_BYTES,
+  BlobTooLargeError,
+  collectBlob,
+  type BlobTransferStore,
+} from "../persistence/blob-transfer.ts";
 import { fileArtifactId, type FileArtifactStore, type FileDirection } from "../files/file-artifact-store.ts";
-import { parseRef } from "../acl/resource-ref.ts";
 import { swallowAs } from "../util/errors.ts";
+import { fileContentRequest } from "./document-kinds.ts";
 import { hashId } from "../util/crypto.ts";
 import type { SecurityScreenVerdict } from "../security/security-posture.ts";
 import { downscaleVisionImage } from "./image-downscale.ts";
+import { NoDefaultSandboxError } from "../sandbox/sandbox-routing.ts";
 
 export const INBOX_DIR = "inbox";
-export const SHARED_DIR = "shared";
 export const TURN_FILES_DIR = ".agent-turn";
 
 export function turnFileId(runId?: string, attempt = 1, now = Date.now()): string {
@@ -32,8 +38,6 @@ const VISION_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "imag
 export const MAX_VISION_IMAGE_BYTES = 5_000_000;
 
 export const MAX_LLM_REQUEST_BYTES = 18_000_000;
-
-export const MAX_HISTORY_IMAGE_BYTES = 10_000_000;
 
 export interface InboundImage {
   name: string;
@@ -90,6 +94,23 @@ const MIME_BY_EXT: Record<string, string> = {
   yaml: "application/yaml",
   yml: "application/yaml",
   pdf: "application/pdf",
+  doc: "application/msword",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xls: "application/vnd.ms-excel",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ppt: "application/vnd.ms-powerpoint",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  odt: "application/vnd.oasis.opendocument.text",
+  ods: "application/vnd.oasis.opendocument.spreadsheet",
+  odp: "application/vnd.oasis.opendocument.presentation",
+  rtf: "application/rtf",
+  tsv: "text/tab-separated-values",
+  eml: "message/rfc822",
+  ics: "text/calendar",
+  vcf: "text/vcard",
+  js: "text/javascript",
+  ts: "text/typescript",
+  py: "text/x-python",
   png: "image/png",
   jpg: "image/jpeg",
   jpeg: "image/jpeg",
@@ -185,36 +206,28 @@ function shownToModel(meta: AttachmentMeta): boolean {
   return isVisionAttachment(meta) && meta.sizeBytes > 0 && meta.sizeBytes <= MAX_VISION_IMAGE_BYTES;
 }
 
-export function inboundManifest(metas: AttachmentMeta[], inboxDir = INBOX_DIR): string {
+export function inboundManifest(metas: AttachmentMeta[], inboxDir = INBOX_DIR, unstaged?: Set<string>): string {
   if (!metas.length) return "";
   const list = metas
     .map(
       (m) =>
-        `- ${inboxDir}/${m.name} (${m.mimetype}, ${m.sizeBytes} bytes)${m.author ? ` — shared by ${m.author}` : ""}`,
+        `- ${inboxDir}/${m.name} (${m.mimetype}, ${m.sizeBytes} bytes)${m.author ? ` — shared by ${m.author}` : ""}${
+          unstaged?.has(m.name)
+            ? ` — saved as file ${m.artifactId}, not yet on a computer (no default sandbox); send it directly with {file_id: "${m.artifactId}"}; if you need it on disk, choose a sandbox_id for execute and download ${fileContentRequest(m.artifactId!)} to a path you choose`
+            : ""
+        }`,
     )
     .join("\n");
   const noun = metas.length === 1 ? "file" : "files";
+  const where = unstaged?.size ? `for ./${inboxDir}/` : `available in ./${inboxDir}/`;
   const lead = metas.some((m) => m.author)
-    ? `${metas.length} ${noun} shared in this conversation, available in ./${inboxDir}/:`
-    : `The user shared ${metas.length} ${noun}, available in ./${inboxDir}/:`;
+    ? `${metas.length} ${noun} shared in this conversation, ${where}:`
+    : `The user shared ${metas.length} ${noun}, ${where}:`;
   return `${lead}\n${list}`;
 }
 
-const FILE_EVENT_KIND = "file_event";
-
-export interface FileEventPayload {
-  kind: typeof FILE_EVENT_KIND;
-  direction: FileDirection;
-  issues: string[];
-  text: string;
-}
-
-export function fileEventPayload(direction: FileDirection, issues: string[]): FileEventPayload {
-  const lead =
-    direction === "in"
-      ? `Files received this turn that did not reach ./${INBOX_DIR}/`
-      : "Files the agent tried to send that did not go out";
-  return { kind: FILE_EVENT_KIND, direction, issues, text: `${lead}: ${issues.join("; ")}` };
+export function inboundIssuesNote(issues: readonly string[]): string {
+  return issues.length ? `Files received this turn that did not reach ./${INBOX_DIR}/: ${issues.join("; ")}` : "";
 }
 
 export function inboundIssueList(opts: {
@@ -239,31 +252,23 @@ export function inboundIssueList(opts: {
   return issues;
 }
 
-function isFileHandle(h: GrantedHandle): boolean {
-  return parseRef(h.ownerPath).kind === "file";
-}
-
 export function sharedManifest(handles: readonly GrantedHandle[]): string {
   const seen = new Set<string>();
   const lines: string[] = [];
   for (const h of handles) {
-    if (!isFileHandle(h)) continue;
     if (seen.has(h.handlePath)) continue;
     seen.add(h.handlePath);
     lines.push(`- ${h.handlePath}${h.permission === "write" ? " (writable)" : ""}`);
   }
   if (!lines.length) return "";
   const total = lines.length;
-  const shown = lines.slice(0, MAX_SHARED_FILES_LISTED);
+  const shown = lines.sort().slice(0, MAX_SHARED_FILES_LISTED);
   const omitted = total - shown.length;
   if (omitted > 0) {
     shown.push(`…and ${omitted} more (read shared/<name> to fetch)`);
   }
   const noun = total === 1 ? "file" : "files";
-  return (
-    `${total} ${noun} shared with you — read a path below to fetch that file on demand, ` +
-    `then attach it to a message to pass it on (name its path in the surface \`post\` action's \`files\`):\n${shown.join("\n")}`
-  );
+  return `${total} ${noun} shared with you — read a path below to fetch that file on demand:\n${shown.join("\n")}`;
 }
 
 export function sharedFilesSystemSection(handles: readonly GrantedHandle[]): string {
@@ -284,7 +289,7 @@ export function senderNote(name: string | undefined): string {
 
 export async function materializeInbound(
   sandbox: Sandbox,
-  handle: SandboxHandle,
+  handle: SandboxHandle | (() => Promise<SandboxHandle>),
   attachments: IncomingAttachment[],
   transfer: BlobTransferStore,
   register?: ArtifactRegistration,
@@ -301,7 +306,15 @@ export async function materializeInbound(
   unavailable: string[];
   blocked: string[];
   unscreened: string[];
+  unstaged?: Set<string>;
 }> {
+  let target: Promise<SandboxHandle | null> | undefined;
+  const computer = () =>
+    (target ??= (typeof handle === "function" ? handle() : Promise.resolve(handle)).catch((e: unknown) => {
+      if (e instanceof NoDefaultSandboxError) return null;
+      throw e;
+    }));
+  const unstaged = new Set<string>();
   const metas: AttachmentMeta[] = [];
   const images: InboundImage[] = [];
   const tooMany: string[] = [];
@@ -332,10 +345,18 @@ export async function materializeInbound(
       }
       if (!verdict || verdict.unscreened) unscreened.push(name);
     }
-    await sandbox.writeFileBytes(handle, `${inboxDir}/${name}`, bytes);
+    const box = await computer();
+    if (box) await sandbox.writeFileBytes(box, `${inboxDir}/${name}`, bytes);
     const registered = register
       ? await registerArtifact(register, "in", metas.length, name, mimetype, bytes)
       : undefined;
+    if (!box) {
+      if (!registered) {
+        unavailable.push(name);
+        continue;
+      }
+      unstaged.add(name);
+    }
     metas.push({
       name,
       mimetype,
@@ -355,7 +376,7 @@ export async function materializeInbound(
       });
     }
   }
-  return { metas, images, tooMany, unavailable, blocked, unscreened };
+  return { metas, images, tooMany, unavailable, blocked, unscreened, ...(unstaged.size ? { unstaged } : {}) };
 }
 
 const DELIVERY_NOTE_PREFIX = "[files delivered to the conversation: ";
@@ -369,23 +390,50 @@ export function isDeliveryNote(text: string): boolean {
   return t.startsWith(DELIVERY_NOTE_PREFIX) && t.endsWith("]") && !t.includes("\n");
 }
 
-export function deliveryNoteManifest(text: string): string | null {
-  if (!isDeliveryNote(text)) return null;
-  return text.trim().slice(DELIVERY_NOTE_PREFIX.length, -1);
-}
+export type OutboundFile = string | { file_id: string };
 
-export function legacyDeliveryNoteManifest(text: string): string | null {
-  const m = /^\(delivered file\(s\) to the conversation: ([^\n]*)\)$/.exec(text.trim());
-  return m ? m[1]! : null;
+export type OpenStoredFile = (id: string) => Promise<{
+  name: string;
+  mimetype: string;
+  sizeBytes: number;
+  stream: Readable;
+} | null>;
+
+export function parseOutboundFiles(
+  value: unknown,
+): { ok: true; files: OutboundFile[] } | { ok: false; message: string } {
+  if (value === undefined) return { ok: true, files: [] };
+  if (
+    !Array.isArray(value) ||
+    value.some((file) =>
+      typeof file === "string"
+        ? !file.trim()
+        : !file ||
+          typeof file !== "object" ||
+          Array.isArray(file) ||
+          Object.keys(file).length !== 1 ||
+          typeof file.file_id !== "string" ||
+          !file.file_id.trim(),
+    )
+  )
+    return { ok: false, message: 'files must be workspace path strings or {file_id: "stored Files ID"} objects' };
+  if (value.length > MAX_OUTBOUND_FILES) return { ok: false, message: `too many files (max ${MAX_OUTBOUND_FILES})` };
+  if (value.some((file) => typeof file === "string" && hasParentPathSegment(file)))
+    return { ok: false, message: "files must stay inside the workspace — no .. path segments" };
+  return {
+    ok: true,
+    files: value.map((file) => (typeof file === "string" ? file.trim() : { file_id: file.file_id.trim() })),
+  };
 }
 
 export async function collectNamedOutbound(
-  sandbox: Sandbox,
-  handle: SandboxHandle,
-  paths: readonly string[],
+  sandbox: Sandbox | undefined,
+  handle: SandboxHandle | (() => Promise<SandboxHandle>),
+  paths: readonly OutboundFile[],
   transfer: BlobTransferStore,
   register?: ArtifactRegistration,
   reservedNames: readonly string[] = [],
+  openStored?: OpenStoredFile,
 ): Promise<{
   attachments: OutgoingAttachment[];
   missing: string[];
@@ -393,9 +441,8 @@ export async function collectNamedOutbound(
   oversized: string[];
   createdArtifactIds: Set<string>;
 }> {
-  const invalid = paths.filter(hasParentPathSegment);
-  if (invalid.length)
-    return { attachments: [], missing: invalid, empty: [], oversized: [], createdArtifactIds: new Set() };
+  const parsed = parseOutboundFiles(paths);
+  if (!parsed.ok) throw new Error(parsed.message);
   const attachments: OutgoingAttachment[] = [];
   const missing: string[] = [];
   const empty: string[] = [];
@@ -403,56 +450,70 @@ export async function collectNamedOutbound(
   const usedNames = new Set<string>(reservedNames);
   const doomed = () => missing.length > 0 || empty.length > 0 || oversized.length > 0;
   const createdArtifactIds = new Set<string>();
-  let i = 0;
-  for (const p of paths) {
-    const bytes = await sandbox.readFileBytes(handle, p);
-    if (bytes === null) {
-      missing.push(p);
-      continue;
-    }
-    const name = uniqueName(safeAttachmentName(basename(p)), usedNames);
-    usedNames.add(name);
-    if (bytes.length === 0) {
-      empty.push(p);
-      continue;
-    }
-    if (bytes.length > MAX_ATTACHMENT_BYTES) {
-      oversized.push(p);
-      continue;
-    }
-    if (doomed()) continue;
-    const mimetype = mimeFromName(name);
-    const { blobId } = await transfer.put(bytes);
-    const artifact = register ? await registerArtifact(register, "out", i, name, mimetype, bytes) : undefined;
-    if (artifact?.created) createdArtifactIds.add(artifact.id);
-    i += 1;
-    attachments.push({
-      name,
-      mimetype,
-      sizeBytes: bytes.length,
-      blobId,
-      ...(artifact ? { artifactId: artifact.id, artifactViewerId: register!.createdBy } : {}),
-    });
-  }
-  if (doomed() && attachments.length) {
-    await Promise.all(
-      attachments.map(async (a) => {
-        await transfer.delete(a.blobId).catch(swallowAs("attachments: rollback blob delete", undefined));
-        if (register && a.artifactId && createdArtifactIds.has(a.artifactId)) {
-          await register.store.delete(a.artifactId).catch((e) => {
-            try {
-              register.onError?.(e);
-            } catch (err) {
-              swallowAs("attachments: rollback onError", undefined)(err);
-            }
-          });
-        }
-      }),
-    );
+  const rollback = async () => {
+    await Promise.all(attachments.map((a) => discardOutbound(a, transfer, register, createdArtifactIds)));
     attachments.length = 0;
     createdArtifactIds.clear();
+  };
+  let target: SandboxHandle | undefined;
+  try {
+    for (const [i, file] of parsed.files.entries()) {
+      const storedId = typeof file === "string" ? undefined : file.file_id;
+      const label = typeof file === "string" ? file : file.file_id;
+      let bytes: Uint8Array | undefined;
+      let stored: Awaited<ReturnType<OpenStoredFile>> = null;
+      if (typeof file === "string") {
+        if (!sandbox) throw new Error("sandbox file access is not available");
+        target ??= typeof handle === "function" ? await handle() : handle;
+        bytes = (await sandbox.readFileBytes(target, file)) ?? undefined;
+      } else {
+        stored = (await openStored?.(file.file_id)) ?? null;
+      }
+      if (!bytes && !stored) {
+        missing.push(label);
+        continue;
+      }
+      const sizeBytes = stored?.sizeBytes ?? bytes!.length;
+      if (sizeBytes === 0) empty.push(label);
+      if (sizeBytes > MAX_ATTACHMENT_BYTES) oversized.push(label);
+      if (doomed()) {
+        stored?.stream.destroy();
+        continue;
+      }
+      const name = uniqueName(safeAttachmentName(stored?.name ?? label), usedNames);
+      usedNames.add(name);
+      const mimetype = stored?.mimetype || mimeFromName(name);
+      let blob;
+      try {
+        blob = await transfer.put(stored?.stream ?? bytes!, { maxBytes: MAX_ATTACHMENT_BYTES });
+      } catch (error) {
+        if (!(error instanceof BlobTooLargeError)) throw error;
+        oversized.push(label);
+        continue;
+      } finally {
+        stored?.stream.destroy();
+      }
+      const attachment: OutgoingAttachment = { name, mimetype, sizeBytes: blob.sizeBytes, blobId: blob.blobId };
+      attachments.push(attachment);
+      if (blob.sizeBytes === 0) {
+        empty.push(label);
+        continue;
+      }
+      let artifact;
+      if (storedId) artifact = { id: storedId, created: false };
+      else if (register) artifact = await registerArtifact(register, "out", i, name, mimetype, bytes!);
+      if (artifact?.created) createdArtifactIds.add(artifact.id);
+      if (artifact) {
+        attachment.artifactId = artifact.id;
+        if (register) attachment.artifactViewerId = register.createdBy;
+      }
+    }
+    if (doomed()) await rollback();
+    return { attachments, missing, empty, oversized, createdArtifactIds };
+  } catch (error) {
+    await rollback();
+    throw error;
   }
-  return { attachments, missing, empty, oversized, createdArtifactIds };
 }
 
 export async function discardOutbound(

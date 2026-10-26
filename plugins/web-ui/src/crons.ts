@@ -2,7 +2,7 @@ import { html, nothing, render, type TemplateResult } from "lit";
 import { Archive, Pause, Pencil, Play, Plus, RotateCcw, Trash2 } from "lucide";
 import { api, userSendMessage } from "./core-bridge";
 import { errMessage } from "../../chassis/src/errors";
-import { icon } from "./ui";
+import { icon } from "./icons";
 import { listBackLink, listPageTpl } from "./list-page";
 import { contextsState, ensureContexts, scopeChip } from "./contexts";
 import { scopedSession, scopedViewTopbar } from "./session-scope";
@@ -152,19 +152,8 @@ function clipWords(text: string, max = 64): string {
   return `${(wordCut.length >= max * 0.55 ? wordCut : cut).trim()}…`;
 }
 
-function suggestedCronTitle(text: string): string {
-  const clean = cleanCronText(text);
-  if (!clean) return "(untitled cron)";
-  const candidate = clean
-    .replace(/^(please\s+)?(run|generate|create|send|post|deliver|summarize|check)\s+(the\s+)?/i, "")
-    .replace(/\s*[:;.!?]\s+.*$/, "")
-    .trim();
-  const clipped = clipWords(candidate || clean, 58);
-  return clipped.replace(/^[a-z]/, (ch) => ch.toUpperCase());
-}
-
 function cronTitle(c: CronView): string {
-  return c.title?.trim() || suggestedCronTitle(cronText(c));
+  return c.title?.trim() || clipWords(cronText(c), 58) || "(untitled cron)";
 }
 
 function cronScopeLabel(c: CronView): string {
@@ -238,14 +227,18 @@ function drawCronsPage(): void {
   const yoursDisabled = yours.filter(({ c }) => !c.enabled);
   const shared = all.filter(({ c, mine }) => !mine && !c.archived);
   const ownsAny = all.some(({ mine }) => mine);
-  const counts: Record<CronTab, number> = { yours: yours.length, shared: shared.length, archived: archived.length };
+  const counts: Record<CronTab, number> = {
+    yours: yoursEnabled.length,
+    shared: shared.filter(({ c }) => c.enabled).length,
+    archived: archived.length,
+  };
 
   const rows: TemplateResult[] = [];
   if (cronActionNotice) {
     rows.push(html`<div class="action-notice">${cronActionNotice}</div>`);
     cronActionNotice = "";
   }
-  if (all.length) rows.push(cronTabs(counts));
+  if (all.length) rows.push(cronTabs(counts, shared.length > 0));
   if (cronTab === "yours") {
     rows.push(...yoursEnabled.map(({ c }) => cronPageRow(c, true)));
     if (all.length && !yoursEnabled.length)
@@ -300,8 +293,10 @@ function cronEmptyRow(text: string): TemplateResult {
   return html`<div class="empty compact cron-filter-empty">${text}</div>`;
 }
 
-function cronTabs(counts: Record<CronTab, number>): TemplateResult {
-  const tabs = CRON_TABS.filter((t) => t.value === "yours" || counts[t.value] > 0 || cronTab === t.value);
+function cronTabs(counts: Record<CronTab, number>, hasShared: boolean): TemplateResult {
+  const tabs = CRON_TABS.filter(
+    (t) => t.value === "yours" || (t.value === "shared" && hasShared) || counts[t.value] > 0 || cronTab === t.value,
+  );
   return html`
     <div class="cron-list-controls" role="tablist" aria-label="Cron view">
       ${tabs.map(

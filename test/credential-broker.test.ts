@@ -457,3 +457,50 @@ test("a deployment token is refused when the credential is switched off for publ
   );
   assert.equal(agent.status, 200, "an agent turn's token is not affected by the published-apps switch");
 });
+
+test("generic credential broker cannot bypass Composio identity binding", async () => {
+  const cap = captureFetch();
+  const result = await brokerCredentialCall(
+    base({
+      reader: reader({ slug: "x-firehose", host: "backend.composio.dev", allowedMethods: ["POST"] }),
+      body: {
+        credential: "x-firehose",
+        method: "POST",
+        url: "https://backend.composio.dev/api/v3.1/tools/execute/GMAIL_FETCH_EMAILS",
+      },
+      fetchImpl: cap.fetch,
+    }),
+  );
+  assert.equal(result.status, 403);
+  assert.equal(cap.calls.length, 0);
+});
+
+test("a daily cap admits that many outbound calls per UTC day, then refuses with 429 without calling out", async () => {
+  const cap = captureFetch();
+  let clock = Date.UTC(2026, 9, 16, 23, 0);
+  const usage = createCredentialUsageSink(() => clock);
+  const capped = base({
+    fetchImpl: cap.fetch,
+    usage,
+    reader: reader({ slug: "x-firehose", allowedPathPrefixes: ["/2/"], maxRequestsPerDay: 2 }),
+  });
+  assert.equal((await brokerCredentialCall(capped)).status, 200);
+  assert.equal(
+    (await brokerCredentialCall({ ...capped, body: { ...capped.body, url: "https://evil.example/" } })).status,
+    403,
+  );
+  assert.equal((await brokerCredentialCall(capped)).status, 200);
+  const refused = await brokerCredentialCall(capped);
+  assert.equal(refused.status, 429);
+  assert.equal((refused.json as { error: string }).error, "daily_cap_reached");
+  assert.equal(cap.calls.length, 2);
+
+  clock = Date.UTC(2026, 9, 17, 0, 1);
+  assert.equal((await brokerCredentialCall(capped)).status, 200);
+  assert.equal(cap.calls.length, 3);
+});
+
+test("a capped credential refuses closed when no usage ledger can count its calls", async () => {
+  const capped = { reader: reader({ slug: "x-firehose", allowedPathPrefixes: ["/2/"], maxRequestsPerDay: 3 }) };
+  assert.equal((await brokerCredentialCall(base(capped))).status, 503);
+});

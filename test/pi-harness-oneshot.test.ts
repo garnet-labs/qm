@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readdirSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
+import { zstdDecompressSync } from "node:zlib";
 import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
 import {
   buildDetectionPrompt,
@@ -10,7 +11,6 @@ import {
   oneShot,
   parseDetectVerdict,
   piHarnessConfigOptions,
-  isProviderRefusal,
   piLastAssistantTextOrThrow,
   piTurnError,
   providerRefusalError,
@@ -22,7 +22,6 @@ import {
   sanitizeLlmPayload,
   trimPayloadToByteBudget,
   seedRawMessagesIntoSession,
-  thinkingBlocksFromContent,
   toPiMessage,
   transportFromModel,
 } from "../src/harness/pi-harness.ts";
@@ -31,6 +30,7 @@ import { modelGatewayRequest } from "../src/model/provider-endpoints.ts";
 import { reconstructMessagesFromHistory } from "../src/harness/replay.ts";
 import type { SessionEntry } from "../src/types.ts";
 import { testConfig } from "./support/test-config.ts";
+import { ProviderTurnError, turnFailureMessage } from "../src/core/turn-error.ts";
 
 function countTempDirs(prefix: string): number {
   return readdirSync(tmpdir()).filter((name) => name.startsWith(prefix)).length;
@@ -125,10 +125,7 @@ test("piHarnessConfigOptions maps every Config knob the harness consumes, field 
         models: { "claude-opus-5": "router/opus" },
       },
       piCaptureRequests: false,
-      piSystemCacheSplit: true,
-      sandboxResourcesEnabled: true,
-      scratchExecEnabled: true,
-      sharedOwnerAuthIsolation: true,
+
       reachExecEnabled: true,
       signingSecret: "sek",
       apiBaseUrl: "https://core.test",
@@ -137,6 +134,7 @@ test("piHarnessConfigOptions maps every Config knob the harness consumes, field 
       execTimeoutMaxMs: 33_000,
       backgroundJobTtlMs: 44_000,
       backgroundJobTtlMaxMs: 55_000,
+      sandboxCapabilityTtlMs: 66_000,
     }),
   );
   assert.deepEqual(opts, {
@@ -151,9 +149,7 @@ test("piHarnessConfigOptions maps every Config knob the harness consumes, field 
       models: { "claude-opus-5": "router/opus" },
     },
     captureRequests: false,
-    systemCacheSplit: true,
     sandboxResources: true,
-    scratchExec: true,
     ownerAuthExec: true,
     reachExec: true,
     controlTools: true,
@@ -162,6 +158,7 @@ test("piHarnessConfigOptions maps every Config knob the harness consumes, field 
     execTimeoutCeilingMs: 33_000,
     backgroundJobTtlMs: 44_000,
     backgroundJobTtlMaxMs: 55_000,
+    sandboxCapabilityTtlMs: 66_000,
   });
 });
 
@@ -197,6 +194,161 @@ test("Pi title generation returns no title without an auxiliary-model credential
   assert.equal(await harness.models.generateTitle!("User:\nPrioritize the public qm issues"), undefined);
 });
 
+test("Pi title generation surfaces provider failures to its caller", async (t) => {
+  const server = createServer((_request, response) => {
+    response.writeHead(401, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: { message: "title model rejected request" } }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(
+    () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      }),
+  );
+  const address = server.address();
+  assert(address && typeof address !== "string");
+  const harness = createPiHarness({
+    defaultModelId: "claude-opus-4-8",
+    titleModelId: "claude-haiku-4-5",
+    modelGateway: {
+      url: `http://127.0.0.1:${address.port}`,
+      apiKey: "gateway-key",
+      apiKeyHeader: "api-key",
+      models: { "claude-haiku-4-5": "title-model" },
+    },
+  });
+
+  await assert.rejects(harness.models.generateTitle!("User:\nInvestigate the deploy"));
+});
+
+test("Pi title generation rejects a reply-shaped answer with the rule that fired and the rejected text", async (t) => {
+  const server = createServer((request, response) => {
+    request.resume();
+    request.on("end", () => {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      for (const event of [
+        {
+          type: "message_start",
+          message: {
+            id: "msg_title",
+            type: "message",
+            role: "assistant",
+            model: "title-model",
+            content: [],
+            stop_reason: null,
+            stop_sequence: null,
+            usage: { input_tokens: 1, output_tokens: 0 },
+          },
+        },
+        { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+        { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Sorry, I can't summarize that" } },
+        { type: "content_block_stop", index: 0 },
+        {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn", stop_sequence: null },
+          usage: { output_tokens: 1 },
+        },
+        { type: "message_stop" },
+      ]) {
+        response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+      }
+      response.end();
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(
+    () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      }),
+  );
+  const address = server.address();
+  assert(address && typeof address !== "string");
+  const harness = createPiHarness({
+    defaultModelId: "claude-opus-4-8",
+    titleModelId: "claude-haiku-4-5",
+    modelGateway: {
+      url: `http://127.0.0.1:${address.port}`,
+      apiKey: "gateway-key",
+      apiKeyHeader: "api-key",
+      models: { "claude-haiku-4-5": "title-model" },
+    },
+  });
+
+  await assert.rejects(harness.models.generateTitle!("User:\nInvestigate the deploy"), {
+    name: "TitleRejected",
+    rule: "reply_opener",
+    message: 'reply_opener: "Sorry, I can\'t summarize that"',
+  });
+});
+
+test("Pi title generation accepts the prompted NONE sentinel without reporting a failure", async (t) => {
+  const server = createServer((request, response) => {
+    request.resume();
+    request.on("end", () => {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      for (const event of [
+        {
+          type: "message_start",
+          message: {
+            id: "msg_title",
+            type: "message",
+            role: "assistant",
+            model: "title-model",
+            content: [],
+            stop_reason: null,
+            stop_sequence: null,
+            usage: { input_tokens: 1, output_tokens: 0 },
+          },
+        },
+        { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+        { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: " NONE\n" } },
+        { type: "content_block_stop", index: 0 },
+        {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn", stop_sequence: null },
+          usage: { output_tokens: 1 },
+        },
+        { type: "message_stop" },
+      ]) {
+        response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+      }
+      response.end();
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(
+    () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      }),
+  );
+  const address = server.address();
+  assert(address && typeof address !== "string");
+  const harness = createPiHarness({
+    defaultModelId: "claude-opus-4-8",
+    titleModelId: "claude-haiku-4-5",
+    modelGateway: {
+      url: `http://127.0.0.1:${address.port}`,
+      apiKey: "gateway-key",
+      apiKeyHeader: "api-key",
+      models: { "claude-haiku-4-5": "title-model" },
+    },
+  });
+
+  assert.equal(await harness.models.generateTitle!("User:\nHello"), undefined);
+});
+
 test("piHarnessConfigOptions omits the optional fields when the config leaves them unset", () => {
   const opts = piHarnessConfigOptions(testConfig());
   for (const key of ["defaultModelId", "detectModelId", "titleModelId", "apiKey"] as const) {
@@ -206,14 +358,14 @@ test("piHarnessConfigOptions omits the optional fields when the config leaves th
 
 test("oneShot removes its temp dirs even when the session call throws", async () => {
   const prefix = "pi-onesh-test";
-  const before = countTempDirs(prefix);
+  const before = countTempDirs(`${prefix}-agent-`);
 
   const fakeModel = { id: "claude-sonnet-4-5" } as unknown as Parameters<typeof oneShot>[1];
 
   await assert.rejects(oneShot(prefix, fakeModel, "test-key", "system", "prompt"));
 
-  const after = countTempDirs(prefix);
-  assert.equal(after, before, "oneShot must leave no temp dirs behind");
+  const after = countTempDirs(`${prefix}-agent-`);
+  assert.equal(after, before, "oneShot must leave no agent dirs behind");
 });
 
 test("oneShot completes an authenticated Pi 0.82 turn", async (t) => {
@@ -281,6 +433,8 @@ test("oneShot completes an authenticated Pi 0.82 turn", async (t) => {
 });
 
 test("oneShot routes configured models through the model gateway without mutating transport metadata", async (t) => {
+  let lastBody = "";
+  let stopReason = "end_turn";
   const requests: Array<{ gatewayKey?: string; providerKey?: string; model?: string; marker?: string }> = [];
   const server = createServer((request, response) => {
     let body = "";
@@ -289,6 +443,7 @@ test("oneShot routes configured models through the model gateway without mutatin
       body += String(chunk);
     });
     request.on("end", () => {
+      lastBody = body;
       const requestModel = (JSON.parse(body) as { model?: string }).model;
       requests.push({
         ...(request.headers["api-key"] ? { gatewayKey: String(request.headers["api-key"]) } : {}),
@@ -316,7 +471,7 @@ test("oneShot routes configured models through the model gateway without mutatin
         { type: "content_block_stop", index: 0 },
         {
           type: "message_delta",
-          delta: { stop_reason: "end_turn", stop_sequence: null },
+          delta: { stop_reason: stopReason, stop_sequence: null },
           usage: { output_tokens: 1 },
         },
         { type: "message_stop" },
@@ -366,6 +521,38 @@ test("oneShot routes configured models through the model gateway without mutatin
     modelId: "claude-haiku-4-5",
     headers: { "x-model-marker": "preserved" },
   });
+  const harness = createPiHarness({ defaultModelId: "claude-haiku-4-5", modelGateway });
+  const compact = harness.models.compactHistory!;
+  const input: Parameters<typeof compact>[0] = {
+    session: { id: "summary-session" } as Parameters<typeof compact>[0]["session"],
+    history: [
+      {
+        sessionId: "summary-session",
+        seq: 136,
+        parentSeq: null,
+        type: "user",
+        payload: { text: "what? local recovery what?" },
+        scopeLabel: "personal:test",
+        createdAt: 0,
+      },
+    ],
+    recordModelCall: () => {},
+  };
+  assert.equal(await compact(input), "gateway");
+  assert.deepEqual(requests.at(-1), {
+    gatewayKey: "gateway-secret",
+    providerKey: "gateway-secret",
+    model: "router/haiku",
+  });
+  const body = JSON.parse(lastBody) as { messages: Array<{ content: Array<{ text?: string }> }> };
+  const prompt = body.messages
+    .flatMap((message) => message.content)
+    .map((block) => block.text ?? "")
+    .join("\n");
+  assert.ok(prompt.indexOf("</conversation>") > prompt.indexOf("user#136"));
+  assert.match(prompt.slice(prompt.indexOf("</conversation>")), /Create a structured context checkpoint summary/);
+  stopReason = "max_tokens";
+  await assert.rejects(compact(input), /did not complete \(length\)/);
 });
 
 test("Pi assistant error messages fail the turn instead of becoming a blank reply", () => {
@@ -385,20 +572,30 @@ test("Pi assistant error messages fail the turn instead of becoming a blank repl
   assert.throws(() => piLastAssistantTextOrThrow(session), /provider quota exhausted/);
 });
 
-test("Pi provider JSON errors are surfaced as readable chat errors", () => {
-  const session = {
+type FailedFields = { errorMessage?: string; providerError?: unknown; rawStopReason?: string };
+const failedSession = (...messages: FailedFields[]) =>
+  ({
     getLastAssistantText: () => undefined,
-    messages: [
-      {
-        role: "assistant",
-        stopReason: "error",
-        errorMessage:
-          '400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low."},"request_id":"req_123"}',
-        content: [],
-      },
-    ],
-  } as unknown as Parameters<typeof piLastAssistantTextOrThrow>[0];
+    messages: messages.map((m) => ({ role: "assistant", stopReason: "error", content: [], ...m })),
+  }) as unknown as Parameters<typeof piTurnError>[0];
+const overloaded = {
+  errorMessage: "529 Overloaded",
+  providerError: {
+    status: 529,
+    type: "overloaded_error",
+    body: { type: "error", error: { type: "overloaded_error", message: "Overloaded" } },
+  },
+};
 
+test("Pi provider errors are surfaced from the structured body as readable chat errors", () => {
+  const session = failedSession({
+    errorMessage: "400 Your credit balance is too low.",
+    providerError: {
+      status: 400,
+      type: "invalid_request_error",
+      body: { type: "error", error: { type: "invalid_request_error", message: "Your credit balance is too low." } },
+    },
+  });
   assert.throws(
     () => piLastAssistantTextOrThrow(session),
     /Model provider API error \(invalid_request_error\): Your credit balance is too low\./,
@@ -406,20 +603,34 @@ test("Pi provider JSON errors are surfaced as readable chat errors", () => {
 });
 
 test("piTurnError recovers the session's structured error when the agent loop rejects generically", () => {
-  const session = {
-    getLastAssistantText: () => undefined,
-    messages: [
-      {
-        role: "assistant",
-        stopReason: "error",
-        errorMessage: '{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}',
-        content: [],
-      },
-    ],
-  } as unknown as Parameters<typeof piTurnError>[0];
-
-  const err = piTurnError(session, new Error("An unknown error occurred"));
+  const err = piTurnError(failedSession(overloaded), new Error("An unknown error occurred"));
   assert.match(err.message, /Model provider API error \(overloaded_error\): Overloaded/);
+});
+
+test("Pi retryability comes from status and type, never errorMessage", () => {
+  const retryable: FailedFields[] = [
+    overloaded,
+    { errorMessage: "500", providerError: { status: 500, type: "api_error" } },
+    { errorMessage: "429", providerError: { status: 429 } },
+    { errorMessage: "fetch failed" },
+  ];
+  for (const fields of retryable) {
+    const err = piTurnError(failedSession(fields), new Error("x"));
+    assert.ok(err instanceof ProviderTurnError && err.retryable, JSON.stringify(fields));
+    assert.equal(turnFailureMessage(err), err.message);
+    assert.throws(() => piLastAssistantTextOrThrow(failedSession(fields)), ProviderTurnError);
+  }
+  const terminal: FailedFields[] = [
+    { errorMessage: "429 overloaded, retry", providerError: { status: 429, code: "insufficient_quota" } },
+    { errorMessage: "rate limit", providerError: { status: 400, type: "invalid_request_error" } },
+    { errorMessage: "503", providerError: { status: 400, code: "context_length_exceeded" } },
+    { errorMessage: "overloaded", providerError: { status: 401, type: "authentication_error" } },
+    { errorMessage: "network error", rawStopReason: "refusal" },
+  ];
+  for (const fields of terminal) {
+    const err = piTurnError(failedSession(fields), new Error("x"));
+    assert.ok(err instanceof ProviderTurnError && !err.retryable, JSON.stringify(fields));
+  }
 });
 
 test("piTurnError falls back to the thrown error when the session has no structured error", () => {
@@ -433,18 +644,7 @@ test("piTurnError falls back to the thrown error when the session has no structu
 });
 
 test("piTurnError ignores a PRIOR turn's stale error when nothing new was appended this prompt", () => {
-  const session = {
-    getLastAssistantText: () => undefined,
-    messages: [
-      {
-        role: "assistant",
-        stopReason: "error",
-        errorMessage: '{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}',
-        content: [],
-      },
-    ],
-  } as unknown as Parameters<typeof piTurnError>[0];
-
+  const session = failedSession(overloaded);
   const err = piTurnError(session, new Error("socket hang up"), 1);
   assert.equal(err.message, "socket hang up");
   const recovered = piTurnError(session, new Error("An unknown error occurred"), 0);
@@ -658,30 +858,6 @@ test("renderDetectPrompt uses prior assistant replies, not assembled prior user 
   assert.match(prompt, /NEWEST message:\nyes, send it/);
 });
 
-test("thinkingBlocksFromContent extracts reasoning, KEEPS signatures (complete WAL), keeps redacted, skips text/tool/empty", () => {
-  const content = [
-    { type: "thinking", thinking: "Let me check the docs first.", thinkingSignature: "AAAA-opaque-base64-token" },
-    { type: "text", text: "On it." },
-    { type: "toolCall", id: "t1", name: "execute", arguments: { command: "ls" } },
-    { type: "thinking", thinking: "   ", thinkingSignature: "sig" },
-    { type: "thinking", thinking: "", thinkingSignature: "encrypted-payload", redacted: true },
-    { type: "thinking", thinking: "No signature here." },
-  ];
-  const out = thinkingBlocksFromContent(content);
-  assert.deepEqual(out, [
-    { thinking: "Let me check the docs first.", thinkingSignature: "AAAA-opaque-base64-token" },
-    { thinking: "", redacted: true, thinkingSignature: "encrypted-payload" },
-    { thinking: "No signature here." },
-  ]);
-});
-
-test("thinkingBlocksFromContent is defensive: non-arrays and non-thinking content yield nothing", () => {
-  assert.deepEqual(thinkingBlocksFromContent(undefined), []);
-  assert.deepEqual(thinkingBlocksFromContent(null), []);
-  assert.deepEqual(thinkingBlocksFromContent("a string"), []);
-  assert.deepEqual(thinkingBlocksFromContent([{ type: "text", text: "hi" }]), []);
-});
-
 test("resolveConfiguredModelId: known ids pass through, unknown ids fall back to the default", () => {
   assert.equal(resolveConfiguredModelId("claude-opus-4-8"), "claude-opus-4-8");
   assert.equal(resolveConfiguredModelId(undefined), DEFAULT_AGENT_MODEL_ID);
@@ -689,23 +865,50 @@ test("resolveConfiguredModelId: known ids pass through, unknown ids fall back to
   assert.equal(resolveConfiguredModelId("claude-dropped-by-pi-ai", "claude-opus-4-8"), "claude-opus-4-8");
 });
 
-test("isProviderRefusal matches Anthropic's ToS-refusal wording and nothing else", () => {
-  assert.equal(
-    isProviderRefusal(
-      "Anthropic API error (invalid_request_error): This request was blocked as it seems to violate Anthropic's Terms of Service restrictions on reverse engineering or duplicating model outputs. To learn more, visit https://www.anthropic.com/legal/commercial-terms. API integrators: you can reduce refusals for your users by configuring a fallback model — see https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback.",
-    ),
-    true,
-  );
-  assert.equal(isProviderRefusal("This request seems to violate Anthropic’s usage policy."), true);
-  assert.equal(isProviderRefusal("Anthropic API error (overloaded_error): Overloaded"), false);
-  assert.equal(isProviderRefusal("prompt is too long: 250000 tokens > 200000 maximum"), false);
-  assert.equal(isProviderRefusal(undefined), false);
+test("Pi provider errors are classified once into a typed code from structured fields", () => {
+  const classify = (fields: FailedFields) => piTurnError(failedSession(fields), new Error("x")) as ProviderTurnError;
+  const budget = classify({
+    errorMessage: "429: Budget has been exceeded! Limit=$1000.00",
+    providerError: {
+      status: 429,
+      type: "budget_exceeded",
+      code: "400",
+      body: { message: "Budget has been exceeded! Limit=$1000.00", type: "budget_exceeded" },
+    },
+  });
+  assert.deepEqual([budget.code, budget.status, budget.retryable], ["model_budget", 429, false]);
+  assert.match(budget.raw, /Limit=\$1000\.00/, "the gateway's full text is kept for operators");
+  assert.match(budget.message, /Budget has been exceeded/);
+  const cases: Array<[FailedFields, string, number | undefined]> = [
+    [{ providerError: { status: 429, type: "rate_limit_error" } }, "rate_limit", 429],
+    [{ providerError: { status: 401, type: "authentication_error" } }, "auth", 401],
+    [{ providerError: { status: 403 } }, "auth", 403],
+    [{ providerError: { status: 400, code: "context_length_exceeded" } }, "context_too_long", 400],
+    [{ providerError: { status: 529, type: "overloaded_error" } }, "transient", 529],
+    [{ rawStopReason: "refusal" }, "refusal", undefined],
+    // Anthropic documents prompt-too-long only as a 400 invalid_request_error, so it is a bad_request, not context_too_long.
+    [
+      {
+        errorMessage: "prompt is too long: 250000 tokens > 200000 maximum",
+        providerError: { status: 400, type: "invalid_request_error" },
+      },
+      "bad_request",
+      400,
+    ],
+    [{ errorMessage: "The model refused to complete the request" }, "unknown", undefined],
+  ];
+  for (const [fields, code, status] of cases) {
+    const err = classify(fields);
+    assert.equal(err.code, code, JSON.stringify(fields));
+    assert.equal(err.status, status, JSON.stringify(fields));
+  }
 });
 
 test("providerRefusalError finds this prompt's refusal but never a prior turn's", () => {
   const refusalMsg = {
     role: "assistant",
     stopReason: "error",
+    rawStopReason: "refusal",
     errorMessage:
       "This request was blocked as it seems to violate Anthropic's Terms of Service restrictions on reverse engineering or duplicating model outputs.",
     content: [],
@@ -734,6 +937,12 @@ test("refusal fallback drawdown: Fable -> Opus, Opus -> Sonnet, never the refuse
   assert.equal(refusalFallbackModelId("claude-fable-5-1"), "claude-opus-5");
   assert.equal(refusalFallbackModelId("claude-fable-5"), "claude-opus-5");
   assert.equal(refusalFallbackModelId("claude-opus-5"), "claude-sonnet-5");
+  assert.equal(refusalFallbackModelId("claude-opus-5", "gpt-6-sol"), "gpt-6-sol");
+  assert.equal(refusalFallbackModelId("gpt-6-sol", "gpt-6-sol"), "claude-opus-5");
+  assert.equal(
+    refusalFallbackModelId("claude-opus-5", "not-a-pi-model", (id) => id !== "not-a-pi-model"),
+    "claude-sonnet-5",
+  );
   for (const id of REFUSAL_FALLBACK_MODEL_IDS) {
     assert.notEqual(refusalFallbackModelId(id), id);
     assert.equal(resolveModel(id)?.provider, "anthropic");
@@ -746,4 +955,65 @@ test("resolveConfiguredModelId: an unresolvable default is rejected too, so auxi
   assert.doesNotThrow(() =>
     getRequiredModel(auxiliaryModelFor(resolveConfiguredModelId(undefined, "anthropic/claude-sonnet-4-5"))),
   );
+});
+
+test("Pi judge uses supported reasoning effort when configured with Astra", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  let request: { model?: string; reasoning?: { effort?: string } } | undefined;
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    const encoded = new Headers(init?.headers).get("content-encoding") === "zstd";
+    const text = encoded ? zstdDecompressSync(init?.body as Uint8Array).toString() : String(init?.body);
+    request = JSON.parse(text);
+    return new Response(JSON.stringify({ error: { message: "offline judge test" } }), { status: 400 });
+  }) as typeof fetch;
+  const harness = createPiHarness({
+    judgeModelId: "gpt-6-astra",
+    resolveProviderKeys: async () => ({ openai: "sk-offline-test-key" }),
+  });
+  await assert.rejects(harness.models.judge!("Judge the answer.", "answer"), /offline judge test/);
+  assert.ok(request);
+  assert.equal(request.model, "gpt-6-astra");
+  assert.equal(request.reasoning?.effort, "low");
+});
+
+test("oneShot stops a request whose abort lands before Pi starts its run", { timeout: 10_000 }, async (t) => {
+  let requests = 0;
+  const server = createServer((request) => {
+    requests += 1;
+    request.resume();
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(
+    () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  );
+  const address = server.address();
+  assert(address && typeof address !== "string");
+  const baseModel = getBuiltinModel("anthropic", "claude-haiku-4-5");
+  assert(baseModel);
+  const model = { ...baseModel, baseUrl: `http://127.0.0.1:${address.port}` };
+  const controller = new AbortController();
+  const signal = controller.signal;
+  const subscribe = signal.addEventListener.bind(signal);
+  signal.addEventListener = ((...args: Parameters<AbortSignal["addEventListener"]>) => {
+    subscribe(...args);
+    controller.abort();
+  }) as AbortSignal["addEventListener"];
+
+  const outcome = await oneShot("pi-abort-test", model, "test-key", "system", "hello", { signal }).then(
+    (text) => ({ text }),
+    (error: unknown) => ({ error }),
+  );
+
+  assert.deepEqual(outcome, { text: undefined });
+  assert.equal(requests, 0);
 });

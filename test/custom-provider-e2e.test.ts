@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createInsecureTestServer } from "../src/api/server.ts";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 import { oneShot } from "../src/harness/pi-harness.ts";
 import { resolveModel, modelSupportedByHarness, modelServiceable } from "../src/model/pi-models.ts";
@@ -19,6 +19,7 @@ import { setCustomProviders } from "../src/model/custom-providers.ts";
 import { createCustomProviderStore } from "../src/model/custom-provider-store.ts";
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
 import type { Api, Model } from "@earendil-works/pi-ai";
+import { verificationUpstream } from "./support/model-verification-upstream.ts";
 
 const ADMIN = { "content-type": "application/json", "x-admin-actor": "admin-alice@default-org" };
 
@@ -127,7 +128,7 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
         protocol: "openai",
         baseUrl: upstreamUrl,
         apiKey: "sk-qa-good",
-        models: [{ id: "qa-chat", name: "QA Chat", contextWindow: 64000, maxTokens: 4096 }],
+        models: [{ id: "qa-chat", name: "QA Chat", contextWindow: 64000, maxTokens: 4096, reasoning: true }],
       }),
     });
     assert.equal(r.status, 200);
@@ -143,14 +144,13 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
     assert.ok(!listing.includes("sk-qa-good"), "key never readable");
 
     // 5. model resolves like a built-in and is catalog-visible
-    const model = resolveModel("qa-chat");
+    const model = resolveModel("custom/qa/qa-chat");
     assert.ok(model, "custom model resolves");
     assert.equal(model!.provider, "qa");
+    assert.equal(model!.reasoning, true);
     assert.equal((model as { baseUrl?: string }).baseUrl, upstreamUrl);
-    assert.equal(modelSupportedByHarness("qa-chat", "pi"), true);
-    assert.equal(modelSupportedByHarness("qa-chat", "opencode"), true);
-    assert.equal(modelSupportedByHarness("qa-chat", "codex"), false);
-    assert.equal(modelServiceable("qa-chat", { anthropic: false, openai: false, openrouter: false }), true);
+    assert.equal(modelSupportedByHarness("custom/qa/qa-chat", "pi"), true);
+    assert.equal(modelServiceable("custom/qa/qa-chat", { anthropic: false, openai: false, openrouter: false }), true);
 
     // 6. REAL model call through QM's pi path → fake upstream answers
     const reply = await oneShot(
@@ -183,7 +183,7 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
     // 8. delete: models leave the registry
     r = await api("/v1/admin/custom-providers/qa", { method: "DELETE" });
     assert.equal(r.status, 200);
-    assert.equal(resolveModel("qa-chat"), undefined, "model gone after delete");
+    assert.equal(resolveModel("custom/qa/qa-chat"), undefined, "model gone after delete");
     r = await api("/v1/admin/custom-providers/qa", { method: "DELETE" });
     assert.equal(r.status, 404, "second delete 404s");
 
@@ -193,6 +193,78 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
   } finally {
     server.close();
     upstream.close();
+  }
+});
+
+test("QA: openai-responses custom provider serves a real turn through the generated Pi registry", async () => {
+  const upstream = await verificationUpstream();
+  const upstreamUrl = `${upstream.url}/v1`;
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "qa-responses-")) }));
+  const server = createInsecureTestServer(built.app, {
+    config: built.config,
+    modelCredentials: built.modelCredentials,
+    customProviders: built.customProviders,
+    refreshCustomProviders: built.refreshCustomProviders,
+    admin: built.admin,
+    auditLog: built.auditLog,
+    harnessId: "pi",
+  });
+  server.listen(0);
+  const base = `http://localhost:${(server.address() as AddressInfo).port}`;
+  const api = (path: string, init?: RequestInit) => fetch(`${base}${path}`, { headers: ADMIN, ...init });
+  const spec = {
+    name: "Responses Provider",
+    protocol: "openai-responses",
+    baseUrl: upstreamUrl,
+    models: [{ id: "responses-custom-model", name: "Responses Custom Model" }],
+  };
+  try {
+    let response = await api("/v1/admin/custom-providers/responses-provider", {
+      method: "PUT",
+      body: JSON.stringify({ ...spec, apiKey: "sk-responses-test" }),
+    });
+    assert.equal(response.status, 200);
+    const validation = upstream.requests.find((request) => request.path === "/v1/models");
+    assert.equal(validation?.authorization, "Bearer sk-responses-test");
+    assert.equal(((await response.json()) as { status: { protocol: string } }).status.protocol, "openai-responses");
+
+    const model = resolveModel("custom/responses-provider/responses-custom-model");
+    assert.ok(model);
+    assert.equal(model.api, "openai-responses");
+    const reply = await oneShot(
+      "qa-responses",
+      model as Model<Api>,
+      { "responses-provider": "sk-responses-test" },
+      "be terse",
+      "reply",
+    );
+    assert.equal(reply, "VERIFIED MODEL REPLY");
+    const request = upstream.requests.find((item) => item.path === "/v1/responses");
+    assert.ok(request);
+    assert.equal(request.body.model, "responses-custom-model");
+    assert.equal(request.body.stream, true);
+    assert.ok(Array.isArray(request.body.input));
+    assert.equal(
+      upstream.requests.some((item) => item.path.endsWith("/chat/completions")),
+      false,
+    );
+
+    response = await api("/v1/admin/custom-providers/responses-provider", {
+      method: "PUT",
+      body: JSON.stringify({ ...spec, name: "Responses Provider Edited" }),
+    });
+    assert.equal(response.status, 200);
+    response = await api("/v1/admin/custom-providers");
+    const providers = (await response.json()) as {
+      providers: Array<{ id: string; name: string; protocol: string; hasKey: boolean }>;
+    };
+    const saved = providers.providers.find((provider) => provider.id === "responses-provider");
+    assert.equal(saved?.name, "Responses Provider Edited");
+    assert.equal(saved?.protocol, "openai-responses");
+    assert.equal(saved?.hasKey, true);
+  } finally {
+    server.close();
+    await upstream.close();
   }
 });
 
@@ -265,7 +337,7 @@ test("QA: anthropic-protocol custom provider serves a real turn (correct wire sh
       }),
     });
     assert.equal(r.status, 200, "anthropic-protocol registration validates against /v1/models with x-api-key");
-    const model = resolveModel("claude-compat");
+    const model = resolveModel("custom/antcompat/claude-compat");
     assert.ok(model);
     assert.equal((model as { api?: string }).api, "anthropic-messages");
     const reply = await oneShot("qa-ant", model as unknown as Model<Api>, { antcompat: "sk-ant-qa" }, "terse", "go");
@@ -305,7 +377,7 @@ test("QA: registrations survive a restart (shared durable backing + same secret)
   assert.equal(await second.resolveKey("survivor"), "sk-live-key", "key decrypts after restart with the same secret");
   // and the hydration path wires it into the runtime registry
   setCustomProviders(enabled);
-  assert.ok(resolveModel("survivor-model"), "hydrated model resolves");
+  assert.ok(resolveModel("custom/survivor/survivor-model"), "hydrated model resolves");
   setCustomProviders([]);
 });
 
@@ -331,4 +403,65 @@ test("QA: a corrupt stored key degrades that provider only — admin surface sta
   assert.equal(statuses[0]?.hasKey, true, "admin surface (no secrets) unaffected");
   const enabled = await reader.enabled();
   assert.equal(enabled[0]?.id, "corrupted", "spec listing unaffected — only the key is lost");
+});
+
+test("QA: a custom model named like a built-in registers and sends its own model id upstream", async () => {
+  const seen: Array<{ model?: string; auth?: string }> = [];
+  const upstream = createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      if (!req.url?.endsWith("/chat/completions")) {
+        res.writeHead(404);
+        return res.end();
+      }
+      seen.push({ model: (JSON.parse(body) as { model?: string }).model, auth: req.headers.authorization });
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      const chunk = (delta: object, finish: string | null) =>
+        `data: ${JSON.stringify({ id: "cmpl-own", object: "chat.completion.chunk", model: "claude-opus-5", choices: [{ index: 0, delta, finish_reason: finish }], usage: finish ? { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 } : undefined })}\n\n`;
+      res.write(chunk({ role: "assistant", content: "OWN KEY REPLY" }, null));
+      res.write(chunk({}, "stop"));
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+  });
+  await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", r));
+  const upstreamUrl = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}/v1`;
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "qa-custom-own-")) }));
+  const server = createInsecureTestServer(built.app, {
+    config: built.config,
+    modelCredentials: built.modelCredentials,
+    customProviders: built.customProviders,
+    refreshCustomProviders: built.refreshCustomProviders,
+    admin: built.admin,
+    auditLog: built.auditLog,
+    harnessId: "pi",
+  });
+  server.listen(0);
+  const base = `http://localhost:${(server.address() as AddressInfo).port}`;
+  try {
+    const r = await fetch(`${base}/v1/admin/custom-providers/own`, {
+      method: "PUT",
+      headers: ADMIN,
+      body: JSON.stringify({
+        name: "Own endpoint",
+        protocol: "openai",
+        baseUrl: upstreamUrl,
+        apiKey: "sk-own",
+        validate: false,
+        models: [{ id: "claude-opus-5", name: "Claude Opus Mine" }],
+      }),
+    });
+    assert.equal(r.status, 200);
+    const model = resolveModel("custom/own/claude-opus-5");
+    assert.equal(model?.provider, "own");
+    assert.equal(model?.name, "Claude Opus Mine");
+    assert.equal(String(resolveModel("claude-opus-5")?.provider), "anthropic");
+    const reply = await oneShot("qa", model as unknown as Model<Api>, { own: "sk-own" }, "you are terse", "hi");
+    assert.equal(reply, "OWN KEY REPLY");
+    assert.deepEqual(seen, [{ model: "claude-opus-5", auth: "Bearer sk-own" }]);
+  } finally {
+    server.close();
+    upstream.close();
+  }
 });
