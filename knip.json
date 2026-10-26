@@ -9,6 +9,7 @@
   "workspaces": {
     ".": {
       "entry": [
+        ".github/scripts/garnet-*.mjs",
         "src/migrate-main.ts",
         "src/sandbox/local-sandbox.ts",
         "scripts/aws-deploy-smoke.ts",

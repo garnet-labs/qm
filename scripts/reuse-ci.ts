@@ -6,6 +6,7 @@ export const CI_JOBS = [
   "Core typecheck",
   ...Array.from({ length: 5 }, (_, i) => `Core tests (${i + 1}/5)`),
   "Core",
+  "Garnet Runtime Review",
   "CLI",
   "Lint",
   "Production dependency audit",

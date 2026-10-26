@@ -128,26 +128,34 @@ jobs:
 
   garnet-runtime-review:
     name: Garnet Runtime Review
-    needs:
-      - core
+    needs: reuse
+    if: always() && !cancelled()
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
+      - name: Reuse the exact successful PR tree
+        if: needs.reuse.outputs.reusable == 'true'
+        run: echo "Full checks already passed for this exact tree; see Resolve exact tested tree."
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        if: needs.reuse.outputs.reusable != 'true'
       - name: Garnet Runtime Review
-        uses: garnet-org/action@3d47f4a9004f7356c980a0e8d420ef5984750e3c # v2.2.0
+        if: needs.reuse.outputs.reusable != 'true'
+        uses: garnet-org/action@8cccc85403e4ac4e05fb7822c994d3c199f9aa57 # v2.4.0
         with:
           api_token: ${{ secrets.GARNET_API_TOKEN }}
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        if: needs.reuse.outputs.reusable != 'true'
         with:
           node-version-file: .node-version
           cache: npm
           cache-dependency-path: package-lock.json
       - name: Install and run one core test shard
+        if: needs.reuse.outputs.reusable != 'true'
         env:
           CORE_TEST_SHARD: 1/5
         run: |
           npm ci
+          npm run build:connector-sdk
           npm run test:root:shard
 
   cli:
