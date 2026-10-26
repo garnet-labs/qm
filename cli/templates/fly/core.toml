@@ -6,7 +6,6 @@ primary_region = "sjc"
   PORT = "8080"
   ORG_ID = "acme"
   HARNESS = "pi"
-  PI_SYSTEM_CACHE_SPLIT = "1"
   SESSION_STORE = "postgres"
   RUN_STORE = "postgres"
   SNAPSHOT_STORE = "s3"
@@ -19,12 +18,17 @@ primary_region = "sjc"
   REQUIRE_SIGNED_PORTAL_IDENTITY = "1"
   FLY_ORG = "personal"
   FLY_DEPLOY_APP_PREFIX = "qm-d"
+  SANDBOX_BACKEND = "sprites"
+  SECURITY_SCREEN = "off"
 [deploy]
   strategy = "bluegreen"
 
+[[restart]]
+  policy = "always"
+
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "2gb"
+  size = "performance-2x"
+  memory = "4gb"
 
 kill_signal = "SIGTERM"
 kill_timeout = "300s"

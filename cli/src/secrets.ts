@@ -4,8 +4,9 @@ import { TARGET_ENV_DEFAULTS } from "./target-env-defaults.ts";
 import { deploymentSecretValue } from "./util.ts";
 
 type SecretCondition =
+  | { kind: "background-work-control" }
+  | { kind: "sandbox-backend"; backend: string }
   | { kind: "env-equals"; service: DeclaredServiceName; name: string; value: string }
-  | { kind: "env-in"; service: DeclaredServiceName; name: string; values: string[] }
   | { kind: "env-absent"; service: DeclaredServiceName; name: string }
   | { kind: "env-all-absent"; service: DeclaredServiceName; names: string[] }
   | { kind: "env-present"; service: DeclaredServiceName; name: string }
@@ -58,22 +59,14 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
   {
     name: "OPENAI_API_KEY",
     service: "core",
-    required: {
-      when: {
-        kind: "any",
-        conditions: [
-          { kind: "env-equals", service: "core", name: "HARNESS", value: "codex" },
-          { kind: "model-provider", provider: "openai" },
-        ],
-      },
-    },
+    required: { when: { kind: "model-provider", provider: "openai" }, optionalOtherwise: true },
     description:
-      'OpenAI API key: the Codex harness needs it (its CLI cannot do browser OAuth in a container), and it bills the base model when modelProvider is "openai".',
+      'OpenAI API key: bills the base model when modelProvider is "openai", an optional deployment fallback otherwise.',
   },
   {
     name: "PUBLIC_API_URL",
     service: "core",
-    required: { when: { kind: "env-in", service: "core", name: "HARNESS", values: ["pi", "opencode", "codex"] } },
+    required: { when: { kind: "env-equals", service: "core", name: "HARNESS", value: "pi" } },
     description: "Public core self-API URL reachable from agent sandboxes.",
   },
   {
@@ -81,6 +74,13 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
     service: "core",
     required: true,
     description: "HMAC key shared by core and surface plugins.",
+    generate: MINT_LOCALLY,
+  },
+  {
+    name: "DEPLOYMENT_CONTROL_SECRET",
+    service: "core",
+    required: { when: { kind: "background-work-control" } },
+    description: "Deployment ownership credential held only by core and the privileged deployment operator.",
     generate: MINT_LOCALLY,
   },
   {
@@ -115,8 +115,21 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
     name: "FLY_DEPLOY_API_TOKEN",
     service: "core",
     required: { when: { kind: "env-equals", service: "core", name: "DEPLOY_PROVIDER", value: "fly" } },
-    description: "Fly organization token used only by qm's opt-in per-deployment app publisher.",
-    generate: "fly tokens create org -o <fly-org> -x 8760h",
+    description: "Fly publisher token: app-scoped for FLY_DEPLOY_SHARED_APP_NAME, organization-scoped otherwise.",
+  },
+  {
+    name: "FLY_DEPLOY_WIREGUARD_PEERS",
+    service: "core",
+    required: {
+      when: {
+        kind: "all",
+        conditions: [
+          { kind: "env-equals", service: "core", name: "DEPLOY_PROVIDER", value: "fly" },
+          { kind: "env-present", service: "core", name: "FLY_DEPLOY_SHARED_APP_NAME" },
+        ],
+      },
+    },
+    description: "JSON array of distinct private ingress WireGuard peer configurations for shared Fly publishing.",
   },
   {
     name: "PORTER_DEPLOY_API_TOKEN",
@@ -125,7 +138,7 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
       when: {
         kind: "any",
         conditions: [
-          { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "porter" },
+          { kind: "sandbox-backend", backend: "porter" },
           { kind: "env-equals", service: "core", name: "DEPLOY_PROVIDER", value: "porter" },
         ],
       },
@@ -138,33 +151,41 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
   {
     name: "SPRITES_TOKEN",
     service: "core",
-    required: { when: { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "sprites" } },
+    required: { when: { kind: "sandbox-backend", backend: "sprites" } },
     description: "Fly Sprites API token for the agent-computer substrate.",
     generate: "sprite login   # then copy the token from ~/.sprite/credentials",
   },
   {
     name: "E2B_API_KEY",
     service: "core",
-    required: { when: { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "e2b" } },
+    required: { when: { kind: "sandbox-backend", backend: "e2b" } },
     description: "E2B API key used by the e2b sandbox backend (from e2b.dev dashboard).",
+  },
+  {
+    name: "DO_AGENTS_API_TOKEN",
+    service: "core",
+    required: { when: { kind: "sandbox-backend", backend: "do-managed-agents" } },
+    description:
+      "DigitalOcean IAM token for the DigitalOcean Managed Agents sandbox backend. Carries the team identity that owns the sandbox sessions, and authenticates both the session REST calls and the port-forward tunnel that carries exec and file transfer.",
+    generate: "doctl auth init   # then create a personal access token at cloud.digitalocean.com/account/api/tokens",
   },
   {
     name: "MODAL_TOKEN_ID",
     service: "core",
-    required: { when: { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "modal" } },
+    required: { when: { kind: "sandbox-backend", backend: "modal" } },
     description: "Modal token id used by the modal sandbox backend.",
     generate: "modal token new   # or create a token in the Modal dashboard",
   },
   {
     name: "MODAL_TOKEN_SECRET",
     service: "core",
-    required: { when: { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "modal" } },
+    required: { when: { kind: "sandbox-backend", backend: "modal" } },
     description: "Modal token secret paired with MODAL_TOKEN_ID.",
   },
   {
     name: "SMOLMACHINES_TOKEN",
     service: "core",
-    required: { when: { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "smolmachines" } },
+    required: { when: { kind: "sandbox-backend", backend: "smolmachines" } },
     description: "smolmachines API key for the agent-computer substrate.",
     generate: "create an API key in the smolmachines console (https://smolmachines.com/console)",
   },
@@ -175,13 +196,20 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
       when: {
         kind: "any",
         conditions: [
-          { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "agent37" },
+          { kind: "sandbox-backend", backend: "agent37" },
           { kind: "env-equals", service: "core", name: "SANDBOX_SECONDARY_BACKEND", value: "agent37" },
         ],
       },
     },
     description: "Agent37 API key for the agent-computer substrate.",
     generate: "mint a key in the Agent37 dashboard (https://agent37.com/dashboard/cloud/api-keys)",
+  },
+  {
+    name: "SUPERSERVE_API_KEY",
+    service: "core",
+    required: { when: { kind: "sandbox-backend", backend: "superserve" } },
+    description: "API key for Superserve sandboxes.",
+    generate: "create an API key in the Superserve console (https://console.superserve.ai/api-keys)",
   },
   {
     name: "DATABASE_URL",
@@ -275,11 +303,23 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
     generate: MINT_LOCALLY,
   },
   {
+    name: "INBOX_USERS",
+    service: "web-ui",
+    required: false,
+    description: "Comma-separated principals allowed to access Inbox, Calendar, and Design System.",
+  },
+  {
     name: "CORE_SIGNING_SECRET",
     service: "admin",
     required: true,
     description: "HMAC key shared by core and surface plugins.",
     generate: MINT_LOCALLY,
+  },
+  {
+    name: "INBOX_USERS",
+    service: "admin",
+    required: false,
+    description: "Comma-separated principals allowed to access Inbox, Calendar, and Design System.",
   },
   {
     name: "OIDC_CLIENT_ID",
@@ -363,6 +403,20 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
     generate: MINT_LOCALLY,
   },
   {
+    name: "CAPABILITY_SECRET",
+    service: "egress-proxy",
+    required: true,
+    description: "Signing key for scoped agent capabilities and egress grants; must differ from every other key.",
+    generate: MINT_LOCALLY,
+  },
+  {
+    name: "CORE_SIGNING_SECRET",
+    service: "egress-proxy",
+    required: true,
+    description: "HMAC key shared by core and surface plugins.",
+    generate: MINT_LOCALLY,
+  },
+  {
     name: "AUTH_SIGNING_JWK",
     service: "auth",
     required: true,
@@ -428,6 +482,13 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
     description: "Email addresses allowed to sign in; the portal enforces the same list the broker does.",
   },
   {
+    name: "AUTH_PASSWORD_USERS",
+    service: "auth",
+    required: false,
+    description:
+      "Optional <email>:<scrypt-hash> entries that may sign in with a password while email or an identity provider is still being set up; each address must also be allowed to sign in.",
+  },
+  {
     name: "AUTH_EMAIL_FROM",
     service: "auth",
     required: false,
@@ -486,6 +547,15 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
 ];
 
 function conditionMatches(config: QmConfig, condition: SecretCondition): boolean {
+  if (condition.kind === "background-work-control")
+    return config.target === "aws" && config.aws?.backgroundWorkControl === true;
+  if (condition.kind === "sandbox-backend") {
+    const backend =
+      config.env.core?.SANDBOX_BACKEND ??
+      config.sandbox?.backend ??
+      targetEnvDefault(config, "core", "SANDBOX_BACKEND");
+    return backend?.trim() === condition.backend;
+  }
   if (condition.kind === "service-enabled") return config.services.includes(condition.service);
   if (condition.kind === "service-absent") return !config.services.includes(condition.service);
   if (condition.kind === "all") return condition.conditions.every((nested) => conditionMatches(config, nested));
@@ -504,7 +574,6 @@ function conditionMatches(config: QmConfig, condition: SecretCondition): boolean
   )?.trim();
   if (condition.kind === "env-absent") return !value;
   if (condition.kind === "env-present") return Boolean(value);
-  if (condition.kind === "env-in") return value !== undefined && condition.values.includes(value);
   return value === condition.value;
 }
 
@@ -612,6 +681,9 @@ export function computedSecrets(config: QmConfig): ComputedSecret[] {
       });
     }
   }
+  const control = byName.get("DEPLOYMENT_CONTROL_SECRET");
+  if (control && (control.services.some((service) => service !== "core") || control.aliases?.length))
+    throw new Error("DEPLOYMENT_CONTROL_SECRET must be delivered only to core under its original name");
   const secrets = [...byName.values()]
     .map((secret) => ({
       ...secret,
@@ -710,6 +782,8 @@ function requiresOtherEmailTransport(config: QmConfig, condition: SecretConditio
 }
 
 function conditionClause(condition: SecretCondition): string {
+  if (condition.kind === "background-work-control") return "aws.backgroundWorkControl is enabled";
+  if (condition.kind === "sandbox-backend") return `SANDBOX_BACKEND selects ${condition.backend}`;
   if (condition.kind === "service-enabled") return `the ${condition.service} service is enabled`;
   if (condition.kind === "service-absent") return `the ${condition.service} service is not enabled`;
   if (condition.kind === "all") return condition.conditions.map(conditionClause).join(" and ");
@@ -719,8 +793,6 @@ function conditionClause(condition: SecretCondition): string {
     return `none of env.${condition.service}.{${condition.names.join(", ")}} are set`;
   if (condition.kind === "env-absent") return `env.${condition.service}.${condition.name} is not set`;
   if (condition.kind === "env-present") return `env.${condition.service}.${condition.name} is set`;
-  if (condition.kind === "env-in")
-    return `env.${condition.service}.${condition.name} is one of ${condition.values.map((value) => JSON.stringify(value)).join(", ")}`;
   if (condition.kind === "model-provider") return `modelProvider is ${JSON.stringify(condition.provider)}`;
   return `env.${condition.service}.${condition.name} is ${JSON.stringify(condition.value)}`;
 }

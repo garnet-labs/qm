@@ -2,7 +2,7 @@ import type { Webhook } from "../../types.ts";
 import { WEBHOOK_SCHEMES } from "../../webhooks/verifiers.ts";
 import type { CreateWebhookInput } from "../../webhooks/webhook-store.ts";
 import { errMessage } from "../../util/errors.ts";
-import { canAdministerWebhook } from "../control-service.ts";
+import { canAdministerWebhook, editWebhookTask } from "../control-service.ts";
 import { PayloadTooLargeError, readRawBody, sendJson } from "../http.ts";
 import { isObj } from "./shared.ts";
 import type { ApiCtx, BaseCtx, Route } from "./route.ts";
@@ -80,6 +80,8 @@ async function incomingWebhook(ctx: BaseCtx): Promise<void> {
 
 const WEBHOOK_ERROR_STATUS: Record<string, number> = {
   bad_request: 400,
+  forbidden: 403,
+  not_found: 404,
   unknown_destination: 400,
   webhook_create_failed: 400,
 };
@@ -144,6 +146,16 @@ async function listWebhooks(ctx: ApiCtx): Promise<void> {
   });
 }
 
+async function listWebhookEvents(ctx: ApiCtx): Promise<void> {
+  const { res, app, params, capability, actor, url } = ctx;
+  const webhook = await app.getWebhook(params.id!);
+  const viewer = capability?.actorId ?? actor?.p ?? url.searchParams.get("viewer");
+  if (!viewer || !webhook || !(await canAdministerWebhook(app, webhook, viewer))) {
+    return sendJson(res, 404, { error: "not_found" });
+  }
+  return sendJson(res, 200, { events: await app.listWebhookEvents(webhook.id, viewer) });
+}
+
 async function setWebhookEnabled(ctx: ApiCtx, enabled: boolean): Promise<void> {
   const { res, app, params, capability, actor, url } = ctx;
   const id = params.id!;
@@ -161,6 +173,18 @@ async function setWebhookEnabled(ctx: ApiCtx, enabled: boolean): Promise<void> {
   return sendJson(res, 200, { ok: true });
 }
 
+async function updateWebhook(ctx: ApiCtx): Promise<void> {
+  const { res, app, deps, params, capability, actor, url, body } = ctx;
+  const action = isObj(body) && typeof body.action === "string" ? body.action : "";
+  const principalId = actor?.p ?? url.searchParams.get("principalId");
+  if (!capability && !principalId) return sendJson(res, 404, { error: "not_found" });
+  const r = capability
+    ? await deps.control.updateWebhook(params.id!, { action }, capability)
+    : await editWebhookTask(app, params.id!, action, principalId!);
+  if (!r.ok) return sendJson(res, WEBHOOK_ERROR_STATUS[r.code] ?? 400, { error: r.code, message: r.message });
+  return sendJson(res, 200, { webhook: redactWebhook(r.webhook), url: inboundUrl(deps.publicUrl, r.webhook.id) });
+}
+
 const disableWebhook = (ctx: ApiCtx): Promise<void> => setWebhookEnabled(ctx, false);
 const enableWebhook = (ctx: ApiCtx): Promise<void> => setWebhookEnabled(ctx, true);
 
@@ -169,8 +193,22 @@ export const webhookRawRoutes: ReadonlyArray<Route<BaseCtx>> = [
 ];
 
 export const webhookRoutes: ReadonlyArray<Route<ApiCtx>> = [
-  { method: "POST", path: "/v1/webhooks", auth: "either", handle: createWebhook },
-  { method: "GET", path: "/v1/webhooks", auth: "either", handle: listWebhooks },
-  { method: "POST", path: "/v1/webhooks/:id/disable", auth: "either", handle: disableWebhook },
+  { method: "POST", path: "/v1/webhooks", actor: "body.createdBy", auth: "either", handle: createWebhook },
+  { method: "GET", path: "/v1/webhooks", actor: "query.viewer", auth: "either", handle: listWebhooks },
+  { method: "GET", path: "/v1/webhooks/:id/events", actor: "query.viewer", auth: "either", handle: listWebhookEvents },
+  {
+    method: "POST",
+    path: "/v1/webhooks/:id/update",
+    actor: "query.principalId",
+    auth: "either",
+    handle: updateWebhook,
+  },
+  {
+    method: "POST",
+    path: "/v1/webhooks/:id/disable",
+    actor: "query.principalId",
+    auth: "either",
+    handle: disableWebhook,
+  },
   { method: "POST", path: "/v1/webhooks/:id/enable", auth: "either", handle: enableWebhook },
 ];

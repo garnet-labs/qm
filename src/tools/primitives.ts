@@ -1,16 +1,31 @@
+import type { AdminToolAccess } from "./admin.ts";
+import { parkedOutputKey, type ToolOutputStore } from "../sessions/tool-output.ts";
+import { rankedSkills } from "../skills/materialize.ts";
+import type { SkillResolution } from "../skills/skill-store.ts";
+import {
+  prepareExecutionFiles,
+  processCredentialFiles,
+  type ExecutionFileCredential,
+} from "../credentials/execute-files.ts";
+import type { MemoryCaptureMetadata } from "../memory/facts.ts";
+import { disclosedMemory } from "../memory/disclosure.ts";
+import { MaskedExecutionError, executionSecretEnv, createExactSecretValueMasker } from "../security/secret-masking.ts";
+import { withAbort, withTimeout } from "../util/async.ts";
 import type { RuntimeRequest, RuntimeResult } from "../harness/runtime-types.ts";
 import { readContextFile } from "../resolution/context-files.ts";
-import { contextMemory, type TurnContext } from "../resolution/turn-context.ts";
-import { randomUUID } from "node:crypto";
-import type { SandboxResources } from "../sandbox/sandbox-resources.ts";
+import { type TurnContext } from "../resolution/turn-context.ts";
+import { canReadNotebook, readNotebook, searchNotebooks } from "../memory/cross-scope.ts";
+import type { SandboxAccessPlan, SandboxResource, SandboxResources } from "../sandbox/sandbox-resources.ts";
 import { join } from "node:path";
+import { workspacePathOf } from "../sandbox/exec-file-ops.ts";
+import { DROPPED_PROXY_ENV } from "../sandbox/sandbox-env.ts";
 import { interpolateSplitEnv } from "../deployment/deployment-layer.ts";
 import type { CredentialPathSpec } from "../credentials/resident-paths.ts";
 import type { ComputerStatus, ExecResult, Sandbox, SandboxHandle } from "../sandbox/sandbox.ts";
-import { ROUTE_CACHE_TTL_MS, type SandboxBackendName } from "../sandbox/sandbox-routing.ts";
-import type { SandboxMigrationRunner } from "../sandbox/sandbox-migration-runner.ts";
 import { CapabilityUnsupportedError, hasParentPathSegment, supportsAgentComputerExport } from "../sandbox/sandbox.ts";
 import type {
+  ApprovalGrantModes,
+  ClientToolResult,
   CommandPolicy,
   CommandRule,
   ConversationKind,
@@ -21,17 +36,16 @@ import type {
   WorkspaceLayer,
 } from "../types.ts";
 import { parseScopeId, scopeId } from "../types.ts";
-import {
-  defaultPublishAudience,
-  type PublishAudience,
-  type PublishAudienceKind,
-} from "../resolution/publish-audience.ts";
+import { type PublishAudienceKind } from "../resolution/publish-audience.ts";
 import type { WorkspaceStore } from "../workspace/workspace-store.ts";
 import type { BotPolicy } from "../surface-cache/channel-policy-store.ts";
 import type { GapPhase, GapWork } from "../sessions/session-store.ts";
+import type { SessionSyscalls } from "../sessions/session-syscalls.ts";
 import { evaluateCommandWithLayer } from "../policy/command-policy.ts";
 import { createNullLedger, type ToolLedger } from "../runs/tool-ledger.ts";
+import { waitForClientResult, type RunSignalStore } from "../runs/run-signal-store.ts";
 import type {
+  BackgroundCredentials,
   BackgroundExecBroker,
   BackgroundStartResult,
   BackgroundPollResult,
@@ -40,17 +54,17 @@ import type {
   BackgroundJobSummary,
 } from "../connectors/background-exec-broker.ts";
 import type { MonitorBroker, BackgroundWatchResult, BackgroundUnwatchResult } from "../monitors/monitor-broker.ts";
-import type { DeployService, DeployFile } from "../deploy/deploy-service.ts";
-import { publicUrlOf, type Deployment } from "../deploy/deploy-store.ts";
+import { deploymentEntrypoint, type DeployService, type DeployFile } from "../deploy/deploy-service.ts";
+import { publicUrlOf } from "../deploy/deploy-store.ts";
 import { carriesGitMetadata } from "../deploy/deploy-fs.ts";
 import type { AclStore } from "../acl/acl-store.ts";
 import type { AuditLog } from "../audit/audit-log.ts";
-import { mimeFromName } from "../core/attachments.ts";
-import { swallow, errMessage } from "../util/errors.ts";
-import { fileArtifactId, type FileArtifactStore } from "../files/file-artifact-store.ts";
+import { TURN_FILES_DIR, type OutboundFile } from "../core/attachments.ts";
+import { errMessage, withCleanup } from "../util/errors.ts";
+import type { FileArtifactStore } from "../files/file-artifact-store.ts";
 import type { ScopedConfigStore } from "../resolution/config-store.ts";
-import { MEMORY_FILE, type MemoryService } from "../memory/memory-service.ts";
-import type { McpToolService, McpToolDescriptor } from "../mcp/mcp-tool-service.ts";
+import { MEMORY_FILE, type MemoryEdit, type MemoryService } from "../memory/memory-service.ts";
+import type { McpToolService } from "../mcp/mcp-tool-service.ts";
 import type { ReachResolution } from "../resolution/scope-reach.ts";
 import type {
   ControlService,
@@ -70,19 +84,6 @@ import type { CapabilityClaims } from "../auth/capability-token.ts";
 import type { VisibleCron } from "../api/app.ts";
 import { createPlaygroundArtifact, type PlaygroundArtifact } from "../playgrounds/playground.ts";
 
-const SKILL_SKILLMD_RE = /^(?:\.\/)?skills\/([^/]+)\/SKILL\.md$/;
-function skillTreeDirFor(path: string): string | null {
-  const m = SKILL_SKILLMD_RE.exec(path);
-  return m ? m[1]! : null;
-}
-
-const SKILL_DIR_IN_COMMAND_RE = /(?:^|[\s'"=(&|;])(?:\.\/)?skills\/([^/\s'"&|;)]+)(?=[/\s'"&|;)]|$)/g;
-function skillTreeDirsInCommand(command: string): string[] {
-  const dirs = new Set<string>();
-  for (const m of command.matchAll(SKILL_DIR_IN_COMMAND_RE)) dirs.add(m[1]!);
-  return [...dirs];
-}
-
 export interface PublishInput {
   dir?: string;
   entrypoint?: string;
@@ -91,7 +92,10 @@ export interface PublishInput {
   env?: Record<string, string>;
   rollbackTo?: number;
   alwaysOn?: boolean;
+  embedAncestors?: string[];
+  public?: boolean;
   share?: Array<{ scope: ScopeId; permission: Permission }>;
+  sandboxId?: string;
 }
 
 export interface PublishAudienceDescriptor {
@@ -111,11 +115,8 @@ interface PublishResult {
   audience?: PublishAudienceDescriptor;
   dataDir?: string;
   alwaysOn?: boolean;
-}
-
-function deploymentEntrypoint(d: Deployment | null): string | undefined {
-  if (!d) return undefined;
-  return d.versions.find((v) => v.version === d.currentVersion)?.entrypoint || undefined;
+  embedAncestors?: string[];
+  public?: boolean;
 }
 
 export class NeedsApproval extends Error {
@@ -124,7 +125,15 @@ export class NeedsApproval extends Error {
   kind: "approval";
   matched?: string;
   approvalKey?: string;
-  constructor(command: string, reason: string, kind: "approval" = "approval", matched?: string, approvalKey?: string) {
+  grantModes?: ApprovalGrantModes;
+  constructor(
+    command: string,
+    reason: string,
+    kind: "approval" = "approval",
+    matched?: string,
+    approvalKey?: string,
+    grantModes?: ApprovalGrantModes,
+  ) {
     super(`command requires approval: ${command}`);
     this.name = "NeedsApproval";
     this.command = command;
@@ -132,6 +141,7 @@ export class NeedsApproval extends Error {
     this.kind = kind;
     this.matched = matched;
     this.approvalKey = approvalKey;
+    this.grantModes = grantModes;
   }
 }
 
@@ -146,15 +156,14 @@ interface ReadResult {
   content: string | null;
   sourceScopeId: ScopeId | null;
   shared?: true;
+  outsideWorkspace?: true;
 }
 
-export interface ShareDirective {
-  scope: ScopeId | "org";
-  permission?: Permission;
-}
-
-interface WriteResult {
-  shared: Array<{ scope: ScopeId; permission: Permission }>;
+export interface SkillResult {
+  content: string | null;
+  sourceScopeId: ScopeId | null;
+  dir?: string;
+  packDir?: string;
 }
 
 interface ReachedProvenance {
@@ -164,7 +173,14 @@ interface ReachedProvenance {
 
 export interface CommandCredential {
   handle: string;
-  env: Array<{ key: string; value: string }>;
+  scope?: "scoped" | "owner";
+  env?: Array<{ key: string; value: string; secret?: boolean }>;
+  resolve?: () => Promise<{
+    commit?: () => Promise<void>;
+    singleUse?: boolean;
+    files?: ExecutionFileCredential;
+    env: Array<{ key: string; value: string; secret?: boolean }>;
+  }>;
 }
 
 interface AttachedFileMeta {
@@ -176,22 +192,18 @@ interface AttachedFileMeta {
 
 export type AttachResult = { ok: true; files: AttachedFileMeta[]; staged: number } | { ok: false; message: string };
 
-export type AttachFiles = (files: readonly string[]) => Promise<AttachResult>;
+export type AttachFiles = (files: readonly OutboundFile[], sandboxId?: string) => Promise<AttachResult>;
 
 export interface ToolContext extends SurfaceToolDeps {
+  installSharedCanvas?: (fileId: string) => Promise<string | null>;
+  admin?: AdminToolAccess;
   runtime?(request: RuntimeRequest, signal?: AbortSignal): Promise<RuntimeResult>;
   attach: AttachFiles;
+  sessionSyscalls?: SessionSyscalls;
+  /** True when a person's own message started this turn (not a cron, webhook, ambient or delegated wake). */
+  humanTurn?: boolean;
+  toolOutput?: Pick<ToolOutputStore, "inlineTokens" | "save">;
   commandCredentialHandles?: readonly string[];
-  credentialExecServices?: readonly { service: string; binary: string }[];
-  credentialExec?(
-    service: string,
-    args: string[],
-    opts?: { timeoutSeconds?: number; signal?: AbortSignal },
-  ): Promise<ExecResult>;
-  registerLogin?(
-    service: string,
-    paths: readonly CredentialPathSpec[],
-  ): Promise<{ service: string; captured: boolean }>;
   execute(
     command: string,
     opts?: {
@@ -210,20 +222,44 @@ export interface ToolContext extends SurfaceToolDeps {
   ): Promise<unknown>;
   computerStatus(sandboxId?: string): Promise<ComputerStatus>;
   restartComputer(sandboxId?: string): Promise<void>;
-  migrateComputer(to: string): Promise<{ from: string; to: string }>;
-  read(path: string): Promise<ReadResult>;
-  write(path: string, data?: string, share?: ShareDirective[]): Promise<WriteResult>;
+  read(path: string, signal?: AbortSignal, sandboxId?: string): Promise<ReadResult>;
+  listSkills(
+    query?: string,
+    offset?: number,
+    limit?: number,
+    source?: string,
+  ): Promise<{
+    sourceScopeId: ScopeId | null;
+    skills: Array<{ name: string; description: string; source?: string }>;
+    nextOffset?: number;
+  }>;
+  skill(
+    name: string,
+    opts?: { path?: string; sandboxId?: string; source?: string; signal?: AbortSignal },
+  ): Promise<SkillResult>;
+  write(path: string, data: string, sandboxId?: string): Promise<void>;
   publish(input: PublishInput): Promise<PublishResult>;
+  setDeploymentPublic(id: string, isPublic: boolean): Promise<{ id: string; name?: string; public: boolean }>;
   createPlayground(input: { title: string; html: string }): Promise<PlaygroundArtifact>;
-  memorySearch(q: string, limit?: number): Promise<string[] | null>;
-  memoryRead(): Promise<string | null>;
-  memoryRemember(facts: string[]): Promise<number | null>;
-  memoryRewrite(content: string): Promise<true | null>;
+  memorySearch(q: string, limit?: number, scope?: ScopeId): Promise<string[] | null>;
+  memoryRead(scope?: ScopeId): Promise<string | null>;
+  memoryAdd(facts: string[]): Promise<number | null>;
+  memoryEdit(edits: MemoryEdit[]): Promise<true | null>;
+  memoryDelete(ids: string[]): Promise<true | null>;
   history(q: string, limit?: number): Promise<string[]>;
   historyOpen(seq: number): Promise<string | null>;
-  mcpToolDefs(): McpToolDescriptor[];
-  callMcpTool(name: string, args: Record<string, unknown>): Promise<string>;
-  backgroundStart(command: string, opts?: { ttlSeconds?: number; sandboxId?: string }): Promise<BackgroundStartResult>;
+  callMcpTool(name: string, args: Record<string, unknown>, approval?: string): Promise<string>;
+  mcpToolNeedsApproval(name: string, args: Record<string, unknown>): Promise<boolean>;
+  awaitClientResult(
+    callId: string,
+    timeoutMs: number,
+    signal?: AbortSignal,
+    toolName?: string,
+  ): Promise<ClientToolResult | "timeout" | "cancelled">;
+  backgroundStart(
+    command: string,
+    opts: { purpose: string; ttlSeconds?: number; sandboxId?: string; credentials?: string[] },
+  ): Promise<BackgroundStartResult>;
   backgroundPoll(
     processId: string,
     opts?: { sinceCursor?: number; maxBytes?: number; waitSeconds?: number },
@@ -282,10 +318,21 @@ export interface ToolContext extends SurfaceToolDeps {
   webhookDisable(
     id: string,
   ): Promise<ControlOk<Record<never, never>> | ControlErr<"not_found" | "forbidden"> | ControlUnavailable>;
+  webhookUpdate(
+    id: string,
+    action: string,
+  ): Promise<
+    ControlOk<{ webhook: Webhook }> | ControlErr<"not_found" | "forbidden" | "bad_request"> | ControlUnavailable
+  >;
   soulRead(): { effectiveSoul: string; soul: string | null; soulVersion: number } | ControlUnavailable;
   soulWrite(
     content: string,
-  ): Promise<ControlOk<{ version: number }> | ControlErr<"soul_update_denied"> | ControlUnavailable>;
+    expectedVersion?: number,
+  ): Promise<
+    | ControlOk<{ version: number }>
+    | ControlErr<"soul_update_denied" | "soul_version_conflict" | "soul_update_failed">
+    | ControlUnavailable
+  >;
   shareArtifact(req: ShareArtifactRequest): Promise<ShareArtifactResult | ControlUnavailable>;
 }
 
@@ -389,8 +436,18 @@ type SurfaceStandingOrderResult =
   | { ok: false; message: string };
 
 export interface SurfaceToolDeps {
-  post(text: string, opts?: SurfacePostOpts, files?: readonly string[]): Promise<SurfacePostResult>;
-  reach(text: string, target: SurfaceReachTarget, files?: readonly string[]): Promise<SurfacePostResult>;
+  post(
+    text: string,
+    opts?: SurfacePostOpts,
+    files?: readonly OutboundFile[],
+    sandboxId?: string,
+  ): Promise<SurfacePostResult>;
+  reach(
+    text: string,
+    target: SurfaceReachTarget,
+    files?: readonly OutboundFile[],
+    sandboxId?: string,
+  ): Promise<SurfacePostResult>;
   react(input: SurfaceReactInput): Promise<SurfacePostResult>;
   edit(input: SurfaceEditInput): Promise<SurfacePostResult>;
   delete(input: SurfaceDeleteInput): Promise<SurfacePostResult>;
@@ -401,11 +458,11 @@ export interface SurfaceToolDeps {
   readFile(ref: string): Promise<SurfaceFileResult>;
   getStandingOrder(): Promise<SurfaceStandingOrderResult>;
   setStandingOrder(
-    orders: string,
+    orders: string | undefined,
     bots?: Record<string, BotPolicy>,
     ambientEnabled?: boolean | null,
+    expectedOrders?: string,
   ): Promise<SurfaceStandingOrderResult>;
-  staySilent(reason: string): Promise<{ ok: true; message: string }>;
 }
 
 export interface ControlUnavailable {
@@ -420,18 +477,23 @@ export const CONTROL_UNAVAILABLE: ControlUnavailable = {
 };
 
 export interface ToolContextDeps {
+  desktopClientId?: string;
+  admin?: AdminToolAccess;
+  installSharedCanvas?: (fileId: string) => Promise<string | null>;
   sandbox: Sandbox;
-  credentialExecServices?: readonly { service: string; binary: string }[];
-  credentialExec?: ToolContext["credentialExec"];
-  registerLogin?: ToolContext["registerLogin"];
   commandCredentials?: readonly CommandCredential[];
+  resolveCommandCredentials?: (handles: readonly string[]) => Promise<readonly CommandCredential[]>;
   provision: () => Promise<SandboxHandle>;
   provisionScratch?: () => Promise<SandboxHandle>;
-  provisionResource?: (id: string) => Promise<SandboxHandle>;
+  provisionResource?: (
+    input: string | SandboxAccessPlan,
+    authorize?: (access: SandboxAccessPlan) => void,
+  ) => Promise<SandboxHandle>;
+  accessSandboxResource?: (id: string) => Promise<SandboxAccessPlan>;
   provisionOwnerAuth?: () => Promise<SandboxHandle>;
-  ownerAuthCommand?: (command: string) => string;
-  scopedCommand?: (command: string) => string;
-  ensureSkillTree?: (skillDir: string, sandboxId?: string) => Promise<void>;
+  ownerAuthCommand?: (command: string, env?: Record<string, string>) => string;
+  listSkills?: (source?: string) => Promise<SkillResolution[]>;
+  useSkill?: (name: string, path: string, sandboxId?: string, source?: string) => Promise<SkillResult>;
   reach?: {
     resolveChannel(query: string): Promise<ReachResolution>;
     provisionFor(scopeId: ScopeId): Promise<SandboxHandle>;
@@ -439,14 +501,11 @@ export interface ToolContextDeps {
   layers: WorkspaceLayer[];
   commandPolicy: () => CommandPolicy;
   layerCommandRules?: () => readonly CommandRule[];
-  authorizeCommand: (command: string, approvalKey?: string) => boolean;
+  authorizeCommand: (command: string, approvalKey?: string, exactApprovalKey?: boolean) => boolean;
   grantedHandles: GrantedHandle[];
   context?: TurnContext;
-  sharedMaterializeDir?: string;
-  sandboxMigration?: SandboxMigrationRunner;
   sandboxResources?: SandboxResources;
   invalidateProvision?: () => void;
-  migrateSettleMs?: number;
   workspace: WorkspaceStore;
   deploy: DeployService;
   acl: AclStore;
@@ -464,6 +523,7 @@ export interface ToolContextDeps {
   config?: ScopedConfigStore;
   memory?: MemoryService;
   memoryScopeId?: ScopeId;
+  memoryCaptureMetadata?: () => MemoryCaptureMetadata;
   memoryAccess?: { write?: ScopeId; read: ScopeId[] };
   mcp?: McpToolService;
   sessionHistory?: {
@@ -478,24 +538,110 @@ export interface ToolContextDeps {
   execTimeoutMs?: number;
   execTimeoutCeilingMs?: number;
   ledger?: ToolLedger;
+  signals?: RunSignalStore;
   runId?: string;
   attempt?: number;
   backgroundBroker?: BackgroundExecBroker;
   monitorBroker?: MonitorBroker;
-  persistWritesToStore?: { excludeDirs: readonly string[] };
   onGapWork?: (work: GapWork) => void;
   control?: ControlService;
   controlClaims?: CapabilityClaims;
   webhookPublicUrl?: string;
   surface?: SurfaceToolDeps;
   attach?: AttachFiles;
+  sessionSyscalls?: SessionSyscalls;
+  humanTurn?: boolean;
+  toolOutput?: ToolOutputStore;
+  sessionId?: string;
 }
 
 export function createToolContext(deps: ToolContextDeps): ToolContext {
   const writableScopeId = deps.layers.find((l) => l.mode === "rw")?.scopeId ?? null;
+  const memory =
+    deps.context?.memory ??
+    (deps.memory
+      ? disclosedMemory(deps.memory, {
+          actor: { id: deps.createdBy, type: "internal" },
+          targetScope: writableScopeId ?? `personal:${deps.createdBy}`,
+          nativeScopes: [
+            ...deps.layers.map((layer) => layer.scopeId),
+            ...(deps.memoryAccess?.read ?? []).filter((scope) => scope.startsWith("org:")),
+          ],
+          audience: deps.publishContext?.publishMembers ?? [{ id: deps.createdBy, type: "internal" }],
+          open: false,
+        })
+      : undefined);
   const fallbackMounts = deps.layers.filter((l) => l.mode === "ro" && l.mountPath);
-  const persistExclude = deps.persistWritesToStore?.excludeDirs;
-  const orgScopeId = deps.layers.find((l) => l.mountPath === "global")?.scopeId ?? null;
+  const persistExclude = [...fallbackMounts.map((mount) => mount.mountPath!), TURN_FILES_DIR];
+
+  const accessSandbox = async (id: string): Promise<SandboxAccessPlan> => {
+    if (!deps.sandboxResources || !deps.accessSandboxResource) throw new Error("sandbox inventory unavailable");
+    if (!id.trim()) throw new Error("sandbox_id must name a sandbox; omit it to use the default");
+    return deps.accessSandboxResource(id);
+  };
+
+  const machine = async (
+    id: string | undefined,
+  ): Promise<{
+    handle: SandboxHandle;
+    resource?: SandboxResource;
+    crossScope: boolean;
+    durableRef: (path: string) => string;
+  }> => {
+    if (id === undefined) {
+      const handle = await deps.provision();
+      const resource = handle.resourceId ? await deps.sandboxResources?.get(handle.resourceId) : undefined;
+      return { handle, ...(resource ? { resource } : {}), crossScope: false, durableRef: (path) => path };
+    }
+    let access = await accessSandbox(id);
+    if (!deps.provisionResource) throw new Error("sandbox inventory unavailable");
+    const handle = await deps.provisionResource(access, (current) => {
+      access = current;
+    });
+    const resource = access.resource;
+    const fallback = writableScopeId ? await deps.sandboxResources!.resolve(writableScopeId) : null;
+    const durableRef =
+      fallback?.id === resource.id ? (path: string) => path : (path: string) => `sandbox-files/${resource.id}/${path}`;
+    return { handle, resource, crossScope: access.crossScope, durableRef };
+  };
+
+  const authorizeExecution = (command: string, access?: SandboxAccessPlan, policy = deps.commandPolicy()): void => {
+    const source = evaluateCommandWithLayer(command, policy, deps.layerCommandRules?.() ?? []);
+    if (source.decision === "deny") throw new CommandDenied(command, source.reason ?? "denied by policy");
+    if (!access?.crossScope) {
+      if (source.decision === "require_approval" && !deps.authorizeCommand(command, source.approvalKey))
+        throw new NeedsApproval(
+          command,
+          source.reason ?? "requires approval",
+          "approval",
+          source.matched,
+          source.approvalKey,
+        );
+      return;
+    }
+    const target = access.commandPolicy
+      ? evaluateCommandWithLayer(command, access.commandPolicy, [])
+      : { decision: "allow" as const };
+    if (target.decision === "deny")
+      throw new CommandDenied(command, target.reason ?? "denied by target sandbox policy");
+    if (source.decision !== "require_approval" && target.decision !== "require_approval") return;
+    const approvalKey = `sandbox:${JSON.stringify([
+      access.resource.ownerScopeId,
+      source.approvalKey ?? command,
+      target.approvalKey ?? command,
+    ])}`;
+    const required = target.decision === "require_approval" ? target : source;
+    const grantModes = { session: false, always: false };
+    if (!deps.authorizeCommand(command, approvalKey, true))
+      throw new NeedsApproval(
+        command,
+        required.reason ?? "requires sandbox approval",
+        "approval",
+        required.matched,
+        approvalKey,
+        grantModes,
+      );
+  };
 
   const ledger = deps.ledger ?? createNullLedger();
   const runId = deps.runId;
@@ -516,13 +662,13 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
   }
 
   async function once<T>(produce: () => Promise<T>, shouldCache: (r: T) => boolean = () => true): Promise<T> {
-    callIndex += 1;
+    const index = ++callIndex;
     if (runId === undefined) return produce();
-    const prior = await timed("tool_ledger", () => ledger.begin(runId, attempt, callIndex));
+    const prior = await timed("tool_ledger", () => ledger.begin(runId, attempt, index));
     if (prior.cached) return JSON.parse(prior.output ?? "null") as T;
     const result = await produce();
     if (shouldCache(result))
-      await timed("tool_ledger", () => ledger.record(runId, attempt, callIndex, JSON.stringify(result ?? null)));
+      await timed("tool_ledger", () => ledger.record(runId, attempt, index, JSON.stringify(result ?? null)));
     return result;
   }
 
@@ -544,14 +690,91 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
     return cache ? once(call, cache) : call();
   }
 
+  const selectCredentials = async (handles: readonly string[], ownerAuth: boolean) => {
+    const available = new Map(
+      (
+        (handles.length ? await deps.resolveCommandCredentials?.(handles) : undefined) ??
+        deps.commandCredentials ??
+        []
+      ).map((credential) => [credential.handle, credential] as const),
+    );
+    return handles.map((handle) => {
+      const credential = available.get(handle);
+      if (!credential) throw new Error(`credential handle is not available on this turn: ${handle}`);
+      if ((credential.scope ?? "scoped") !== (ownerAuth ? "owner" : "scoped"))
+        throw new Error(`credential ${handle} requires scope:${credential.scope ?? "scoped"}`);
+      return credential;
+    });
+  };
+
+  const stageCredentials = async (
+    requested: readonly CommandCredential[],
+    handle: SandboxHandle,
+    use: "command" | "background",
+    signal?: AbortSignal,
+  ) => {
+    const commandEnv: Record<string, string> = {};
+    const addCommandEnv = (key: string, value: string) => {
+      if (DROPPED_PROXY_ENV.has(key) || Object.hasOwn(handle.env ?? {}, key))
+        throw new Error(`requested credentials may not override the computer's environment key: ${key}`);
+      if (Object.hasOwn(commandEnv, key) && commandEnv[key] !== value)
+        throw new Error(`requested credentials provide conflicting environment key: ${key}`);
+      commandEnv[key] = value;
+    };
+    const prepared: Array<{
+      commit?: () => Promise<void>;
+      singleUse?: boolean;
+      files?: ExecutionFileCredential;
+      env: Array<{ key: string; value: string; secret?: boolean }>;
+    }> = [];
+    for (const credential of new Set(requested)) {
+      const materialized = credential.resolve ? await credential.resolve() : { env: credential.env ?? [] };
+      prepared.push(materialized);
+      for (const { key, value } of materialized.env) addCommandEnv(key, value);
+      deps.auditLog?.record({
+        at: Date.now(),
+        principalId: deps.createdBy,
+        action: "keychain.materialize",
+        resource: `${credential.handle} (${use})`,
+        scopeLabel: writableScopeId!,
+      });
+    }
+    signal?.throwIfAborted();
+    const singleUse = prepared.filter((credential) => credential.singleUse);
+    if (singleUse.length > 1) throw new Error("An execution may use at most one single-use grant");
+    for (const credential of prepared.filter((credential) => !credential.singleUse)) await credential.commit?.();
+    signal?.throwIfAborted();
+    for (const credential of singleUse) await credential.commit?.();
+    const fileCredentials = prepared.flatMap((credential) => (credential.files ? [credential.files] : []));
+    const fileExecution = fileCredentials.length
+      ? await prepareExecutionFiles(deps.sandbox, handle, fileCredentials)
+      : undefined;
+    for (const [key, value] of Object.entries(fileExecution?.env ?? {})) {
+      try {
+        addCommandEnv(key, value);
+      } catch (error) {
+        return withCleanup(
+          () => Promise.reject(error),
+          () => fileExecution!.finish(),
+        );
+      }
+    }
+    return {
+      commandEnv,
+      secretValues: prepared.flatMap((credential) => credential.env),
+      fileExecution,
+      fileCredentials,
+    };
+  };
+
   return {
-    ...(deps.credentialExecServices ? { credentialExecServices: deps.credentialExecServices } : {}),
-    ...(deps.credentialExec ? { credentialExec: deps.credentialExec } : {}),
-    ...(deps.registerLogin ? { registerLogin: deps.registerLogin } : {}),
+    ...(deps.admin ? { admin: deps.admin } : {}),
+    ...(deps.installSharedCanvas ? { installSharedCanvas: deps.installSharedCanvas } : {}),
+    ...(deps.toolOutput ? { toolOutput: deps.toolOutput } : {}),
     ...(deps.commandCredentials?.length
       ? { commandCredentialHandles: deps.commandCredentials.map((credential) => credential.handle) }
       : {}),
-    ...(deps.sandboxResources
+    ...(deps.sandboxResources && deps.accessSandboxResource
       ? {
           async sandboxResources(
             action: "list" | "create" | "default" | "retire",
@@ -563,15 +786,22 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
               const listed = await resources.list(deps.createdBy, writableScopeId);
               return {
                 ...listed,
-                sandboxes: listed.sandboxes.filter((record) => record.ownerScopeId === writableScopeId),
+                sandboxes: (
+                  await Promise.all(
+                    listed.sandboxes.map(async (record) =>
+                      deps.accessSandboxResource!(record.id)
+                        .then((access) => access.resource)
+                        .catch(() => null),
+                    ),
+                  )
+                ).filter((record) => record !== null),
               };
             }
             if (action === "retire") {
               if (!input?.sandboxId) throw new Error("retire requires sandbox_id");
-              const record = await resources.access(deps.createdBy, input.sandboxId);
-              if (record.ownerScopeId !== writableScopeId) throw new Error("retire this sandbox from its owning scope");
-              await resources.retire(deps.createdBy, record.id);
-              return { retired: record.id };
+              const { resource } = await accessSandbox(input.sandboxId);
+              await resources.retire(deps.createdBy, resource.id);
+              return { retired: resource.id };
             }
             if (action === "default") {
               if (input?.sandboxId === undefined) throw new Error("default requires sandbox_id or null");
@@ -587,33 +817,37 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
         }
       : {}),
     async computerStatus(sandboxId?: string): Promise<ComputerStatus> {
-      if (sandboxId) {
+      const probe = async (status: ComputerStatus, provision: () => Promise<SandboxHandle>) => {
+        if (!status.provisioned || status.lifecycleState === "paused") return status;
+        try {
+          const code = await withTimeout(
+            async () =>
+              (await deps.sandbox.run(await provision(), "true", { timeoutMs: COMMAND_PATH_PROBE_TIMEOUT_MS })).code,
+            COMMAND_PATH_PROBE_TIMEOUT_MS * 2,
+            "command probe",
+          );
+          return { ...status, guestResponsive: code === 0 };
+        } catch (e) {
+          return { ...status, guestResponsive: false, probeError: errMessage(e) };
+        }
+      };
+      if (sandboxId !== undefined) {
         const resources = deps.sandboxResources;
-        if (!resources) throw new Error("sandbox inventory unavailable");
-        const record = await resources.access(deps.createdBy, sandboxId);
-        if (record.ownerScopeId !== writableScopeId) throw new Error("inspect this sandbox from its owning scope");
-        return resources.status(deps.createdBy, sandboxId);
+        if (!resources || !deps.provisionResource) throw new Error("sandbox inventory unavailable");
+        const access = await accessSandbox(sandboxId);
+        return probe(await resources.status(deps.createdBy, sandboxId), () => deps.provisionResource!(access));
       }
       if (!deps.sandbox.computerStatus) {
         throw new CapabilityUnsupportedError(deps.sandbox.profile.backend, "reporting computer status");
       }
       if (!writableScopeId) throw new Error("this turn has no scoped computer");
-      const status = await deps.sandbox.computerStatus(writableScopeId);
-      if (!status.provisioned || ("lifecycleState" in status && status.lifecycleState === "paused")) return status;
-      try {
-        const handle = await deps.provision();
-        const probe = await deps.sandbox.run(handle, "true", { timeoutMs: COMMAND_PATH_PROBE_TIMEOUT_MS });
-        return { ...status, guestResponsive: probe.code === 0 };
-      } catch (e) {
-        return { ...status, guestResponsive: false, probeError: errMessage(e) };
-      }
+      return probe(await deps.sandbox.computerStatus(writableScopeId), deps.provision);
     },
     async restartComputer(sandboxId?: string): Promise<void> {
-      if (sandboxId) {
+      if (sandboxId !== undefined) {
         const resources = deps.sandboxResources;
         if (!resources) throw new Error("sandbox inventory unavailable");
-        const record = await resources.access(deps.createdBy, sandboxId);
-        if (record.ownerScopeId !== writableScopeId) throw new Error("restart this sandbox from its owning scope");
+        await accessSandbox(sandboxId);
         return resources.restart(deps.createdBy, sandboxId);
       }
       if (!deps.sandbox.restartComputer) {
@@ -621,60 +855,6 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
       }
       if (!writableScopeId) throw new Error("this turn has no scoped computer to restart");
       await deps.sandbox.restartComputer(writableScopeId);
-    },
-    async migrateComputer(to: string): Promise<{ from: string; to: string }> {
-      if (writableScopeId && (await deps.sandboxResources?.resolve(writableScopeId)) !== undefined)
-        throw new Error("this scope uses sandbox resources; create a sandbox and change its default independently");
-      const runner = deps.sandboxMigration;
-      if (!runner) throw new Error("computer migration is not available on this deployment");
-      if (!writableScopeId) throw new Error("this turn has no scoped computer to migrate");
-      const available = runner.availableBackends();
-      if (!(available as string[]).includes(to)) {
-        throw new Error(
-          `${JSON.stringify(to)} is not an available backend here — choose one of: ${available.join(", ")}`,
-        );
-      }
-      const approvalCommand = `computer:"migrate" to:"${to}"`;
-      const approvalKey = `computer-migrate:${to}`;
-      if (!deps.authorizeCommand(approvalCommand, approvalKey)) {
-        throw new NeedsApproval(
-          approvalCommand,
-          `moving this computer to ${to} re-homes its files onto a different provider and can take several minutes`,
-          "approval",
-          undefined,
-          approvalKey,
-        );
-      }
-      try {
-        const result = await runner.migrateScope(writableScopeId, to as SandboxBackendName, "agent-requested", {
-          copyTimeoutSec: 1800,
-        });
-        deps.auditLog?.record({
-          at: Date.now(),
-          principalId: deps.createdBy,
-          action: "sandbox_routes.migrate",
-          resource: `${result.from}->${result.to} sha=${result.sha.slice(0, 12)}`,
-          scopeLabel: writableScopeId,
-        });
-        await new Promise((res) => setTimeout(res, deps.migrateSettleMs ?? ROUTE_CACHE_TTL_MS));
-        deps.invalidateProvision?.();
-        return { from: result.from, to: result.to };
-      } catch (err) {
-        deps.auditLog?.record({
-          at: Date.now(),
-          principalId: deps.createdBy,
-          action: "sandbox_routes.migrate_failed",
-          resource: errMessage(err).slice(0, 200),
-          scopeLabel: writableScopeId,
-        });
-        throw new Error(
-          errMessage(err).replace(
-            "Migrate with force to accept the loss.",
-            "An operator can force this from the admin console.",
-          ),
-          { cause: err },
-        );
-      }
     },
     async execute(
       command: string,
@@ -688,104 +868,66 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
         credentials?: string[];
       },
     ): Promise<ExecResult & { reached?: ReachedProvenance }> {
-      const scratch = execOpts?.scratch === true;
-      const ownerAuth = execOpts?.ownerAuth === true;
-      const requestedCredentials = execOpts?.credentials ?? [];
-      if (
-        requestedCredentials.length &&
-        (scratch || ownerAuth || execOpts?.reachTarget !== undefined || !writableScopeId)
-      ) {
-        throw new Error("command credentials are available only on the scoped computer");
-      }
-      const availableCredentials = new Map(
-        (deps.commandCredentials ?? []).map((credential) => [credential.handle, credential] as const),
-      );
-      const requested = requestedCredentials.map((handle) => {
-        const credential = availableCredentials.get(handle);
-        if (!credential) throw new Error(`credential handle is not available on this turn: ${handle}`);
-        return credential;
-      });
-      const commandEnv: Record<string, string> = {};
-      for (const credential of requested) {
-        for (const { key, value } of credential.env) {
-          if (key in commandEnv && commandEnv[key] !== value) {
-            throw new Error(`requested credentials provide conflicting environment key: ${key}`);
-          }
-          commandEnv[key] = value;
-        }
-      }
-      for (const credential of requested) {
-        deps.auditLog?.record({
-          at: Date.now(),
-          principalId: deps.createdBy,
-          action: "keychain.materialize",
-          resource: `${credential.handle} (command)`,
-          scopeLabel: writableScopeId!,
-        });
-      }
-      const reachTarget = execOpts?.reachTarget;
-      if (
-        [scratch, ownerAuth, reachTarget !== undefined, execOpts?.sandboxId !== undefined].filter(Boolean).length > 1
-      ) {
-        throw new Error("a command runs on one computer — choose scoped, scratch, owner, or a reached room");
-      }
-      if (scratch && !deps.provisionScratch) {
-        throw new Error('scratch execution is not available on this computer — run without scope:"scratch"');
-      }
-      if (ownerAuth && !deps.provisionOwnerAuth) {
-        throw new Error('an owner-auth box is not available on this turn — use scope:"scoped"');
-      }
-      let reached: ReachedProvenance | undefined;
-      if (reachTarget !== undefined) {
-        if (!deps.reach) {
-          throw new Error(
-            "visiting another conversation's computer works from a DM — here, ask in that channel instead",
-          );
-        }
-        const target = await deps.reach.resolveChannel(reachTarget);
-        if (target.kind === "error") throw new Error(target.message);
-        reached = { scopeId: target.scopeId, label: `#${target.channelName}` };
-      }
-      const { decision, reason, matched, approvalKey } = evaluateCommandWithLayer(
-        command,
-        deps.commandPolicy(),
-        deps.layerCommandRules?.() ?? [],
-      );
-      if (decision === "deny") {
-        throw new CommandDenied(command, reason ?? "denied by policy");
-      }
-      if (decision === "require_approval" && !deps.authorizeCommand(command, approvalKey)) {
-        throw new NeedsApproval(command, reason ?? "requires approval", "approval", matched, approvalKey);
-      }
-      let handle;
-      if (execOpts?.sandboxId) {
-        if (!deps.sandboxResources || !deps.provisionResource) throw new Error("sandbox inventory unavailable");
-        const resource = await deps.sandboxResources.access(deps.createdBy, execOpts.sandboxId);
-        if (resource.ownerScopeId !== writableScopeId)
-          throw new Error("execute on this sandbox from its owning scope to preserve conversation isolation");
-        handle = await deps.provisionResource(execOpts.sandboxId);
-      } else if (reached) handle = await deps.reach!.provisionFor(reached.scopeId);
-      else if (scratch) handle = await deps.provisionScratch!();
-      else if (ownerAuth) handle = await deps.provisionOwnerAuth!();
-      else handle = await deps.provision();
-      const resolvedMs = execOpts?.timeoutSeconds != null ? execOpts.timeoutSeconds * 1000 : deps.execTimeoutMs;
-      const timeoutMs =
-        resolvedMs != null && deps.execTimeoutCeilingMs != null
-          ? Math.min(resolvedMs, deps.execTimeoutCeilingMs)
-          : resolvedMs;
-      const opts =
-        timeoutMs !== undefined || execOpts?.signal
-          ? {
-              ...(timeoutMs !== undefined ? { timeoutMs } : {}),
-              ...(execOpts?.signal ? { signal: execOpts.signal } : {}),
-            }
-          : undefined;
-      const local = !scratch && !ownerAuth && reached === undefined && !execOpts?.sandboxId;
-      if ((local || execOpts?.sandboxId) && deps.ensureSkillTree) {
-        for (const skillDir of skillTreeDirsInCommand(command))
-          await deps.ensureSkillTree(skillDir, execOpts?.sandboxId);
-      }
       return once(async () => {
+        const scratch = execOpts?.scratch === true;
+        const ownerAuth = execOpts?.ownerAuth === true;
+        const requestedCredentials = execOpts?.credentials ?? [];
+        if (requestedCredentials.length && (execOpts?.reachTarget !== undefined || !writableScopeId)) {
+          throw new Error("command credentials are available only on scoped, scratch, or owner computers");
+        }
+        const requested = await selectCredentials(requestedCredentials, ownerAuth);
+        const reachTarget = execOpts?.reachTarget;
+        if (
+          [scratch, ownerAuth, reachTarget !== undefined, execOpts?.sandboxId !== undefined].filter(Boolean).length > 1
+        ) {
+          throw new Error("a command runs on one computer — choose scoped, scratch, owner, or a reached room");
+        }
+        if (scratch && !deps.provisionScratch) {
+          throw new Error('scratch execution is not available on this computer — run without scope:"scratch"');
+        }
+        if (ownerAuth && !deps.provisionOwnerAuth) {
+          throw new Error('an owner-auth box is not available on this turn — use scope:"scoped"');
+        }
+        let reached: ReachedProvenance | undefined;
+        if (reachTarget !== undefined) {
+          if (!deps.reach) {
+            throw new Error(
+              "visiting another conversation's computer works from a DM — here, ask in that channel instead",
+            );
+          }
+          const target = await deps.reach.resolveChannel(reachTarget);
+          if (target.kind === "error") throw new Error(target.message);
+          reached = { scopeId: target.scopeId, label: `#${target.channelName}` };
+        }
+        const executionPolicy = deps.commandPolicy;
+        let handle;
+        if (execOpts?.sandboxId !== undefined) {
+          if (!deps.sandboxResources || !deps.provisionResource) throw new Error("sandbox inventory unavailable");
+          const access = await accessSandbox(execOpts.sandboxId);
+          handle = await deps.provisionResource(access, (current) => {
+            if (current.crossScope && requestedCredentials.length)
+              throw new Error("command credentials cannot be copied to another scope's computer");
+            authorizeExecution(command, current, executionPolicy());
+          });
+        } else {
+          authorizeExecution(command, undefined, executionPolicy());
+          if (reached) handle = await deps.reach!.provisionFor(reached.scopeId);
+          else if (scratch) handle = await deps.provisionScratch!();
+          else if (ownerAuth) handle = await deps.provisionOwnerAuth!();
+          else handle = await deps.provision();
+        }
+        const resolvedMs = execOpts?.timeoutSeconds != null ? execOpts.timeoutSeconds * 1000 : deps.execTimeoutMs;
+        const timeoutMs =
+          resolvedMs != null && deps.execTimeoutCeilingMs != null
+            ? Math.min(resolvedMs, deps.execTimeoutCeilingMs)
+            : resolvedMs;
+        const opts =
+          timeoutMs !== undefined || execOpts?.signal
+            ? {
+                ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+                ...(execOpts?.signal ? { signal: execOpts.signal } : {}),
+              }
+            : undefined;
         if (reached) {
           deps.auditLog?.record({
             at: Date.now(),
@@ -796,65 +938,92 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
           });
         }
         return timed("exec", async () => {
-          const sandboxCommand = ownerAuth
-            ? (deps.ownerAuthCommand?.(command) ?? command)
-            : (deps.scopedCommand?.(command) ?? command);
-          const commandHandle = Object.keys(commandEnv).length
-            ? { ...handle, env: { ...handle.env, ...commandEnv } }
-            : handle;
-          const r = await deps.sandbox.run(commandHandle, sandboxCommand, opts);
+          execOpts?.signal?.throwIfAborted();
+          const { commandEnv, secretValues, fileExecution } = await stageCredentials(
+            requested,
+            handle,
+            "command",
+            execOpts?.signal,
+          );
+          const r = await withCleanup(
+            async (): Promise<ExecResult> => {
+              const sandboxCommand = ownerAuth ? (deps.ownerAuthCommand?.(command, commandEnv) ?? command) : command;
+              const commandHandle = Object.keys(commandEnv).length
+                ? { ...handle, env: { ...handle.env, ...commandEnv } }
+                : handle;
+              const secretEnv = executionSecretEnv(commandHandle.env, secretValues);
+              const mask = createExactSecretValueMasker(Object.values(secretEnv));
+              try {
+                const result = await deps.sandbox.run(commandHandle, sandboxCommand, opts);
+                return { ...result, stdout: mask(result.stdout), stderr: mask(result.stderr) };
+              } catch (error) {
+                const message = errMessage(error);
+                const masked = mask(message);
+                if (masked !== message) throw new MaskedExecutionError(error, mask, masked);
+                throw error;
+              }
+            },
+            async () => {
+              await fileExecution?.finish();
+            },
+          );
           return reached ? { ...r, reached } : r;
         });
       });
     },
 
-    async read(path: string): Promise<ReadResult> {
-      if (path === MEMORY_FILE && deps.memory && deps.memoryScopeId) {
+    async read(path: string, signal?: AbortSignal, sandboxId?: string): Promise<ReadResult> {
+      signal?.throwIfAborted();
+      if (path === MEMORY_FILE && memory && deps.memoryScopeId) {
         if (!deps.memoryAccess?.read.includes(deps.memoryScopeId)) {
           throw new Error("memory recall is not enabled for this conversation; use the `memory` tool when enabled");
         }
-        const content = await deps.memory.read(deps.memoryScopeId);
-        if (content) return { content, sourceScopeId: deps.memoryScopeId };
+        const content = await withAbort(() => memory.read(deps.memoryScopeId!), signal);
+        return { content, sourceScopeId: deps.memoryScopeId };
       }
       const sharedFile = deps.context
-        ? await deps.context.readFile(path)
-        : await readContextFile(path, deps.grantedHandles, deps.workspace, deps.files);
+        ? await withAbort(() => deps.context!.readFile(path), signal)
+        : await withAbort(() => readContextFile(path, deps.grantedHandles, deps.files), signal);
       if (sharedFile && "error" in sharedFile) return { content: sharedFile.error, sourceScopeId: null };
       if (sharedFile) {
         const { grant: granted, bytes } = sharedFile;
         if (bytes === null) return { content: null, sourceScopeId: granted.ownerScopeId };
         const asText = tryDecodeUtf8(bytes);
         if (asText !== null) return { content: asText, sourceScopeId: granted.ownerScopeId, shared: true };
-        if (granted.carried) {
-          return {
-            content:
-              "Binary files require an explicit share before they can be copied into this conversation's computer.",
-            sourceScopeId: granted.ownerScopeId,
-          };
-        }
-        const handle = await deps.provision();
-        const name = granted.handlePath.split(/[\\/]/).pop() ?? granted.handlePath;
-        const materializedPath = deps.sharedMaterializeDir
-          ? `${deps.sharedMaterializeDir}/${name}`
-          : granted.handlePath;
-        await deps.sandbox.writeFileBytes(handle, materializedPath, bytes);
         return {
-          content:
-            `[binary file materialized into the sandbox at ${materializedPath} (${bytes.length} bytes) — ` +
-            `to send it, attach it to a message: name \`${materializedPath}\` in the surface \`post\` action's \`files\`]`,
+          content: `[binary file ${granted.handlePath.split("/").pop()}, Files ID ${granted.fileId}; send it by ID]`,
           sourceScopeId: granted.ownerScopeId,
           shared: true,
         };
       }
       if (path.startsWith("shared/open-")) return { content: null, sourceScopeId: null };
-      const skillDir = skillTreeDirFor(path);
-      if (skillDir && deps.ensureSkillTree) await deps.ensureSkillTree(skillDir);
-      const handle = await deps.provision();
+      const parkedKey = parkedOutputKey(path);
+      if (parkedKey && deps.toolOutput && deps.sessionId) {
+        const parked = await withAbort(() => deps.toolOutput!.read(deps.sessionId!, parkedKey), signal);
+        if (parked && "expired" in parked)
+          return {
+            content: `[the full output in ${path} expired after 30 days; only the cut shown in the transcript remains]`,
+            sourceScopeId: writableScopeId,
+          };
+        if (parked) {
+          const { handle } = await machine(sandboxId);
+          await withAbort(() => deps.sandbox.writeFile(handle, path, parked.text), signal);
+          return {
+            content: `[copied the full output (${parked.text.length} chars) to ${path} on the computer; read the parts you need with execute, e.g. sed -n or grep]`,
+            sourceScopeId: writableScopeId,
+          };
+        }
+      }
+      signal?.throwIfAborted();
+      const { handle, resource, crossScope } = await machine(sandboxId);
+      const mounts = crossScope ? fallbackMounts.filter((mount) => mount.mountPath === "global") : fallbackMounts;
+      const rel = path.startsWith("/") ? workspacePathOf(handle.rootDir, path) : path;
+      if (rel === null) return { content: null, sourceScopeId: null, outsideWorkspace: true };
       return timed("file_op", async () => {
-        const direct = await deps.sandbox.readFile(handle, path);
-        if (direct !== null) return { content: direct, sourceScopeId: writableScopeId };
-        for (const mount of fallbackMounts) {
-          const v = await deps.sandbox.readFile(handle, join(mount.mountPath, path));
+        const direct = await withAbort(() => deps.sandbox.readFile(handle, rel), signal);
+        if (direct !== null) return { content: direct, sourceScopeId: resource?.ownerScopeId ?? writableScopeId };
+        for (const mount of mounts) {
+          const v = await withAbort(() => deps.sandbox.readFile(handle, join(mount.mountPath, rel)), signal);
           if (v !== null) return { content: v, sourceScopeId: mount.scopeId };
         }
         return { content: null, sourceScopeId: null };
@@ -872,86 +1041,66 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
       );
     },
 
-    async write(path: string, data?: string, share?: ShareDirective[]): Promise<WriteResult> {
-      const wantShare = share !== undefined && share.length > 0;
-      if (data === undefined && !wantShare) {
-        throw new Error("write needs `data` to save content, `share` to grant access, or both");
-      }
-      if (data !== undefined && deps.memory && deps.memoryScopeId && isUnderAnyDir(path, ["memory"])) {
+    async listSkills(query = "", offset = 0, limit = 50, source?: string) {
+      const available = (await deps.listSkills?.(source)) ?? [];
+      const matches = rankedSkills(available, query, [], Boolean(query));
+      const start = Math.max(0, Math.floor(offset));
+      const selected = matches.slice(start, start + Math.max(1, Math.min(100, Math.floor(limit))));
+      const sourceScopeId = selected.length && source ? selected[0]!.skill!.scopeId : null;
+      const end = start + selected.length;
+      return {
+        sourceScopeId,
+        skills: selected.map(({ skill }) => ({
+          id: skill!.id,
+          name: skill!.manifest.name,
+          description: skill!.manifest.description,
+          source: skill!.scopeId,
+        })),
+        ...(end < matches.length ? { nextOffset: end } : {}),
+      };
+    },
+
+    async skill(
+      name: string,
+      opts?: { path?: string; sandboxId?: string; source?: string; signal?: AbortSignal },
+    ): Promise<SkillResult> {
+      opts?.signal?.throwIfAborted();
+      if (!deps.useSkill) return { content: null, sourceScopeId: null };
+      if (opts?.sandboxId !== undefined && (!deps.sandboxResources || !deps.provisionResource))
+        throw new Error("named sandboxes are not available here");
+      return withAbort(
+        () => deps.useSkill!(name, opts?.path ?? "SKILL.md", opts?.sandboxId, opts?.source),
+        opts?.signal,
+      );
+    },
+
+    async write(path: string, data: string, sandboxId?: string): Promise<void> {
+      if (deps.memory && deps.memoryScopeId && isUnderAnyDir(path, ["memory"])) {
         throw new Error(
-          `your durable memory isn't a file — use the \`memory\` tool instead (action "remember" to add facts, "rewrite" to curate the whole notebook)`,
+          `your durable memory isn't a file — use the \`memory\` tool instead (actions "add", "edit" and "delete")`,
         );
       }
-      const handle = await deps.provision();
-      return once(() =>
+      const { handle, resource, crossScope, durableRef } = await machine(sandboxId);
+      if (crossScope) throw new Error("files write needs a computer owned by this conversation");
+      const ownerScopeId = resource?.ownerScopeId ?? writableScopeId;
+      const rel = path.startsWith("/") ? workspacePathOf(handle.rootDir, path) : path;
+      if (rel === null)
+        throw new Error(
+          `${path} is not in the computer's workspace; only workspace files can be written, so name it relative to the workspace`,
+        );
+      await once(() =>
         timed("file_op", async () => {
-          if (data !== undefined) {
-            await deps.sandbox.writeFile(handle, path, data);
-            if (writableScopeId && persistExclude && !isUnderAnyDir(path, persistExclude)) {
-              await deps.workspace.write(writableScopeId, path, data);
-            }
-          }
-          const shared: WriteResult["shared"] = [];
-          if (wantShare) {
-            if (!writableScopeId) throw new Error("share needs a writable scope that owns the file");
-            const bytes = await deps.sandbox.readFileBytes(handle, path);
-            if (bytes === null) throw new Error(`no such file to share: ${path}`);
-            await deps.workspace.write(writableScopeId, path, bytes);
-            const priorRows = deps.files
-              ? await deps.files.resolveByOwnerPaths([{ ownerScopeId: writableScopeId, path }])
-              : [];
-            const priorArtifact = priorRows.find((r) => r.direction === "out") ?? priorRows[0];
-            const priorAuthor = priorArtifact?.createdBy;
-            const author = data === undefined ? (priorAuthor ?? deps.createdBy) : deps.createdBy;
-            if (deps.files) {
-              try {
-                const name = path.split(/[\\/]/).pop() || path;
-                await deps.files.put({
-                  id: priorArtifact?.id ?? fileArtifactId(randomUUID(), "out", 0),
-                  reuseExistingPath: true,
-                  ownerScopeId: writableScopeId,
-                  createdBy: author,
-                  name,
-                  path,
-                  mimetype: mimeFromName(name),
-                  data: bytes,
-                  direction: "out",
-                  createdInScope: writableScopeId,
-                });
-              } catch (e) {
-                swallow("tools: persist of outbound file artifact failed", e);
-              }
-            }
-            for (const s of share!) {
-              const granteeScopeId = s.scope === "org" ? orgScopeId : s.scope;
-              if (!granteeScopeId) throw new Error('cannot resolve "org" — no org scope is mounted in this session');
-              if (parseScopeId(granteeScopeId).kind === null) {
-                throw new Error(
-                  `invalid share target "${s.scope}" — use a scope id like personal:<id>, channel:<id>, team:<id>, or org:<id> (or "org")`,
-                );
-              }
-              const permission: Permission = s.permission ?? "read";
-              await deps.acl.grant(
-                { ownerScopeId: writableScopeId, ref: path, granteeScopeId, permission, grantedBy: deps.createdBy },
-                author,
-              );
-              deps.auditLog?.record({
-                at: Date.now(),
-                principalId: deps.createdBy,
-                action: "file_share",
-                resource: path,
-                scopeLabel: granteeScopeId,
-              });
-              shared.push({ scope: granteeScopeId, permission });
-            }
-          }
-          return { shared };
+          await deps.sandbox.writeFile(handle, rel, data);
+          if (ownerScopeId && !isUnderAnyDir(rel, persistExclude))
+            await deps.workspace.write(ownerScopeId, durableRef(rel), data);
         }),
       );
     },
 
     async publish(input: PublishInput): Promise<PublishResult> {
       if (!writableScopeId) throw new Error("publish needs a writable scope to own the app");
+      if (input.share !== undefined || input.public !== undefined)
+        throw new Error("publish does not accept sharing options; use apps action share to change access");
       const owner: ScopeId = scopeId("personal", deps.createdBy);
       const createdInScope: ScopeId = writableScopeId;
       let effectiveEntrypoint = input.entrypoint;
@@ -968,9 +1117,9 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
       if (effectiveEntrypoint && input.dir && hasParentPathSegment(input.dir)) {
         throw new Error("publish directory must stay inside the workspace — no .. path segments");
       }
-      const handle = await deps.provision();
+      if (!effectiveEntrypoint && input.sandboxId !== undefined) await accessSandbox(input.sandboxId);
       const files: DeployFile[] = effectiveEntrypoint
-        ? filesUnder(await collectTree(deps.sandbox, handle, input.dir), input.dir)
+        ? filesUnder(await collectTree(deps.sandbox, (await machine(input.sandboxId)).handle, input.dir), input.dir)
         : [];
       if (effectiveEntrypoint && files.length === 0) {
         throw new Error(`publish: no files found under ${input.dir ?? "."} - nothing to deploy`);
@@ -983,32 +1132,7 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
             ),
           )
         : {};
-      const env = { ...input.env, ...authEnv };
 
-      const pc = deps.publishContext;
-      const aud: PublishAudience =
-        pc && orgScopeId
-          ? defaultPublishAudience({
-              kind: pc.conversationKind,
-              ...(pc.isPrivate !== undefined ? { isPrivate: pc.isPrivate } : {}),
-              ...(pc.isMpim !== undefined ? { isMpim: pc.isMpim } : {}),
-              ...(pc.publishMembers ? { members: pc.publishMembers } : {}),
-              orgScopeId,
-              ownerId: deps.createdBy,
-            })
-          : { kind: "owner", grantees: [] };
-      const optOut = Array.isArray(input.share) && input.share.length === 0;
-      const desiredDefault = optOut ? [] : aud.grantees;
-      const doReconcile = effectiveEntrypoint !== undefined && (optOut || !aud.incomplete);
-      const snapshotAt = Date.now();
-      const resolvedShare = input.share?.map((s) => {
-        const scope = s.scope === "org" ? orgScopeId : s.scope;
-        if (!scope) throw new Error('cannot resolve "org" — no org scope is mounted in this session');
-        if (parseScopeId(scope).kind === null) {
-          throw new Error(`invalid share target "${s.scope}" — use "org" or a scope id like personal:<id> or org:<id>`);
-        }
-        return { scope, permission: s.permission };
-      });
       return once(async () => {
         const d = await deps.deploy.deployOrUpdate({
           ownerScopeId: owner,
@@ -1018,31 +1142,18 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
           ...(input.entrypoint ? { entrypoint: input.entrypoint } : {}),
           ...(input.name !== undefined ? { name: input.name } : {}),
           ...(input.renameFrom !== undefined ? { renameFrom: input.renameFrom } : {}),
-          ...(Object.keys(env).length ? { env } : {}),
+          ...(input.env !== undefined ? { env: input.env } : {}),
+          ...(Object.keys(authEnv).length ? { stampEnv: authEnv } : {}),
           ...(input.rollbackTo !== undefined ? { rollbackTo: input.rollbackTo } : {}),
           ...(input.alwaysOn !== undefined ? { alwaysOn: input.alwaysOn } : {}),
-          ...(doReconcile
-            ? {
-                defaultAudience: {
-                  contextScopeId: createdInScope,
-                  granteeScopeIds: desiredDefault,
-                  snapshotAt,
-                  ...(optOut ? { force: true } : {}),
-                },
-              }
-            : {}),
-          ...(resolvedShare?.length ? { share: resolvedShare } : {}),
+          ...(input.embedAncestors !== undefined ? { embedAncestors: input.embedAncestors } : {}),
         });
         const ref = d.name ?? d.id;
         const grantees = await deps.deploy.deploymentGrantees(d.id);
-        const base = audienceFromGrantees(
+        const audience = audienceFromGrantees(
           grantees.map((g) => g.scope),
           d.createdInScope,
         );
-        const audience: PublishAudienceDescriptor =
-          aud.incomplete && effectiveEntrypoint !== undefined && input.share === undefined && aud.reason
-            ? { ...base, note: aud.reason }
-            : base;
         const urlBase = deps.publicWebUrl?.replace(/\/$/, "") ?? "";
         const url = publicUrlOf(d.endpoint) ?? `${urlBase}/d/${ref}/`;
         const dataDir = effectiveEntrypoint ? deps.deploy.providerProfile?.dataDir : undefined;
@@ -1054,45 +1165,78 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
           audience,
           ...(dataDir ? { dataDir } : {}),
           ...(d.alwaysOn ? { alwaysOn: true } : {}),
+          ...(d.embedAncestors?.length ? { embedAncestors: d.embedAncestors } : {}),
+          ...(d.public ? { public: true } : {}),
         };
       });
     },
 
-    async memorySearch(q: string, limit?: number): Promise<string[] | null> {
-      if (deps.context) return timed("recall", () => deps.context!.searchMemory(q, limit));
-      const read = deps.memoryAccess?.read ?? [];
-      if (!deps.memory || read.length === 0) return null;
+    async setDeploymentPublic(id: string, isPublic: boolean) {
+      const d = await deps.deploy.setDeploymentPublic(id, isPublic, { createdBy: deps.createdBy });
+      return { id: d.id, ...(d.name ? { name: d.name } : {}), public: d.public === true };
+    },
+
+    async memorySearch(q: string, limit?: number, scope?: ScopeId): Promise<string[] | null> {
+      if (deps.context) return timed("recall", () => deps.context!.searchMemory(q, limit, scope));
+      if (!memory) return null;
       return timed("recall", () =>
-        contextMemory({ memory: deps.memory!, scopes: read, actorId: deps.createdBy }).search(q, limit),
+        searchNotebooks(memory!, deps.memoryAccess?.read ?? [], q, limit, scope, deps.createdBy),
       );
     },
 
-    async memoryRead(): Promise<string | null> {
-      const write = deps.memoryAccess?.write;
-      if (!deps.memory || !write) return null;
-      return timed("recall", () => deps.memory!.read(write));
+    async memoryRead(scope?: ScopeId): Promise<string | null> {
+      const target = scope ?? deps.memoryAccess?.write ?? deps.memoryScopeId;
+      if (!memory || !target || !canReadNotebook(deps.memoryAccess ?? { read: [] }, target)) return null;
+      const body = await timed("recall", async () => {
+        if (deps.context && deps.memoryAccess?.read.includes(target)) return deps.context.readMemory(target);
+        return readNotebook(memory!, target);
+      });
+      if (body === null) return null;
+      return scope !== undefined ? `### ${target}\n${body}` : body;
     },
 
-    async memoryRemember(facts: string[]): Promise<number | null> {
+    async memoryAdd(facts: string[]): Promise<number | null> {
       const write = deps.memoryAccess?.write;
-      if (!deps.memory || !write) return null;
+      if (!memory || !write) return null;
       return once(() =>
         timed("memory_write", () =>
-          deps.memory!.capture(write, facts, Date.now(), deps.createdBy, { mode: "explicit", actorId: deps.createdBy }),
+          memory!.capture(write, facts, Date.now(), deps.createdBy, {
+            ...deps.memoryCaptureMetadata?.(),
+            mode: "explicit",
+            actorId: deps.createdBy,
+            conversationScopeId: writableScopeId ?? write,
+          }),
         ),
       );
     },
 
-    async memoryRewrite(content: string): Promise<true | null> {
+    async memoryEdit(edits: MemoryEdit[]): Promise<true | null> {
       const write = deps.memoryAccess?.write;
-      if (!deps.memory || !write) return null;
+      if (!memory?.edit || !write) return null;
       return once(() =>
         timed("memory_write", async () => {
-          await deps.memory!.replace(write, content, deps.createdBy);
+          await memory!.edit!(write, edits, deps.createdBy, {
+            ...deps.memoryCaptureMetadata?.(),
+            conversationScopeId: writableScopeId ?? write,
+          });
           return true as const;
         }),
       );
     },
+
+    async memoryDelete(ids: string[]): Promise<true | null> {
+      const write = deps.memoryAccess?.write;
+      if (!memory?.delete || !write) return null;
+      return once(() =>
+        timed("memory_write", async () => {
+          await memory!.delete!(write, ids, deps.createdBy);
+          return true as const;
+        }),
+      );
+    },
+
+    ...(deps.humanTurn ? { humanTurn: true } : {}),
+    ...(deps.sessionSyscalls ? { sessionSyscalls: deps.sessionSyscalls } : {}),
 
     async history(q: string, limit?: number): Promise<string[]> {
       if (!deps.sessionHistory) return [];
@@ -1104,46 +1248,73 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
       return deps.sessionHistory.open(seq);
     },
 
-    mcpToolDefs(): McpToolDescriptor[] {
-      return deps.mcp?.toolDefs() ?? [];
+    async callMcpTool(name: string, args: Record<string, unknown>, approval?: string): Promise<string> {
+      if (!deps.mcp) throw new Error("no MCP connectors are configured");
+      return deps.mcp.call(name, args, deps.createdBy, approval);
     },
 
-    async callMcpTool(name: string, args: Record<string, unknown>): Promise<string> {
+    async mcpToolNeedsApproval(name: string, args: Record<string, unknown>): Promise<boolean> {
       if (!deps.mcp) throw new Error("no MCP connectors are configured");
-      return deps.mcp.call(name, args, deps.createdBy);
+      return deps.mcp.needsApproval(name, args, deps.createdBy);
+    },
+
+    async awaitClientResult(callId, timeoutMs, signal, toolName) {
+      if (toolName === "desktop" && !deps.desktopClientId)
+        return { content: "Computer access unavailable; continue from QM desktop.", isError: true };
+      if (!deps.signals || runId === undefined) throw new Error("client tools need a queued run");
+      return waitForClientResult(deps.signals, runId, callId, { timeoutMs, ...(signal ? { signal } : {}) });
     },
 
     async backgroundStart(
       command: string,
-      opts?: { ttlSeconds?: number; sandboxId?: string },
+      opts: { purpose: string; ttlSeconds?: number; sandboxId?: string; credentials?: string[] },
     ): Promise<BackgroundStartResult> {
       if (!deps.backgroundBroker) throw new Error(BACKGROUND_UNAVAILABLE_MESSAGE);
+      const requestedCredentials = opts.credentials ?? [];
+      if (requestedCredentials.length && !writableScopeId)
+        throw new Error("command credentials are available only on scoped computers");
+      const requested = await selectCredentials(requestedCredentials, false);
+      const policy = deps.commandPolicy;
       let handle: SandboxHandle;
-      if (opts?.sandboxId) {
+      if (opts?.sandboxId !== undefined) {
         if (!deps.sandboxResources || !deps.provisionResource) throw new Error("sandbox inventory unavailable");
-        const record = await deps.sandboxResources.access(deps.createdBy, opts.sandboxId);
-        if (record.ownerScopeId !== writableScopeId) throw new Error("start work from the sandbox's owning scope");
-        handle = await deps.provisionResource(opts.sandboxId);
-      } else handle = await deps.provision();
-      const { decision, reason, matched, approvalKey } = evaluateCommandWithLayer(
-        command,
-        deps.commandPolicy(),
-        deps.layerCommandRules?.() ?? [],
-      );
-      if (decision === "deny") throw new CommandDenied(command, reason ?? "denied by policy");
-      if (decision === "require_approval" && !deps.authorizeCommand(command, approvalKey)) {
-        throw new NeedsApproval(command, reason ?? "requires approval", "approval", matched, approvalKey);
-      }
-      if (deps.ensureSkillTree) {
-        for (const skillDir of skillTreeDirsInCommand(command)) await deps.ensureSkillTree(skillDir, opts?.sandboxId);
+        const access = await accessSandbox(opts.sandboxId);
+        handle = await deps.provisionResource(access, (current) => {
+          if (current.crossScope && requestedCredentials.length)
+            throw new Error("command credentials cannot be copied to another scope's computer");
+          authorizeExecution(command, current, policy());
+        });
+      } else {
+        authorizeExecution(command, undefined, policy());
+        handle = await deps.provision();
       }
       return once(
-        () =>
-          deps.backgroundBroker!.start(
+        async () => {
+          const staged = requested.length ? await stageCredentials(requested, handle, "background") : undefined;
+          const release = async () => {
+            await staged?.fileExecution?.finish();
+          };
+          let credentials: BackgroundCredentials | undefined;
+          try {
+            credentials = staged && {
+              env: staged.commandEnv,
+              secrets: Object.values(executionSecretEnv(staged.commandEnv, staged.secretValues)),
+              ...(staged.fileExecution
+                ? { files: processCredentialFiles(staged.fileExecution.plan, staged.fileCredentials) }
+                : {}),
+              release,
+            };
+          } catch (error) {
+            return withCleanup(() => Promise.reject(error), release);
+          }
+          return deps.backgroundBroker!.start(
             handle,
-            deps.scopedCommand?.(command) ?? command,
+            command,
+            opts.purpose,
             opts?.ttlSeconds ? opts.ttlSeconds * 1000 : undefined,
-          ),
+            credentials,
+          );
+        },
         () => true,
       );
     },
@@ -1253,13 +1424,18 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
         (c, cl) => c.disableWebhook(id, cl),
         (r) => r.ok,
       ),
+    webhookUpdate: (id, action) =>
+      controlOp(
+        (c, cl) => c.updateWebhook(id, { action }, cl),
+        (r) => r.ok,
+      ),
     soulRead() {
       if (!deps.control || !deps.controlClaims) return CONTROL_UNAVAILABLE;
       return deps.control.readSoul(deps.controlClaims);
     },
-    soulWrite: (content) =>
+    soulWrite: (content, expectedVersion) =>
       controlOp(
-        async (c, cl) => c.writeSoul(content, cl),
+        async (c, cl) => c.writeSoul(content, cl, expectedVersion),
         (r) => r.ok,
       ),
     shareArtifact: (req) =>
@@ -1268,14 +1444,14 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
         (r) => r.ok,
       ),
 
-    post: (text, opts, files) =>
+    post: (text, opts, files, sandboxId) =>
       surfaceOp(
-        (s) => s.post(text, opts, files),
+        (s) => s.post(text, opts, files, sandboxId),
         (r) => r.ok,
       ),
-    reach: (text, target, files) =>
+    reach: (text, target, files, sandboxId) =>
       surfaceOp(
-        (s) => s.reach(text, target, files),
+        (s) => s.reach(text, target, files, sandboxId),
         (r) => r.ok,
       ),
     react: (input) =>
@@ -1299,14 +1475,12 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
     readMembers: () => surfaceOp((s) => s.readMembers()),
     readFile: (ref) => surfaceOp((s) => s.readFile(ref)),
     getStandingOrder: () => surfaceOp((s) => s.getStandingOrder()),
-    setStandingOrder: (orders, bots, ambientEnabled) =>
-      surfaceOp((s) => s.setStandingOrder(orders, bots, ambientEnabled)),
-    staySilent: (reason) =>
-      deps.surface
-        ? deps.surface.staySilent(reason)
-        : Promise.resolve({ ok: true as const, message: "[staying silent]" }),
-    attach: (files) =>
-      deps.attach ? deps.attach(files) : Promise.resolve({ ok: false as const, message: ATTACH_UNAVAILABLE_MESSAGE }),
+    setStandingOrder: (orders, bots, ambientEnabled, expectedOrders) =>
+      surfaceOp((s) => s.setStandingOrder(orders, bots, ambientEnabled, expectedOrders)),
+    attach: (files, sandboxId) =>
+      deps.attach
+        ? deps.attach(files, sandboxId)
+        : Promise.resolve({ ok: false as const, message: ATTACH_UNAVAILABLE_MESSAGE }),
   };
 }
 
@@ -1332,7 +1506,9 @@ function audienceFromGrantees(
   return {
     kind: "members",
     ...(origin.kind === "channel" ? { channelRef: origin.ref } : {}),
-    memberCount: granteeScopeIds.length,
+    ...(granteeScopeIds.every((g) => parseScopeId(g).kind === "personal")
+      ? { memberCount: granteeScopeIds.length }
+      : {}),
   };
 }
 
@@ -1344,7 +1520,7 @@ function tryDecodeUtf8(bytes: Uint8Array): string | null {
   }
 }
 
-const COMMAND_PATH_PROBE_TIMEOUT_MS = 15_000;
+const COMMAND_PATH_PROBE_TIMEOUT_MS = 10_000;
 
 async function collectTree(
   sandbox: Sandbox,

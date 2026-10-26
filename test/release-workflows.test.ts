@@ -21,7 +21,7 @@ test("the release is the sole sandbox-base publisher and bakes in the browser en
     workflow,
     /- name: sandbox-base\n\s+dockerfile: fly\/Dockerfile\n\s+build-args: INSTALL_BROWSER_ENGINE=1\n/,
   );
-  assert.match(workflow, /build-args: \$\{\{ matrix\.build-args \}\}/);
+  assert.match(workflow, /build-args: \|\n\s+\$\{\{ matrix\.build-args \}\}\n\s+GIT_SHA=\$\{\{ github\.sha \}\}/);
   assert.equal(existsSync(".github/workflows/publish-sandbox-base.yml"), false);
   assert.equal(existsSync(".github/workflows/publish-images.yml"), false);
 });
@@ -84,7 +84,7 @@ test("the published package pins real image digests, never the checked-in sentin
     workflow.indexOf("Pin published image digests") < workflow.indexOf("npm publish"),
     "digests are resolved before the package is published",
   );
-  assert.match(workflow, /for service in core web-ui admin portal auth sandbox-base; do/);
+  assert.match(workflow, /for service in core web-ui admin portal auth egress-proxy sandbox-base; do/);
   assert.match(workflow, /printf '%s\\n' "\$out" > cli\/manifest\.json/);
   assert.match(workflow, /no published image for \$repo at \$IMAGES_REF/);
   assert.match(workflow, /\{63\}\$"\) \| not\)/);
@@ -94,7 +94,7 @@ test("the published package pins real image digests, never the checked-in sentin
     services: Record<string, string>;
   };
   const refs = [sentinel.sandboxBase, ...Object.values(sentinel.services)];
-  assert.equal(refs.length, 6);
+  assert.equal(refs.length, 7);
   assert.ok(
     refs.every((ref) => ref.startsWith("registry.invalid/")),
     "the checked-in manifest stays a sentinel so a source checkout never pulls a stale digest",

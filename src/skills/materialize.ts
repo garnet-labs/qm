@@ -1,88 +1,35 @@
 import { CapabilityUnsupportedError, type Sandbox, type SandboxHandle } from "../sandbox/sandbox.ts";
-import { createHash } from "node:crypto";
 import { safeSkillFilePath, type SkillFile, type SkillResolution } from "./skill-store.ts";
 import type { SkillBundle } from "./skill-bundle-store.ts";
 import { swallow } from "../util/errors.ts";
-import { assertSafeSkillName, isSafeSkillName } from "./skill-name.ts";
-import { createKeyedQueue } from "../util/async.ts";
-import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
+import { assertSafeSkillName } from "./skill-name.ts";
 import type { ScopeId } from "../types.ts";
-import {
-  isSkillMaterializationControlPath,
-  SKILLS_DIR,
-  SKILLS_INDEX_MARKER as INDEX_MARKER,
-  SKILL_TREE_MARKER as TREE_MARKER,
-} from "./materialization-paths.ts";
 
-const SKILL_PACKS_DIR = `${SKILLS_DIR}/.packs`;
-export { SKILLS_DIR } from "./materialization-paths.ts";
-
-export interface SkillMaterializer {
-  materializeIndex(
-    sandbox: Sandbox,
-    handle: SandboxHandle,
-    resolved: SkillResolution[],
-    current?: () => Promise<SkillResolution[]>,
-  ): Promise<void>;
-  materializeTree(
-    sandbox: Sandbox,
-    handle: SandboxHandle,
-    resolution: SkillResolution,
-    bundles?: SkillBundle[],
-    current?: () => Promise<{ resolution: SkillResolution; bundles: SkillBundle[] } | null>,
-  ): Promise<void>;
-}
-
-function materializationKey(handle: SandboxHandle): string {
-  const sandboxId = createHash("sha256").update(handle.id).update("\0").update(handle.rootDir).digest("hex");
-  return `skills:projection:${sandboxId}`;
-}
+export const SKILLS_DIR = "skills";
+export const SKILLS_ROOT = ".agent-skills";
 
 export function safeSkillDirName(name: string): string {
   return assertSafeSkillName(name);
 }
 
-function indexHash(resolved: SkillResolution[]): string {
-  const h = createHash("sha256");
-  const entries = resolved
-    .filter((r) => r.skill)
-    .map((r) => `${r.skill!.manifest.name}\0${r.skill!.scopeId}\0${r.skill!.id}\0${renderedBody(r)}`)
-    .sort();
-  for (const e of entries) {
-    h.update(e);
-    h.update("\n");
-  }
-  return h.digest("hex");
+export function skillDir(root: string, resolution: SkillResolution): string {
+  return `${root}/${safeSkillDirName(resolution.skill!.manifest.name)}`;
 }
 
-function treeHash(resolution: SkillResolution, bundles: SkillBundle[]): string {
-  const m = resolution.skill!.manifest;
-  const files = [...(m.files ?? [])]
-    .map((f) => `${f.path}\0${f.content}\0${f.executable === true ? "1" : "0"}`)
-    .sort()
-    .join("\0");
-  const folded = [...bundles]
-    .map((b) => b.hash)
-    .sort()
-    .join("\0");
-  return createHash("sha256")
-    .update(renderedBody(resolution))
-    .update("\0")
-    .update(files)
-    .update("\0")
-    .update(folded)
-    .digest("hex");
+export function packRoot(root: string, resolution: SkillResolution): string | null {
+  return resolution.skill?.pack ? `${root}/.packs/${safeSkillDirName(resolution.skill.pack.packId)}` : null;
 }
 
-function packRoot(resolution: SkillResolution): string | null {
-  return resolution.skill?.pack ? `${SKILL_PACKS_DIR}/${safeSkillDirName(resolution.skill.pack.packId)}` : null;
+export function rehomeSkillPaths(resolution: SkillResolution, text: string, root: string): string {
+  const name = safeSkillDirName(resolution.skill!.manifest.name);
+  return text.split(`${SKILLS_DIR}/${name}/`).join(`${root}/${name}/`);
 }
 
-function renderedBody(resolution: SkillResolution): string {
-  const body = resolution.skill!.manifest.body;
-  const root = packRoot(resolution);
-  return root
-    ? `${body}\n\n## Pack files\nResolve repository-relative shared-file paths against \`${root}/\`; pack files never overwrite the workspace root.`
+export function renderSkillBody(resolution: SkillResolution, root = SKILLS_DIR): string {
+  const body = rehomeSkillPaths(resolution, resolution.skill!.manifest.body, root);
+  const pack = packRoot(root, resolution);
+  return pack
+    ? `${body}\n\n## Pack files\nResolve repository-relative shared-file paths against \`${pack}/\`; pack files never overwrite the workspace root.`
     : body;
 }
 
@@ -91,114 +38,46 @@ interface LayEntry {
   content: string;
 }
 
-interface IndexMarkerState {
-  version: 2;
-  hash: string;
-  names: string[];
-  identities?: Record<string, string>;
-  legacyExternalPathsPreserved?: true;
-}
-
-interface TreeMarkerState {
-  version: 2;
-  hash: string;
-  skillPaths: string[];
-  bundlePaths: string[];
-}
-
-function parsedMarker(raw: string | null): Record<string, unknown> | null {
-  if (!raw?.startsWith("{")) return null;
-  try {
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    return parsed.version === 2 && typeof parsed.hash === "string" ? parsed : null;
-  } catch {
-    return null;
+function entriesUnder(
+  dir: string,
+  files: SkillFile[],
+  label: string,
+  content: (f: SkillFile) => string = (f) => f.content,
+  skip: (rel: string) => boolean = () => false,
+): LayEntry[] {
+  const entries: LayEntry[] = [];
+  for (const f of files) {
+    try {
+      const rel = safeSkillFilePath(f.path);
+      if (!skip(rel)) entries.push({ path: `${dir}/${rel}`, content: content(f) });
+    } catch (e) {
+      swallow(`skills: bad ${label} path ${f.path}`, e);
+    }
   }
+  return entries;
 }
 
-function indexMarkerState(raw: string | null): IndexMarkerState | null {
-  const parsed = parsedMarker(raw);
-  if (
-    !parsed ||
-    !Array.isArray(parsed.names) ||
-    !parsed.names.every((name) => typeof name === "string" && isSafeSkillName(name))
-  )
-    return null;
-  return parsed as unknown as IndexMarkerState;
-}
-
-function isSafeMaterializedPath(path: unknown): path is string {
-  if (typeof path !== "string") return false;
-  try {
-    return safeSkillFilePath(path) === path;
-  } catch {
-    return false;
-  }
-}
-
-function treeMarkerState(raw: string | null, dir: string): TreeMarkerState | null {
-  const parsed = parsedMarker(raw);
-  if (!parsed || !Array.isArray(parsed.skillPaths) || !Array.isArray(parsed.bundlePaths)) return null;
-  if (
-    !parsed.skillPaths.every(
-      (path) => isSafeMaterializedPath(path) && path.startsWith(`${dir}/`) && !isSkillMaterializationControlPath(path),
-    )
-  )
-    return null;
-  if (!parsed.bundlePaths.every((path) => isSafeMaterializedPath(path) && !isSkillMaterializationControlPath(path)))
-    return null;
-  return parsed as unknown as TreeMarkerState;
-}
-
-function samePaths(a: string[], b: string[]): boolean {
-  return a.length === b.length && a.every((path, index) => path === b[index]);
-}
-
-async function readMarker(
+export async function materializeSkillTree(
   sandbox: Sandbox,
   handle: SandboxHandle,
-  path: string,
-  label: string,
-): Promise<string | null> {
-  try {
-    return await sandbox.readFile(handle, path);
-  } catch (error) {
-    swallow(label, error);
-    return null;
-  }
-}
-
-function guardedSkillPaths(dir: string, files: SkillFile[] | undefined): string[] {
-  const paths = [`${dir}/SKILL.md`];
-  for (const file of files ?? []) {
-    try {
-      const path = `${dir}/${safeSkillFilePath(file.path)}`;
-      if (!isSkillMaterializationControlPath(path)) paths.push(path);
-    } catch (error) {
-      swallow(`skills: bad asset path ${file.path}`, error);
-    }
-  }
-  return [...new Set(paths)].sort();
-}
-
-function guardedBundlePaths(bundles: SkillBundle[]): string[] {
-  const paths: string[] = [];
-  for (const bundle of bundles) {
-    const root = `${SKILL_PACKS_DIR}/${safeSkillDirName(bundle.packId)}`;
-    for (const file of bundle.files) {
-      try {
-        const path = `${root}/${safeSkillFilePath(file.path)}`;
-        if (!isSkillMaterializationControlPath(path)) paths.push(path);
-      } catch (error) {
-        swallow(`skills: bad bundle path ${file.path}`, error);
-      }
-    }
-  }
-  return [...new Set(paths)].sort();
-}
-
-async function layFiles(sandbox: Sandbox, handle: SandboxHandle, entries: LayEntry[]): Promise<void> {
-  if (!entries.length) return;
+  root: string,
+  resolution: SkillResolution,
+  bundles: SkillBundle[] = [],
+): Promise<void> {
+  if (!resolution.skill) return;
+  const dir = skillDir(root, resolution);
+  const entries: LayEntry[] = [
+    { path: `${dir}/SKILL.md`, content: renderSkillBody(resolution, root) },
+    ...entriesUnder(
+      dir,
+      resolution.skill.manifest.files ?? [],
+      "asset",
+      (f) => rehomeSkillPaths(resolution, f.content, root),
+      (rel) => rel === "SKILL.md",
+    ),
+  ];
+  for (const b of bundles)
+    entries.push(...entriesUnder(`${root}/.packs/${safeSkillDirName(b.packId)}`, b.files, "bundle"));
   if (sandbox.importFiles) {
     try {
       await sandbox.importFiles(
@@ -213,224 +92,97 @@ async function layFiles(sandbox: Sandbox, handle: SandboxHandle, entries: LayEnt
   for (const e of entries) await sandbox.writeFile(handle, e.path, e.content);
 }
 
-async function materializeSkillIndexUnlocked(
-  sandbox: Sandbox,
-  handle: SandboxHandle,
+export function rankedSkills(
   resolved: SkillResolution[],
-): Promise<void> {
-  const want = indexHash(resolved);
-  const names = resolved.flatMap((r) => (r.skill ? [safeSkillDirName(r.skill.manifest.name)] : [])).sort();
-  const identities = Object.fromEntries(
-    resolved.flatMap((r) =>
-      r.skill ? [[safeSkillDirName(r.skill.manifest.name), JSON.stringify([r.skill.scopeId, r.skill.id])]] : [],
+  query = "",
+  usedNames: readonly string[] = [],
+  onlyMatches = false,
+): SkillResolution[] {
+  const tokens = (text: string) =>
+    new Set(
+      [...new Intl.Segmenter("en", { granularity: "word" }).segment(text.toLowerCase())]
+        .filter((part) => part.isWordLike)
+        .map((part) => part.segment),
+    );
+  const ignored = new Set(
+    "a an and are as at be by can do for from have help i in is it me my of on or please that the this to today use want what with you your".split(
+      " ",
     ),
   );
-  const raw = await readMarker(sandbox, handle, INDEX_MARKER, "skills: index probe");
-  const prev = indexMarkerState(raw);
-  if (prev?.hash === want && samePaths(prev.names, names)) return;
-  const legacyExternalPathsPreserved = prev?.legacyExternalPathsPreserved === true || Boolean(raw && !prev);
-
-  if (raw && !prev) {
-    await sandbox.removeDir(handle, SKILLS_DIR);
-  } else if (prev) {
-    const unchangedNames = new Set(names.filter((name) => prev.identities?.[name] === identities[name]));
-    const activeBundlePaths = new Set<string>();
-    for (const name of unchangedNames) {
-      const currentRaw = await readMarker(
-        sandbox,
-        handle,
-        `${SKILLS_DIR}/${name}/${TREE_MARKER}`,
-        `skills: tree probe ${name}`,
-      );
-      const current = treeMarkerState(currentRaw, `${SKILLS_DIR}/${name}`);
-      for (const path of current?.bundlePaths ?? []) activeBundlePaths.add(path);
-    }
-    for (const name of prev.names) {
-      if (unchangedNames.has(name)) continue;
-      const dir = `${SKILLS_DIR}/${name}`;
-      const staleRaw = await readMarker(sandbox, handle, `${dir}/${TREE_MARKER}`, `skills: tree probe ${name}`);
-      const stale = treeMarkerState(staleRaw, dir);
-      const paths = new Set([`${dir}/SKILL.md`, ...(stale?.skillPaths ?? []), ...(stale?.bundlePaths ?? [])]);
-      for (const path of paths) {
-        if (!activeBundlePaths.has(path)) await sandbox.removeDir(handle, path);
-      }
-      const protectsDirectory = [...activeBundlePaths].some((path) => path.startsWith(`${dir}/`));
-      if (protectsDirectory) await sandbox.removeDir(handle, `${dir}/${TREE_MARKER}`);
-      else await sandbox.removeDir(handle, dir);
-    }
+  const words = [...tokens(query)].filter((word) => !ignored.has(word));
+  const unique = new Map<string, SkillResolution>();
+  for (const entry of resolved) {
+    if (entry.skill && !unique.has(entry.skill.manifest.name)) unique.set(entry.skill.manifest.name, entry);
   }
-
-  const entries: LayEntry[] = [];
-  for (const r of resolved) {
-    if (!r.skill) continue;
-    entries.push({
-      path: `${SKILLS_DIR}/${safeSkillDirName(r.skill.manifest.name)}/SKILL.md`,
-      content: renderedBody(r),
-    });
-  }
-  entries.push({
-    path: INDEX_MARKER,
-    content: JSON.stringify({
-      version: 2,
-      hash: want,
-      names,
-      identities,
-      ...(legacyExternalPathsPreserved ? { legacyExternalPathsPreserved: true as const } : {}),
-    } satisfies IndexMarkerState),
-  });
-  await layFiles(sandbox, handle, entries);
+  return [...unique.values()]
+    .map((entry) => {
+      const skill = entry.skill!;
+      const text = tokens(`${skill.manifest.name} ${skill.manifest.description}`);
+      return {
+        entry,
+        relevance: words.filter((word) => text.has(word)).length,
+        used: usedNames.includes(skill.manifest.name) ? 1 : 0,
+      };
+    })
+    .filter(({ relevance }) => !onlyMatches || relevance > 0)
+    .sort(
+      (a, b) =>
+        b.relevance - a.relevance ||
+        b.used - a.used ||
+        a.entry.skill!.manifest.name.localeCompare(b.entry.skill!.manifest.name),
+    )
+    .map(({ entry }) => entry);
 }
 
-async function materializeSkillTreeUnlocked(
-  sandbox: Sandbox,
-  handle: SandboxHandle,
-  resolution: SkillResolution,
-  bundles: SkillBundle[] = [],
-): Promise<void> {
-  if (!resolution.skill) return;
-  const m = resolution.skill.manifest;
-  const files = m.files ?? [];
+const SKILLS_INDEX_BUDGET = 12_000;
+const MIN_DESCRIPTION = 60;
 
-  const dir = `${SKILLS_DIR}/${safeSkillDirName(m.name)}`;
-  const marker = `${dir}/${TREE_MARKER}`;
-  const want = treeHash(resolution, bundles);
-  const skillPaths = guardedSkillPaths(dir, files);
-  const bundlePaths = guardedBundlePaths(bundles);
-  const raw = await readMarker(sandbox, handle, marker, "skills: tree probe");
-  const prev = treeMarkerState(raw, dir);
-  if (prev?.hash === want && samePaths(prev.skillPaths, skillPaths) && samePaths(prev.bundlePaths, bundlePaths)) return;
-
-  if (raw === want) {
-    await sandbox.writeFile(
-      handle,
-      marker,
-      JSON.stringify({ version: 2, hash: want, skillPaths, bundlePaths } satisfies TreeMarkerState),
-    );
-    return;
+function fitDescriptions(heads: string[], descriptions: string[], budget: number): number {
+  const size = (cap: number) =>
+    heads.reduce((sum, head, i) => sum + head.length + 1 + Math.min(descriptions[i]!.length, cap) + 4, 0);
+  let low = 0;
+  let high = Math.max(0, ...descriptions.map((d) => d.length));
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (size(mid) <= budget) low = mid;
+    else high = mid - 1;
   }
-
-  const otherBundlePaths = new Set<string>();
-  const indexRaw = await readMarker(sandbox, handle, INDEX_MARKER, "skills: index probe");
-  const index = indexMarkerState(indexRaw);
-  for (const name of index?.names ?? []) {
-    if (name === safeSkillDirName(m.name)) continue;
-    const otherRaw = await readMarker(
-      sandbox,
-      handle,
-      `${SKILLS_DIR}/${name}/${TREE_MARKER}`,
-      `skills: tree probe ${name}`,
-    );
-    const other = treeMarkerState(otherRaw, `${SKILLS_DIR}/${name}`);
-    for (const path of other?.bundlePaths ?? []) otherBundlePaths.add(path);
-  }
-
-  if (prev) {
-    const currentSkillPaths = new Set(skillPaths);
-    const currentBundlePaths = new Set(bundlePaths);
-    for (const path of prev.skillPaths) {
-      if (!currentSkillPaths.has(path) && !otherBundlePaths.has(path)) await sandbox.removeDir(handle, path);
-    }
-    for (const path of prev.bundlePaths) {
-      if (!currentBundlePaths.has(path) && !otherBundlePaths.has(path)) await sandbox.removeDir(handle, path);
-    }
-  } else if (![...otherBundlePaths].some((path) => path.startsWith(`${dir}/`))) {
-    await sandbox.removeDir(handle, dir);
-  }
-
-  const entries: LayEntry[] = [{ path: `${dir}/SKILL.md`, content: renderedBody(resolution) }];
-  for (const f of files) {
-    let rel: string;
-    try {
-      rel = safeSkillFilePath(f.path);
-    } catch (e) {
-      swallow(`skills: bad asset path ${f.path}`, e);
-      continue;
-    }
-    const path = `${dir}/${rel}`;
-    if (!isSkillMaterializationControlPath(path)) entries.push({ path, content: f.content });
-  }
-  for (const b of bundles) {
-    const root = `${SKILL_PACKS_DIR}/${safeSkillDirName(b.packId)}`;
-    for (const f of b.files) {
-      let rel: string;
-      try {
-        rel = safeSkillFilePath(f.path);
-      } catch (e) {
-        swallow(`skills: bad bundle path ${f.path}`, e);
-        continue;
-      }
-      const path = `${root}/${rel}`;
-      if (!isSkillMaterializationControlPath(path)) entries.push({ path, content: f.content });
-    }
-  }
-  entries.push({
-    path: marker,
-    content: JSON.stringify({ version: 2, hash: want, skillPaths, bundlePaths } satisfies TreeMarkerState),
-  });
-  await layFiles(sandbox, handle, entries);
+  return low;
 }
 
-export function createSkillMaterializer(advisoryLock?: AdvisoryLock): SkillMaterializer {
-  const queue = createKeyedQueue<string>();
-  const locked = <T>(handle: SandboxHandle, fn: () => Promise<T>): Promise<T> => {
-    const key = materializationKey(handle);
-    return queue(key, () => advisoryLock?.withLock(key, fn) ?? fn());
-  };
-  return {
-    materializeIndex(sandbox, handle, resolved, current) {
-      return locked(handle, async () => {
-        const latest = current ? await current() : resolved;
-        await materializeSkillIndexUnlocked(sandbox, handle, latest);
-      });
-    },
-    materializeTree(sandbox, handle, resolution, bundles = [], current) {
-      return locked(handle, async () => {
-        const latest = current ? await current() : { resolution, bundles };
-        if (latest) await materializeSkillTreeUnlocked(sandbox, handle, latest.resolution, latest.bundles);
-      });
-    },
-  };
-}
-
-const localMaterializer = createSkillMaterializer();
-
-export function materializeSkillIndex(
-  sandbox: Sandbox,
-  handle: SandboxHandle,
+export function skillsIndex(
   resolved: SkillResolution[],
-): Promise<void> {
-  return localMaterializer.materializeIndex(sandbox, handle, resolved);
-}
-
-export function materializeSkillTree(
-  sandbox: Sandbox,
-  handle: SandboxHandle,
-  resolution: SkillResolution,
-  bundles: SkillBundle[] = [],
-): Promise<void> {
-  return localMaterializer.materializeTree(sandbox, handle, resolution, bundles);
-}
-
-export function skillsIndex(resolved: SkillResolution[], provenanceScopes: readonly ScopeId[] = []): string {
+  provenanceScopes: readonly ScopeId[] = [],
+  usedNames: readonly string[] = [],
+  budget = SKILLS_INDEX_BUDGET,
+): string {
   const provenance = new Set(provenanceScopes);
-  const items = resolved
-    .filter((r) => r.skill)
-    .sort((a, b) => {
-      const [x, y] = [a.skill!.manifest.name, b.skill!.manifest.name];
-      if (x < y) return -1;
-      if (x > y) return 1;
-      return 0;
-    });
+  const items = rankedSkills(resolved, "", usedNames);
   if (!items.length) return "";
-  const lines = items.map((r) => {
-    const m = r.skill!.manifest;
-    const shadow = r.shadowed.length ? " (shadows a broader-scope skill of the same name)" : "";
+  const heads = items.map((r) => {
     const source = provenance.has(r.skill!.scopeId) ? ` [from ${r.skill!.scopeId}]` : "";
-    return `- **${m.name}**${source} — ${m.description}${shadow}  → read \`${SKILLS_DIR}/${safeSkillDirName(m.name)}/SKILL.md\``;
+    return `- **${r.skill!.manifest.name}**${source}`;
   });
+  const descriptions = items.map((r) => r.skill!.manifest.description.trim());
+  const cap = fitDescriptions(heads, descriptions, budget);
+  let lines: string[];
+  let note = "";
+  const shortened = descriptions.filter((d) => d.length > cap).length;
+  if (cap >= MIN_DESCRIPTION || !shortened) {
+    lines = heads.map((head, i) => {
+      const d = descriptions[i]!;
+      return `${head} — ${d.length > cap ? `${d.slice(0, cap).trimEnd()}…` : d}`;
+    });
+    if (shortened) note = ` ${shortened} descriptions are shortened; skills action read shows the full text.`;
+  } else {
+    let used = 0;
+    lines = heads.filter((head) => (used += head.length + 1) <= budget);
+    const omitted = items.length - lines.length;
+    note = ` Descriptions are omitted to fit the list${omitted ? `, and ${omitted} skills are left out; find them with skills action search` : ""}.`;
+  }
   return [
     "## Skills",
-    "You have these skills available. To use one, read its SKILL.md and follow it (run its steps with your tools):",
+    `If the task matches a skill's description, or uses a connected app or service a skill covers, read that skill in full with skills action read before acting.${note}`,
     ...lines,
   ].join("\n");
 }

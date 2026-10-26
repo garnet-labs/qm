@@ -31,6 +31,8 @@ interface SlackMeta {
   channelLabel?: string;
   ts: string;
   threadTs?: string;
+  isDirectMessage?: boolean;
+  userId?: string;
 }
 
 function parseSlackMeta(v: unknown): SlackMeta | undefined {
@@ -40,24 +42,34 @@ function parseSlackMeta(v: unknown): SlackMeta | undefined {
   if (!channelId || !ts) return undefined;
   const channelLabel = clipOpt(v.channelLabel, 120);
   const threadTs = clipOpt(v.threadTs, 40);
-  return { channelId, ts, ...(channelLabel ? { channelLabel } : {}), ...(threadTs ? { threadTs } : {}) };
+  const userId = clipOpt(v.userId, 40);
+  return {
+    channelId,
+    ts,
+    ...(channelLabel ? { channelLabel } : {}),
+    ...(threadTs ? { threadTs } : {}),
+    ...(userId ? { userId } : {}),
+    ...(typeof v.isDirectMessage === "boolean" ? { isDirectMessage: v.isDirectMessage } : {}),
+  };
 }
 
 function metaOf(item: LoopItem): SlackMeta | undefined {
   return parseSlackMeta(item.sourcePayload?.slack);
 }
 
-export function slackConversationRef(channelId: string, ts: string, threadTs?: string): string {
-  const dm = channelId.startsWith("D") || channelId.startsWith("G");
-  return dm ? channelId : `${channelId}:${threadTs ?? ts}`;
+export function slackConversationRef(
+  channelId: string,
+  ts: string,
+  threadTs: string | undefined,
+  isDirectMessage: boolean,
+): string {
+  return isDirectMessage && !threadTs ? channelId : `${channelId}:${threadTs ?? ts}`;
 }
 
 export function slackReplyThreadTs(item: LoopItem): string | undefined {
   const slack = metaOf(item);
   if (!slack) return undefined;
-  if (slack.threadTs) return slack.threadTs;
-  const dm = slack.channelId.startsWith("D") || slack.channelId.startsWith("G");
-  return dm ? undefined : slack.ts;
+  return slack.threadTs ?? (slack.isDirectMessage ? undefined : slack.ts);
 }
 
 function itemReactions(item: LoopItem): string[] {
@@ -66,7 +78,10 @@ function itemReactions(item: LoopItem): string[] {
 }
 
 export function slackUserClientFactory(apiUrl?: string): (token: string) => SlackUserClient {
-  const options = apiUrl ? { slackApiUrl: normalizeSlackApiUrl(apiUrl) } : {};
+  const options = {
+    attachOriginalToWebAPIRequestError: false,
+    ...(apiUrl ? { slackApiUrl: normalizeSlackApiUrl(apiUrl) } : {}),
+  };
   return (token) => new WebClient(token, options);
 }
 
@@ -165,8 +180,9 @@ export const slackAdapter: LoopSourceAdapter = {
     const rawKey = clip(raw.sourceKey ?? raw.dedupeKey, 300);
     if (!rawKey) return { error: "sourceKey required" };
     const slack = parseSlackMeta(raw.slack);
-    if (!slack) return { error: "slack items need slack.channelId and slack.ts" };
-    const dedupeKey = slackConversationRef(slack.channelId, slack.ts, slack.threadTs);
+    if (!slack || slack.isDirectMessage === undefined)
+      return { error: "slack items need slack.channelId, slack.ts and slack.isDirectMessage" };
+    const dedupeKey = slackConversationRef(slack.channelId, slack.ts, slack.threadTs, slack.isDirectMessage);
     const draft = raw.draft === undefined ? undefined : parseReplyDraft(raw.draft);
     if (draft === null) return { error: "draft needs a string body" };
     const entry: ParsedEntry = {
@@ -181,7 +197,9 @@ export const slackAdapter: LoopSourceAdapter = {
   matchesEvent(item, conversationRef) {
     const slack = metaOf(item);
     if (!slack) return false;
-    return slackConversationRef(slack.channelId, slack.ts, slack.threadTs) === conversationRef;
+    return (slack.isDirectMessage ? [true, false] : [false]).some(
+      (dm) => slackConversationRef(slack.channelId, slack.ts, slack.threadTs, dm) === conversationRef,
+    );
   },
   parseProposal(raw) {
     const draft = parseReplyDraft(raw);
@@ -193,7 +211,7 @@ export const slackAdapter: LoopSourceAdapter = {
     }
     try {
       if (kind === "react") return await reactInSlack(deps, item, args.name);
-      const draft = parseReplyDraft(args) ?? draftOf(item);
+      const draft = args.body !== undefined ? parseReplyDraft(args) : draftOf(item);
       if (!draft || !draft.body.trim()) return { ok: false, reason: "bad_item", message: "the draft is empty" };
       return await sendSlack(deps, item, { ...draft, body: draft.body.trim() });
     } catch (err) {

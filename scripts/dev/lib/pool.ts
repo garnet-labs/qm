@@ -1,7 +1,8 @@
 import { mkdirSync, readdirSync, chmodSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { bestEffort, readEnvFile } from "./util.ts";
+import { readEnvFile } from "../../../cli/src/util.ts";
+import { bestEffort } from "./util.ts";
 import type { SlotPorts } from "./types.ts";
 
 const CONFIG_HOME = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
@@ -51,7 +52,7 @@ export interface SlotTokens {
 }
 
 export function slotTokens(slot: string, store = poolStore()): SlotTokens {
-  const env = readEnvFile(join(store, `${slot}.env`));
+  const env = Object.fromEntries(readEnvFile(join(store, `${slot}.env`)));
   return {
     botToken: env.SLACK_BOT_TOKEN ?? "",
     appToken: env.SLACK_APP_TOKEN ?? "",
@@ -66,16 +67,35 @@ export function slotValid(slot: string, store = poolStore()): boolean {
   return t.botToken.startsWith("xoxb-") && t.appToken.startsWith("xapp-");
 }
 
+const LEGACY_PORT_SLOTS = 16;
+const PORTS_PER_SLOT = 7;
+
+export function portSlotCount(basePort = Number(process.env.DEV_INSTANCE_BASE_PORT || 8080)): number {
+  if (!Number.isInteger(basePort) || basePort < 0 || basePort > 65535) {
+    throw new Error("DEV_INSTANCE_BASE_PORT must be an integer between 0 and 65535");
+  }
+  const available = 65535 - basePort;
+  return available >= LEGACY_PORT_SLOTS * PORTS_PER_SLOT
+    ? Math.floor(available / PORTS_PER_SLOT)
+    : Math.max(0, available - LEGACY_PORT_SLOTS * (PORTS_PER_SLOT - 1));
+}
+
 export function slotPorts(slot: string, basePort = Number(process.env.DEV_INSTANCE_BASE_PORT || 8080)): SlotPorts {
   const num = Number(slot.replace(/^pool/, ""));
+  if (!/^pool[1-9][0-9]*$/.test(slot) || !Number.isSafeInteger(num) || num > portSlotCount(basePort)) {
+    throw new Error(`No valid port block for ${slot} with base port ${basePort}`);
+  }
+  const legacy = num <= LEGACY_PORT_SLOTS;
+  const first = legacy ? basePort + num : basePort + (num - 1) * PORTS_PER_SLOT + 1;
+  const stride = legacy ? LEGACY_PORT_SLOTS : 1;
   return {
-    core: basePort + num,
-    web: basePort + 16 + num,
-    admin: basePort + 32 + num,
-    portal: basePort + 48 + num,
-    prodProxy: basePort + 64 + num,
-    slackHealth: basePort + 80 + num,
-    supervisor: basePort + 96 + num,
+    core: first,
+    web: first + stride,
+    admin: first + 2 * stride,
+    portal: first + 3 * stride,
+    prodProxy: first + 4 * stride,
+    slackHealth: first + 5 * stride,
+    supervisor: first + 6 * stride,
   };
 }
 

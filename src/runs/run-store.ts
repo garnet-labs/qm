@@ -1,7 +1,26 @@
+import type { SubscribeOptions } from "../util/event-bus.ts";
+import type { RunSignal, RunSignalStore } from "./run-signal-store.ts";
 import type { TurnResult } from "../types.ts";
 import type { OrchestratorInput } from "../core/orchestrator.ts";
+import { isPersonAuthored, resolveTurnOrigin } from "../core/turn-origin.ts";
+import { traceCarrier } from "../../plugins/chassis/src/error-reporting.ts";
 
 type RunStatus = "pending" | "running" | "done" | "failed";
+
+export type RunPriority = 0 | 1 | 2;
+export const MAX_PREEMPTIONS = 3;
+
+export function withTraceCarrier(request: OrchestratorInput): OrchestratorInput {
+  const { trace: _stale, ...rest } = request;
+  const trace = request.swarm ? undefined : traceCarrier();
+  return trace ? { ...rest, trace } : rest;
+}
+
+export function runPriority(request: OrchestratorInput, delegating: RunPriority | null): RunPriority {
+  if (request.swarm || (request.delegatingRunId && delegating === null)) return 2;
+  if (request.delegatingRunId) return delegating === 2 ? 2 : 1;
+  return isPersonAuthored(resolveTurnOrigin(request).kind) ? 0 : 2;
+}
 
 export interface ReapEvent {
   runId: string;
@@ -13,7 +32,24 @@ export interface ReapEvent {
 }
 
 export interface RunDeliveryState {
+  replying?: boolean;
   editRef?: string;
+}
+
+export type RunStop =
+  | { kind: "shutdown" }
+  | { kind: "parked" }
+  | { kind: "lease_expired" }
+  | { kind: "error"; code?: string; status?: number };
+
+export const PARKED: RunStop = { kind: "parked" };
+
+export function stopErrorCode(stop: RunStop | undefined): { errorCode?: string } {
+  return stop?.kind === "error" && stop.code ? { errorCode: stop.code } : {};
+}
+
+export function handbackStop(shutdown: AbortSignal): RunStop {
+  return shutdown.reason === PARKED ? PARKED : { kind: "shutdown" };
 }
 
 export interface Run {
@@ -28,12 +64,20 @@ export interface Run {
   attempts: number;
   errorAttempts: number;
   maxAttempts: number;
+  priority: RunPriority;
+  preemptions: number;
   leaseToken: string | null;
   leaseExpiresAt: number | null;
   workerId: string | null;
   createdAt: number;
   startedAt: number | null;
   finishedAt: number | null;
+  lastStop?: RunStop | null;
+}
+
+interface TerminalCursor {
+  finishedAt: number;
+  id: string;
 }
 
 export interface EnqueueInput {
@@ -51,6 +95,8 @@ export interface EnqueueResult {
 export interface RunStore {
   readonly maxClaims?: number;
 
+  subscribeAvailable?(listener: () => void, options?: SubscribeOptions & { pollMs?: number }): () => void;
+
   enqueue(input: EnqueueInput): Promise<EnqueueResult>;
   getByDedupKey(dedupKey: string): Promise<Run | null>;
 
@@ -58,17 +104,36 @@ export interface RunStore {
 
   claimById(runId: string, workerId: string, ttlMs: number): Promise<Run | null>;
 
+  claimForSession(sessionId: string, workerId: string, ttlMs: number): Promise<Run | null>;
+
+  personWaiting(createdBefore: number): Promise<boolean>;
+
   heartbeat(runId: string, leaseToken: string, ttlMs: number): Promise<boolean>;
 
-  releaseLease(runId: string, leaseToken: string): Promise<boolean>;
+  releaseLease(runId: string, leaseToken: string, stop?: RunStop): Promise<boolean>;
 
   complete(runId: string, leaseToken: string, result: TurnResult): Promise<boolean>;
 
-  fail(runId: string, leaseToken: string, error: string, opts?: { retry?: boolean }): Promise<{ requeued: boolean }>;
+  fail(
+    runId: string,
+    leaseToken: string,
+    error: string,
+    opts?: { retry?: boolean; retryAfterMs?: number; stop?: RunStop },
+  ): Promise<{ requeued: boolean }>;
 
   setDeliveryState(runId: string, leaseToken: string | null, state: RunDeliveryState): Promise<boolean>;
 
   noteTurnUserSeq(runId: string, seq: number): Promise<boolean>;
+
+  latestForThreads(
+    threadRefs: readonly string[],
+    opts?: { excludePrivateMessages?: boolean },
+  ): Promise<Map<string, Run>>;
+  latestForThread(threadRef: string, opts?: { excludePrivateMessages?: boolean }): Promise<Run | null>;
+  pendingReturns(limit?: number, afterId?: string): Promise<Run[]>;
+  terminalFinished(after: TerminalCursor, beforeMs: number, limit: number): Promise<Run[]>;
+  markReturned(runId: string): Promise<void>;
+  deferReturn(runId: string, delayMs: number): Promise<void>;
 
   onTerminal(listener: (run: Run) => void): void;
 
@@ -78,11 +143,14 @@ export interface RunStore {
 
   inFlightForThread(sessionId: string): Promise<Run[]>;
 
-  withdraw(runId: string): Promise<boolean>;
+  withdraw(runId: string, opts?: { unstartedOnly?: boolean }): Promise<boolean>;
+  steerQueued(queuedRunId: string, targetRunId: string, signal: RunSignal, signals: RunSignalStore): Promise<boolean>;
+
+  editPendingText(runId: string, text: string, expectedText: string): Promise<boolean>;
 
   activeSessionIds(): Promise<string[]>;
 
-  list(opts?: { limit?: number }): Promise<Run[]>;
+  list(opts?: { limit?: number; threadRef?: string }): Promise<Run[]>;
 
   reapExpired(
     onRetired?: (sessionIds: string[]) => Promise<void>,
@@ -103,8 +171,15 @@ export function releasesDedupKey(result: TurnResult): boolean {
   return result.refusalKind === "session_busy";
 }
 
-export function errorParks(run: Pick<Run, "errorAttempts" | "maxAttempts" | "attempts">, maxClaims?: number): boolean {
-  return run.errorAttempts + 1 >= run.maxAttempts || (maxClaims !== undefined && run.attempts >= maxClaims);
+export function countedClaims(run: Pick<Run, "attempts" | "preemptions">): number {
+  return run.attempts - run.preemptions;
+}
+
+export function errorParks(
+  run: Pick<Run, "errorAttempts" | "maxAttempts" | "attempts" | "preemptions">,
+  maxClaims?: number,
+): boolean {
+  return run.errorAttempts + 1 >= run.maxAttempts || (maxClaims !== undefined && countedClaims(run) >= maxClaims);
 }
 
 export function leaseLapsed(run: Pick<Run, "status" | "leaseExpiresAt">, asOf: number): boolean {

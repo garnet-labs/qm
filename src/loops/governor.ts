@@ -1,4 +1,5 @@
 import type { Loop, LoopGovernorConfig, LoopHealth } from "../types.ts";
+import { heldMembers } from "./triage.ts";
 import type { LoopItemLedger, LoopQueueStats } from "./item-ledger.ts";
 import { isDecided, unresolvedOutput, type LoopOutputStore } from "./output-store.ts";
 import { undeclaredShipActions } from "./ship-gate.ts";
@@ -9,6 +10,7 @@ export interface LoopVitals {
   decidedOutputs: number;
   returnedOutputs: number;
   undeclaredShipActions?: string[];
+  transientFailure?: string;
 }
 
 type GovernorActionType = "quarantine" | "throttle" | "ping";
@@ -79,6 +81,10 @@ export function evaluateGovernor(loop: Loop, vitals: LoopVitals, now: number): G
     raise("failing", `${failedFires} consecutive failed fires`);
   }
 
+  if (vitals.transientFailure !== undefined) {
+    raise("degraded", `temporary failure, retrying on the next fire: ${vitals.transientFailure}`);
+  }
+
   const rate = returnRate(vitals);
   if (vitals.decidedOutputs >= config.returnRateMinDecisions && rate > config.maxReturnRate) {
     const why = `${Math.round(rate * 100)}% of reviewed outputs were returned`;
@@ -132,7 +138,8 @@ export async function collectVitals(
   stores: { items: LoopItemLedger; outputs: LoopOutputStore },
   now: number,
 ): Promise<LoopVitals> {
-  const [queue, outputs] = await Promise.all([stores.items.stats(loop.id, now), stores.outputs.byLoop(loop.id)]);
+  const held = heldMembers(loop, await stores.items.byLoop(loop.id));
+  const [queue, outputs] = await Promise.all([stores.items.stats(loop.id, now, held), stores.outputs.byLoop(loop.id)]);
   const decided = outputs.filter(isDecided);
   const undeclared = undeclaredShipActions(
     loop,

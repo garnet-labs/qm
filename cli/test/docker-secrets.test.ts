@@ -92,10 +92,10 @@ test("docker up delivers secrets via a 0600 env-file, never on the docker argv",
           secretEnv: ["SB_TOKEN", "SLACK_BOT_TOKEN"],
         },
         securityScreen: {
-          backend: "proxy",
+          mode: "enforce",
+          classifier: "proxy",
           provider: "example-screen",
           endpoint: "https://screen.example.test/classify",
-          rollout: "enforce",
         },
         secretEnv: {
           core: {
@@ -157,10 +157,10 @@ test("docker up delivers secrets via a 0600 env-file, never on the docker argv",
     assert.ok(signerArgs, "coreless plugin starts");
     assert.ok(!signerArgs.includes("CORE_API_URL=http://core:8080"), "coreless plugin gets no core endpoint");
     assert.ok(!signerArgs.includes("--env-file"), "coreless plugin gets no source-auth secret");
-    assert.ok(argv.includes("SECURITY_SCREEN_BACKEND=proxy"));
+    assert.ok(argv.includes("SECURITY_SCREEN_CLASSIFIER=proxy"));
     assert.ok(argv.includes("SECURITY_SCREEN_PROXY_PROVIDER=example-screen"));
     assert.ok(argv.includes("SECURITY_SCREEN_PROXY_ENDPOINT=https://screen.example.test/classify"));
-    assert.ok(argv.includes("SECURITY_SCREEN_PROXY_ROLLOUT=enforce"));
+    assert.ok(argv.includes("SECURITY_SCREEN=enforce"));
 
     assert.ok(
       argv.includes("WEB_UI_PUBLIC_URL=http://folded.example.com/web-ui"),
@@ -264,7 +264,7 @@ test(
       );
       writeFileSync(
         join(dir, ".env"),
-        `CAPABILITY_SECRET=capability-sign\nCONNECTOR_SECRET_KEY=${"connector-key".repeat(3)}\nCORE_SIGNING_SECRET=${"core-sign".repeat(4)}\nPORTAL_IDENTITY_SECRET=portal-sign\nSKILL_SIGNING_SECRET=${"skill-sign".repeat(4)}\n`,
+        `PUBLIC_API_URL=http://localhost:8080\nCAPABILITY_SECRET=capability-sign\nCONNECTOR_SECRET_KEY=${"connector-key".repeat(3)}\nCORE_SIGNING_SECRET=${"core-sign".repeat(4)}\nPORTAL_IDENTITY_SECRET=portal-sign\nSKILL_SIGNING_SECRET=${"skill-sign".repeat(4)}\n`,
       );
       const fake = fakeDocker(dir);
       process.env.PATH = `${dir}:${priorPath}`;
@@ -377,7 +377,7 @@ test(
       );
       writeFileSync(
         join(dir, ".env"),
-        `CAPABILITY_SECRET=capability\nCONNECTOR_SECRET_KEY=${"connector".repeat(4)}\nPORTAL_IDENTITY_SECRET=identity\nSKILL_SIGNING_SECRET=${"ok".repeat(16)}\n`,
+        `PUBLIC_API_URL=http://localhost:8080\nCAPABILITY_SECRET=capability\nCONNECTOR_SECRET_KEY=${"connector".repeat(4)}\nPORTAL_IDENTITY_SECRET=identity\nSKILL_SIGNING_SECRET=${"ok".repeat(16)}\n`,
       );
       fakeDocker(dir);
       process.env.PATH = `${dir}:${priorPath}`;

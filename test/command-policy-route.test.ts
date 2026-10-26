@@ -1,4 +1,5 @@
 import "./support/auto-fake-sprites.ts";
+import { selectDefaultSandbox } from "./support/default-sandbox.ts";
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -7,7 +8,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { createInsecureTestServer } from "../src/api/server.ts";
-import { buildApp, type BuiltApp } from "../src/wiring.ts";
+import { type BuiltApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 
 const ADMIN = { "content-type": "application/json", "x-admin-actor": "admin-alice@default-org" };
@@ -34,6 +36,7 @@ const putPolicy = (base: string, b: unknown) =>
 test("a pending approval survives a surface restart: GET /v1/approvals/:id returns a replayable request", async () => {
   const srv = start();
   try {
+    await selectDefaultSandbox(srv.built, "U1", "personal:U1");
     const command = "git push --force origin main";
     const turn = {
       surface: "slack",

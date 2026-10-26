@@ -5,9 +5,10 @@ import { EGRESS_PROXY_AUD, verifyCapabilityToken, type CapabilityClaims } from "
 import { egressDecision, hostMatches, isHostDenied, type EgressVerdict } from "./resolution/egress-policy.ts";
 import { createEgressAuditSink, type EgressAuditRecord, type EgressAuditSink } from "./admin/egress-audit-sink.ts";
 import { createPostgresEgressAuditSink } from "./admin/postgres-egress-audit-sink.ts";
-import { signedRequestHeaders } from "./auth/source-auth-sign.ts";
+import { signedRequestHeaders } from "../plugins/chassis/src/source-auth-sign.ts";
 import { createSweeper } from "./util/sweeper.ts";
-import { errMessage } from "./util/errors.ts";
+import { errMessage, swallow } from "./util/errors.ts";
+import { shutdownOnUncaught } from "./util/process-guard.ts";
 import { numEnv } from "./config.ts";
 import type { EgressPolicy, ScopeId } from "./types.ts";
 import { isPrivateNetworkIp } from "./util/network.ts";
@@ -127,7 +128,7 @@ export function buildEgressAuthzServer(deps: EgressAuthzDeps): Server {
   async function checkStatus(
     req: IncomingMessage,
     authority: string,
-  ): Promise<{ status: 200 | 403; upstream?: string }> {
+  ): Promise<{ status: 200 | 403 | 407; upstream?: string }> {
     const host = hostFromAuthority(authority);
     if (!host) return { status: 403 };
     const portText = authority.match(/:(\d+)$/)?.[1];
@@ -136,11 +137,14 @@ export function buildEgressAuthzServer(deps: EgressAuthzDeps): Server {
     if (portText) port = Number(portText);
     if (!Number.isInteger(port) || port < 1 || port > 65_535) return { status: 403 };
     const token = tokenFromRequest(req);
-    const claims = await claimsFor(token, deps);
+    const challenge = !token && deps.tokenless !== "open";
+    const claims = challenge ? undefined : await claimsFor(token, deps);
     let policy: EgressPolicy | undefined = DENY_ALL;
     if (claims) policy = claims.egress;
-    else if (!token && deps.tokenless === "open") policy = OPEN;
-    const d = await decide(host, policy, lookup);
+    else if (!token) policy = OPEN;
+    const d: { allow: boolean; verdict: EgressVerdict; address?: string } = challenge
+      ? { allow: false, verdict: "denied" }
+      : await decide(host, policy, lookup);
     try {
       deps.audit.record({
         source: "proxy",
@@ -151,8 +155,9 @@ export function buildEgressAuthzServer(deps: EgressAuthzDeps): Server {
         principalId: claims?.actorId ?? "unknown",
       });
     } catch (error) {
-      void error;
+      swallow("egress-authz: audit record", error);
     }
+    if (challenge) return { status: 407 };
     if (!d.allow || !d.address) return { status: 403 };
     return { status: 200, upstream: isIP(d.address) === 6 ? `[${d.address}]:${port}` : `${d.address}:${port}` };
   }
@@ -245,11 +250,14 @@ function main(): void {
   const tokenless = process.env.EGRESS_TOKENLESS === "open" ? ("open" as const) : ("deny" as const);
   const server = buildEgressAuthzServer({ ...(capabilitySecret ? { capabilitySecret } : {}), audit, tokenless });
   server.listen(port, "127.0.0.1", () => console.log(`[egress-authz] listening on 127.0.0.1:${port}`));
-  for (const sig of ["SIGTERM", "SIGINT"] as const) {
-    process.on(sig, () =>
-      server.close(() => void (relay ? relay.flush() : Promise.resolve()).finally(() => process.exit(0))),
-    );
-  }
+  let shuttingDown = false;
+  const shutdown = (): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    server.close(() => void (relay ? relay.flush() : Promise.resolve()).finally(() => process.exit()));
+  };
+  for (const sig of ["SIGTERM", "SIGINT"] as const) process.on(sig, shutdown);
+  shutdownOnUncaught("egress-authz", shutdown);
 }
 
 if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) main();

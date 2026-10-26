@@ -1,7 +1,9 @@
+import { errMessage, swallow } from "../util/errors.ts";
 import type { EgressPolicy, WorkspaceLayer } from "../types.ts";
 
 export interface SandboxHandle {
   resourceId?: string;
+  providerSandboxId?: string;
   id: string;
   rootDir: string;
   homeDir?: string;
@@ -10,6 +12,35 @@ export interface SandboxHandle {
   scratch?: boolean;
   backend?: string;
   scopeId?: string;
+}
+
+export class SandboxProvisionCleanupError extends AggregateError {
+  readonly handle: SandboxHandle;
+
+  constructor(handle: SandboxHandle, cleanupError: unknown, provisionError: unknown) {
+    super(
+      [provisionError, cleanupError],
+      `Disposable sandbox cleanup failed after initialization failed (${errMessage(provisionError)})`,
+      {
+        cause: cleanupError,
+      },
+    );
+    this.name = "SandboxProvisionCleanupError";
+    this.handle = { ...handle, scratch: true };
+  }
+}
+
+export async function cleanupFailedProvision(
+  sandbox: Pick<Sandbox, "teardown">,
+  handle: SandboxHandle,
+  provisionError: unknown,
+): Promise<void> {
+  try {
+    await sandbox.teardown(handle, handle.scratch ? { destroy: true } : undefined);
+  } catch (error) {
+    if (handle.scratch) throw new SandboxProvisionCleanupError(handle, error, provisionError);
+    swallow("sandbox: teardown after failed provision", error);
+  }
 }
 
 export function hasParentPathSegment(path: string): boolean {
@@ -35,6 +66,7 @@ export interface AgentComputerProfile {
   backend: string;
   writablePersistence: WritablePersistence;
   processSessions: boolean;
+  parksOnTeardown?: boolean;
   egressEnforcement?: EgressEnforcement;
   spec?: AgentComputerSpec;
 }
@@ -155,6 +187,15 @@ export interface ComputerStatus {
   guestResponsive: boolean;
   probeError?: string;
   pressure?: ExecPressure;
+  resources?: ComputerResources;
+}
+
+interface ComputerResources {
+  cpuUsedPct: number;
+  memUsedMb: number;
+  memTotalMb: number;
+  diskUsedGb: number;
+  diskTotalGb: number;
 }
 
 export type ComputerVerdict = "ok" | "wedged" | "down";
@@ -176,7 +217,7 @@ export interface TeardownOptions {
 
 export interface Sandbox {
   readonly profile: AgentComputerProfile;
-  profileFor?(scopeId: string): Promise<AgentComputerProfile>;
+  profileFor?(scopeId: string, sandboxId?: string): Promise<AgentComputerProfile>;
   provision(layers: WorkspaceLayer[], opts?: ProvisionOptions): Promise<SandboxHandle>;
   run(handle: SandboxHandle, command: string, opts?: ExecOptions): Promise<ExecResult>;
   readFile(handle: SandboxHandle, relPath: string): Promise<string | null>;
@@ -188,6 +229,7 @@ export interface Sandbox {
   importFiles?(handle: SandboxHandle, entries: ReadonlyArray<{ path: string; data: Uint8Array }>): Promise<void>;
   listDir(handle: SandboxHandle, relDir: string): Promise<string[]>;
   removeDir(handle: SandboxHandle, relDir: string): Promise<void>;
+  removeDirAndList?(handle: SandboxHandle, removeRelDir: string, listRelDir: string): Promise<string[]>;
   exportFiles?(handle: SandboxHandle, opts?: AgentComputerExportOptions): Promise<AgentComputerExportEntry[]>;
   startRegisteredProcess?(
     handle: SandboxHandle,
@@ -200,7 +242,6 @@ export interface Sandbox {
   writeStdin?(handle: SandboxHandle, processId: string, data: string): Promise<void>;
   signalProcess?(handle: SandboxHandle, processId: string, signal: string): Promise<void>;
   listProcesses?(handle: SandboxHandle): Promise<ProcessSession[]>;
-  adoptHomeSnapshot?(scopeId: string, blobId: string): Promise<void>;
   persistHomeSnapshot?(scopeId: string): Promise<void>;
   computerStatus?(scopeId: string): Promise<ComputerStatus>;
   restartComputer?(scopeId: string): Promise<void>;
@@ -252,21 +293,4 @@ export function supportsProcessSessions(sandbox: Sandbox): sandbox is ProcessSan
     typeof sandbox.signalProcess === "function" &&
     typeof sandbox.listProcesses === "function"
   );
-}
-
-const SANDBOX_CAPABILITIES: ReadonlyArray<{ label: string; supported: (s: Sandbox) => boolean }> = [
-  { label: "process sessions (background work, dev servers)", supported: supportsProcessSessions },
-  { label: "home export (publish, resident-auth capture)", supported: supportsAgentComputerExport },
-];
-
-const ENFORCEMENT_RANK: Record<EgressEnforcement, number> = { none: 0, ip_port: 1, domain: 2 };
-
-export function capabilitiesLostMovingTo(from: Sandbox, to: Sandbox): string[] {
-  const lost = SANDBOX_CAPABILITIES.filter((c) => c.supported(from) && !c.supported(to)).map((c) => c.label);
-  const fromEgress = from.profile.egressEnforcement ?? "none";
-  const toEgress = to.profile.egressEnforcement ?? "none";
-  if (ENFORCEMENT_RANK[toEgress] < ENFORCEMENT_RANK[fromEgress]) {
-    lost.push(`egress enforcement (${fromEgress} on the source, ${toEgress} on the target)`);
-  }
-  return lost;
 }

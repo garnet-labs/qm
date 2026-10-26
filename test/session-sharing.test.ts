@@ -56,6 +56,36 @@ test("shared transcript allowlists visible message fields and published replies"
   );
 });
 
+test("a delivery into the conversation is shared as the assistant's message", () => {
+  assert.deepEqual(
+    sharedMessages([entry("user", { text: "remind me" }, 1), entry("assistant", { text: "Standup now" }, 2)]),
+    [
+      { role: "user", text: "remind me" },
+      { role: "assistant", text: "Standup now" },
+    ],
+  );
+});
+
+test("work phases and approval decisions remain outside the shared message snapshot", () => {
+  assert.deepEqual(
+    sharedMessages([
+      entry("user", { text: "Run the check" }, 1),
+      entry("text_start", { phase: "commentary", streamOffset: 0 }, 2),
+      entry("text", { text: "PRIVATE_WORK_NARRATION" }, 3),
+      entry("approval_request", { requestId: "r", command: "PRIVATE_COMMAND" }, 4),
+      entry("approval_resolved", { requestId: "r", command: "PRIVATE_COMMAND", approved: false }, 5),
+      entry("approval_request", { requestId: "r", command: "PRIVATE_COMMAND" }, 6),
+      entry("approval_resolved", { requestId: "r", command: "PRIVATE_COMMAND", approved: true, scope: "once" }, 7),
+      entry("text_start", { phase: "final_answer", streamOffset: 22 }, 8),
+      entry("assistant", { text: "Check complete", stopped: true }, 9),
+    ]),
+    [
+      { role: "user", text: "Run the check" },
+      { role: "assistant", text: "Check complete" },
+    ],
+  );
+});
+
 test("fresh shares freeze messages and authorized attachments with separate audiences", async (t) => {
   const store = createMemoryMap<SessionShare>();
   const bytes = createMemoryDurableByteStore();
@@ -234,14 +264,13 @@ test("attachment projection includes only user and delivered attachments", () =>
     entry("tool_result", { tool: "attach", files: [{ artifactId: "old", name: "a" }] }, 4),
     entry("tool_result", { tool: "attach", files: [{ artifactId: "new", name: "a" }] }, 5),
     entry("assistant", { text: "Here" }, 6),
-    entry("delivery", { files: [{ artifactId: "new" }] }, 7),
     entry("tool_call", { action: "post", callId: "p", text: "Posted" }, 8),
     entry("tool_result", { callId: "p", files: [{ artifactId: "posted" }] }, 9),
     entry("assistant", { text: "private final" }, 10),
   ]);
   assert.deepEqual(messages, [
     { role: "user", text: "", attachmentIds: ["user"] },
-    { role: "assistant", text: "Here", attachmentIds: ["new"] },
+    { role: "assistant", text: "Here" },
     { role: "assistant", text: "Posted", attachmentIds: ["posted"] },
   ]);
 });

@@ -1,19 +1,32 @@
+import "./onboarding-welcome";
+import "./slack-account";
+import { openModelConnectManager, type StatusResponse } from "./model-connect";
+import {
+  alwaysSteer,
+  api,
+  fetchUiState,
+  pinLatestPrompt,
+  putUiState,
+  setAlwaysSteer,
+  setPinLatestPrompt,
+  withBase,
+} from "./core-bridge";
 import { html, nothing, render, type TemplateResult } from "lit";
-import { BookOpen, ExternalLink, LogOut, Monitor, Moon, ShieldUser, Sun, type IconNode } from "lucide";
-import { icon } from "./ui";
+import { Download, ExternalLink, LogOut, Monitor, Moon, ShieldUser, Sun, type IconNode } from "lucide";
+import { icon } from "./icons";
 import { ADMIN_HOME_URL, appState, can, signOut } from "./shell";
 import { sessionsState, setWebOnly } from "./sessions";
-import { errMessage } from "../../chassis/src/errors";
+import { errMessage, swallowAs } from "../../chassis/src/errors";
 import { importTheme, isPalette, themeCss, themeTokens, type Palette } from "./theme-import";
 
-export type ThemeChoice = "light" | "dark" | "system" | "custom";
+type ThemeChoice = "light" | "dark" | "system" | "custom";
 
 const THEME_KEY = "theme";
 const CUSTOM_THEME_KEY = "theme:custom";
 const CUSTOM_THEME_STYLE_ID = "custom-theme";
 const THEME_FILE_ACCEPT = ".itermcolors,.plist,.json,.jsonc,application/json,text/xml,application/xml";
 
-const QM_ABOUT_URL = "https://github.com/yc-software/qm";
+const QM_MAC_DOWNLOAD_URL = "https://github.com/yc-software/qm/releases/download/desktop-v0.1.0/QM-mac-arm64.zip";
 
 const THEME_OPTIONS: Array<{ value: ThemeChoice; label: string; glyph: IconNode }> = [
   { value: "light", label: "Light", glyph: Sun },
@@ -24,7 +37,7 @@ const THEME_OPTIONS: Array<{ value: ThemeChoice; label: string; glyph: IconNode 
 let settingsHost: HTMLElement | null = null;
 let themeImportError: string | null = null;
 
-export function storedTheme(): ThemeChoice {
+function storedTheme(): ThemeChoice {
   try {
     const stored = localStorage.getItem(THEME_KEY);
     if (stored === "light" || stored === "dark") return stored;
@@ -35,7 +48,7 @@ export function storedTheme(): ThemeChoice {
   return "system";
 }
 
-export function storedCustomTheme(): Palette | null {
+function storedCustomTheme(): Palette | null {
   try {
     const parsed: unknown = JSON.parse(localStorage.getItem(CUSTOM_THEME_KEY) ?? "null");
     return isPalette(parsed) ? parsed : null;
@@ -53,6 +66,21 @@ function storeCustomTheme(palette: Palette | null): void {
   }
 }
 
+let themeParentOrigin: string | null = null;
+
+function publishTheme(): void {
+  if (!themeParentOrigin) return;
+  const root = document.documentElement;
+  const style = getComputedStyle(root);
+  const colors = Object.fromEntries(
+    ["--background", "--foreground", "--secondary", "--muted-foreground", "--border", "--brand-accent"].map((key) => [
+      key,
+      style.getPropertyValue(key).trim(),
+    ]),
+  );
+  window.parent.postMessage({ type: "qm:theme", dark: root.classList.contains("dark"), colors }, themeParentOrigin);
+}
+
 export function applyTheme(): void {
   const choice = storedTheme();
   const custom = choice === "custom" ? storedCustomTheme() : null;
@@ -67,14 +95,16 @@ export function applyTheme(): void {
     }
     styleEl.textContent = themeCss(tokens);
     root.classList.toggle("dark", tokens.dark);
+    publishTheme();
     return;
   }
   styleEl?.remove();
   const dark = choice === "system" ? window.matchMedia("(prefers-color-scheme: dark)").matches : choice === "dark";
   root.classList.toggle("dark", dark);
+  publishTheme();
 }
 
-export function setTheme(choice: ThemeChoice): void {
+function setTheme(choice: ThemeChoice): void {
   themeImportError = null;
   try {
     if (choice === "system") localStorage.removeItem(THEME_KEY);
@@ -86,12 +116,12 @@ export function setTheme(choice: ThemeChoice): void {
   drawSettings();
 }
 
-export function installCustomTheme(palette: Palette): void {
+function installCustomTheme(palette: Palette): void {
   storeCustomTheme(palette);
   setTheme("custom");
 }
 
-export function removeCustomTheme(): void {
+function removeCustomTheme(): void {
   const wasActive = storedTheme() === "custom";
   storeCustomTheme(null);
   setTheme(wasActive ? "system" : storedTheme());
@@ -111,6 +141,15 @@ async function onThemeFileChosen(e: Event): Promise<void> {
 }
 
 export function watchSystemTheme(): void {
+  window.addEventListener("message", (event) => {
+    if (window.parent === window || event.source !== window.parent || event.origin === "null") return;
+    if (event.data?.type !== "qm:theme-request") return;
+    themeParentOrigin = event.origin;
+    publishTheme();
+  });
+  window.addEventListener("storage", (event) => {
+    if (event.key === null || event.key === THEME_KEY || event.key === CUSTOM_THEME_KEY) applyTheme();
+  });
   window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
     if (storedTheme() === "system") applyTheme();
   });
@@ -200,6 +239,133 @@ function themeRow(): TemplateResult {
   `;
 }
 
+const OPEN_NEW_CHAT_KEY = "open-new-chat";
+let openNewChat = false;
+let openNewChatTouched = false;
+
+export async function loadOpenNewChat(timeoutMs = 2000): Promise<boolean> {
+  const fetched = fetchUiState(OPEN_NEW_CHAT_KEY).then(
+    (rec) => {
+      if (!openNewChatTouched) {
+        openNewChat = rec.value === true;
+        drawSettings();
+      }
+      return openNewChat;
+    },
+    () => null,
+  );
+  let timer = 0;
+  const value = await Promise.race([
+    fetched,
+    new Promise<null>((resolve) => {
+      timer = window.setTimeout(() => resolve(null), timeoutMs);
+    }),
+  ]);
+  window.clearTimeout(timer);
+  return value ?? false;
+}
+
+function setOpenNewChat(value: boolean): void {
+  openNewChatTouched = true;
+  openNewChat = value;
+  drawSettings();
+  void putUiState(OPEN_NEW_CHAT_KEY, value, Date.now()).catch(
+    swallowAs("web-ui: save open-new-chat setting", undefined),
+  );
+}
+
+const OPEN_OPTIONS: Array<{ newChat: boolean; label: string }> = [
+  { newChat: false, label: "Last session" },
+  { newChat: true, label: "New chat" },
+];
+
+function openBehaviorRow(): TemplateResult {
+  return html`
+    <div class="settings-row">
+      <div class="settings-row-copy">
+        <div class="settings-row-title">When QM opens</div>
+        <div class="settings-row-note">Reopen the conversations you had open last time, or start on a new chat.</div>
+      </div>
+      <div class="settings-choice" role="radiogroup" aria-label="When QM opens">
+        ${OPEN_OPTIONS.map(
+          (option) => html`
+            <button
+              class="settings-choice-option ${openNewChat === option.newChat ? "selected" : ""}"
+              type="button"
+              role="radio"
+              aria-checked=${openNewChat === option.newChat ? "true" : "false"}
+              @click=${() => setOpenNewChat(option.newChat)}
+            >
+              <span>${option.label}</span>
+            </button>
+          `,
+        )}
+      </div>
+    </div>
+  `;
+}
+
+function choiceRow(
+  title: string,
+  note: string,
+  options: Array<{ value: boolean; label: string }>,
+  current: boolean,
+  choose: (value: boolean) => void,
+): TemplateResult {
+  return html`
+    <div class="settings-row">
+      <div class="settings-row-copy">
+        <div class="settings-row-title">${title}</div>
+        <div class="settings-row-note">${note}</div>
+      </div>
+      <div class="settings-choice" role="radiogroup" aria-label=${title}>
+        ${options.map(
+          (option) => html`
+            <button
+              class="settings-choice-option ${current === option.value ? "selected" : ""}"
+              type="button"
+              role="radio"
+              aria-checked=${current === option.value ? "true" : "false"}
+              @click=${() => {
+                choose(option.value);
+                drawSettings();
+              }}
+            >
+              <span>${option.label}</span>
+            </button>
+          `,
+        )}
+      </div>
+    </div>
+  `;
+}
+
+function pinPromptRow(): TemplateResult {
+  return choiceRow(
+    "Pin my last message",
+    "Keeps your latest message at the top of the chat while you scroll its reply.",
+    [
+      { value: true, label: "Pinned" },
+      { value: false, label: "Off" },
+    ],
+    pinLatestPrompt(),
+    setPinLatestPrompt,
+  );
+}
+
+function sendWhileWorkingRow(): TemplateResult {
+  return choiceRow(
+    "Sending while QM is working",
+    "Steer folds your message into the running task instead of waiting for it to finish.",
+    [
+      { value: false, label: "Queue" },
+      { value: true, label: "Steer" },
+    ],
+    alwaysSteer(),
+    setAlwaysSteer,
+  );
+}
+
 const SURFACE_OPTIONS: Array<{ webOnly: boolean; label: string }> = [
   { webOnly: false, label: "All conversations" },
   { webOnly: true, label: "Web only" },
@@ -234,6 +400,116 @@ function sidebarSurfaceRow(): TemplateResult {
   `;
 }
 
+let aiStatus: StatusResponse | null = null;
+let aiError = "";
+let aiBusy = false;
+let aiSaving = false;
+let aiRevision = 0;
+
+function acceptAiStatus(status: StatusResponse): void {
+  aiRevision++;
+  aiStatus = status;
+  if (appState.me) {
+    appState.me.individualModelAuth = status.individualModelAuth;
+    appState.me.modelAuthConnected = status.connections.some(
+      (c) => status.account === "personal" || status.account === c.provider,
+    );
+  }
+  drawSettings();
+}
+
+window.addEventListener("model-account-changed", (event) => {
+  const status = (event as CustomEvent<StatusResponse>).detail;
+  if (status) {
+    aiBusy = false;
+    acceptAiStatus(status);
+  }
+});
+
+async function loadAiStatus(): Promise<void> {
+  if (aiSaving) return;
+  const revision = ++aiRevision;
+  aiBusy = true;
+  aiError = "";
+  drawSettings();
+  try {
+    const status = await api<StatusResponse>("/api/user-model-auth/status");
+    if (revision !== aiRevision) return;
+    acceptAiStatus(status);
+  } catch (error) {
+    aiError = errMessage(error);
+  }
+  aiBusy = false;
+  drawSettings();
+}
+
+async function chooseAiAccount(account: "company" | "anthropic" | "openai"): Promise<void> {
+  if (aiBusy || aiSaving) return;
+  if (
+    account === aiStatus?.account &&
+    (account === "company" || aiStatus.connections.some((c) => c.provider === account))
+  )
+    return;
+  if (account !== "company" && !aiStatus?.connections.some((c) => c.provider === account)) {
+    openModelConnectManager(account);
+    return;
+  }
+  aiSaving = true;
+  aiError = "";
+  drawSettings();
+  try {
+    const status = await api<StatusResponse>("/api/user-model-auth/account", {
+      method: "POST",
+      body: JSON.stringify({
+        account: account === "company" ? "company" : "personal",
+        provider: account === "company" ? undefined : account,
+      }),
+    });
+    acceptAiStatus(status);
+    window.dispatchEvent(new CustomEvent("model-account-changed", { detail: status }));
+  } catch (error) {
+    aiError = errMessage(error);
+  }
+  aiSaving = false;
+  drawSettings();
+}
+
+function aiAccountsRow(): TemplateResult {
+  return html`
+    <div class="settings-row">
+      <div class="settings-row-copy">
+        <div class="settings-row-title">AI access</div>
+        <div class="settings-row-note">Use company access or your own subscription.</div>
+        ${aiError ? html`<div class="settings-row-error" role="alert">${aiError} <button class="settings-theme-link" ?disabled=${aiSaving} @click=${loadAiStatus}>Retry</button></div>` : nothing}
+      </div>
+      <div class="settings-ai-controls">
+        <div class="settings-choice" role="group" aria-label="AI access">
+          ${(
+            [
+              ["company", "Company"],
+              ["anthropic", "Claude"],
+              ["openai", "ChatGPT / Codex"],
+            ] as const
+          ).map(
+            ([value, label]) => html`
+              <button
+                type="button"
+                class="settings-choice-option ${aiStatus?.account === value ? "selected" : ""}"
+                aria-pressed=${aiStatus?.account === value}
+                ?disabled=${aiBusy || aiSaving || !aiStatus || (value === "company" && aiStatus.required)}
+                @click=${() => void chooseAiAccount(value)}
+              >
+                ${label}
+              </button>
+            `,
+          )}
+        </div>
+        ${aiStatus?.account === "anthropic" || aiStatus?.account === "openai" ? html`<button class="settings-theme-link" ?disabled=${aiBusy || aiSaving} @click=${() => openModelConnectManager(aiStatus!.account as "anthropic" | "openai")}>Connection settings</button>` : nothing}
+      </div>
+    </div>
+  `;
+}
+
 function adminRow(): TemplateResult {
   return html`
     <div class="settings-row">
@@ -248,17 +524,15 @@ function adminRow(): TemplateResult {
   `;
 }
 
-function aboutRow(): TemplateResult {
+function desktopRow(): TemplateResult {
   return html`
     <div class="settings-row">
       <div class="settings-row-copy">
-        <div class="settings-row-title">Learn more about QM</div>
-        <div class="settings-row-note">
-          Why Y Combinator built this open-source agent harness, and how to run your own.
-        </div>
+        <div class="settings-row-title">Desktop app</div>
+        <div class="settings-row-note">QM for Mac. Requires Apple Silicon and macOS 13 or later.</div>
       </div>
-      <a class="btn settings-row-action" href=${QM_ABOUT_URL} target="_blank" rel="noreferrer noopener">
-        ${icon(BookOpen, 15)}<span>Read the announcement</span>${icon(ExternalLink, 14)}
+      <a class="btn settings-row-action" href=${QM_MAC_DOWNLOAD_URL} target="_blank" rel="noreferrer noopener">
+        ${icon(Download, 15)}<span>Download for Mac</span>
       </a>
     </div>
   `;
@@ -270,7 +544,9 @@ function accountRow(): TemplateResult {
     <div class="settings-row">
       <div class="settings-row-copy">
         <div class="settings-row-title">Account</div>
-        <div class="settings-row-note">${me?.user ?? "Not signed in"}${me?.org ? ` · ${me.org}` : ""}</div>
+        <div class="settings-row-note">
+          ${me?.displayName?.trim() || me?.user || "Not signed in"}${me?.org ? ` · ${me.org}` : ""}
+        </div>
       </div>
       <button class="btn settings-row-action" type="button" @click=${() => void signOut()}>
         ${icon(LogOut, 15)}<span>Sign out</span>
@@ -285,7 +561,20 @@ function settingsPane(): TemplateResult {
       <h1 class="pane-title">Settings</h1>
     </div>
     <div class="settings-group">
-      ${themeRow()} ${sidebarSurfaceRow()} ${can("admin") ? adminRow() : nothing} ${aboutRow()} ${accountRow()}
+      ${aiAccountsRow()} ${themeRow()} ${openBehaviorRow()} ${pinPromptRow()} ${sendWhileWorkingRow()}
+      ${sidebarSurfaceRow()} ${can("admin") ? adminRow() : nothing} ${desktopRow()} ${accountRow()}
+      <div class="settings-row settings-slack-account">
+        <qm-slack-account .user=${`${appState.me?.org}:${appState.me?.user}`}></qm-slack-account>
+      </div>
+      <div class="settings-row">
+        <qm-onboarding-welcome
+          .me=${appState.me}
+          .setupOnly=${true}
+          .widget=${"apps"}
+          .returnKey=${"settings"}
+          .base=${withBase("")}
+        ></qm-onboarding-welcome>
+      </div>
     </div>
   `;
 }
@@ -302,4 +591,5 @@ function drawSettings(): void {
 
 export function renderSettings(): void {
   drawSettings();
+  void loadAiStatus();
 }

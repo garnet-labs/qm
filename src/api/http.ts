@@ -1,53 +1,9 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { gzip } from "node:zlib";
 import { verifySignature, type SourceAuth, SOURCE_AUTH_REPLAY_WINDOW_MS } from "../auth/source-auth.ts";
 
-const COMPRESS_MIN_BYTES = 1024;
+import { json as sendJson } from "../../plugins/chassis/src/http.ts";
 
-export function gzipAccepted(req: IncomingMessage | undefined): boolean {
-  const header = req?.headers["accept-encoding"];
-  if (header === undefined) return false;
-  let explicit: boolean | undefined;
-  let wildcard: boolean | undefined;
-  for (const part of (Array.isArray(header) ? header.join(",") : header).split(",")) {
-    const [name, ...params] = part.split(";");
-    const token = (name ?? "").trim().toLowerCase();
-    if (token !== "gzip" && token !== "*") continue;
-    const q = params.map((p) => p.trim().toLowerCase()).find((p) => p.startsWith("q="));
-    const weight = q === undefined ? 1 : Number.parseFloat(q.slice(2));
-    const allowed = Number.isFinite(weight) && weight > 0;
-    if (token === "*") wildcard = allowed;
-    else explicit = allowed;
-  }
-  return explicit ?? wildcard ?? false;
-}
-
-export function sendBuffered(res: ServerResponse, status: number, headers: Record<string, string>, body: string): void {
-  const out = { ...headers, vary: "accept-encoding" };
-  if (Buffer.byteLength(body) < COMPRESS_MIN_BYTES || !gzipAccepted(res.req)) {
-    res.writeHead(status, out);
-    res.end(body);
-    return;
-  }
-  gzip(body, (err, packed) => {
-    if (res.headersSent || res.writableEnded || res.destroyed) return;
-    try {
-      if (err) {
-        res.writeHead(status, out);
-        res.end(body);
-        return;
-      }
-      res.writeHead(status, { ...out, "content-encoding": "gzip", "content-length": String(packed.length) });
-      res.end(packed);
-    } catch {
-      res.destroy();
-    }
-  });
-}
-
-export function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  sendBuffered(res, status, { "content-type": "application/json" }, JSON.stringify(body));
-}
+export { sendJson };
 
 const BODY_DEADLINE = Symbol.for("qm.bodyDeadline");
 type DeadlineCarrier = IncomingMessage & { [BODY_DEADLINE]?: { rearm: (ms: number) => void } };
@@ -145,19 +101,15 @@ export class PayloadTooLargeError extends Error {
 
 const MAX_BODY_BYTES = 1_000_000;
 
-export async function readRawBody(req: IncomingMessage): Promise<string> {
+export async function readRawBody(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<string> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > MAX_BODY_BYTES) throw new PayloadTooLargeError();
+    if (size > maxBytes) throw new PayloadTooLargeError();
     chunks.push(chunk as Buffer);
   }
   return chunks.length === 0 ? "" : Buffer.concat(chunks).toString("utf8");
-}
-
-export function canonicalPayload(method: string, pathWithQuery: string, tail: string): string {
-  return `${method}\n${pathWithQuery}\n${tail}`;
 }
 
 export async function verifyOrReject(
@@ -185,10 +137,6 @@ export async function verifyOrReject(
     return false;
   }
   return true;
-}
-
-export function escapeHtml(s: string): string {
-  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
 }
 
 export function contentDispositionAttachment(name: string, kind: "attachment" | "inline" = "attachment"): string {

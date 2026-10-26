@@ -7,14 +7,14 @@ description: Publish a long-lived internal web app, site, or dashboard from the 
 
 Use this skill when the user wants something that **outlives the turn** and is
 **reachable in a browser** — a small web app, an internal API, a status page, a
-dashboard you generated from a query. A turn's sandbox is torn down when the turn
-ends; publishing ships your files to a separate, long-lived runtime that keeps running
-and gets a stable link.
+dashboard you generated from a query. Publishing ships your files from the selected
+sandbox to a separate, long-lived runtime with a stable link.
 
-Publishing is a **first-class primitive**: the `publish` tool, alongside
-`execute`/`read`/`write`. Build the app in the workspace as usual (write files, install
-deps with `execute`, test it), then call `publish` on the directory. The app must listen
-on the `PORT` env var (the runtime sets it).
+Publish with the `apps` tool, action `publish`. Build the app in the workspace with
+`files` actions `write` / `read`; install dependencies and test with `execute`. Keep the
+same explicit `sandbox_id` throughout writing, building, testing, previewing, and
+publishing. Use `sandbox` only to manage computers, not to run commands.
+The app must listen on the `PORT` env var (the runtime sets it).
 
 ## Match the house style (the default)
 
@@ -22,12 +22,12 @@ Anything browsable you publish should look designed, not defaulted. Before you b
 UI, load the design skills and apply your organization's **house style** unless the user
 asked for a different look:
 
-- **The deployment's house-style skill** — if a `*-design` skill is installed (list
-  `skills/`), it carries the org's look as ready-to-paste CSS and design tokens. Start
+- **The deployment's house-style skill** — if the Skills index lists a `*-design` skill,
+  it carries the org's look as ready-to-paste CSS and design tokens. Start
   there for the look.
-- **`skills/taste-skill/SKILL.md`** — the design _process_: reading the brief, layout,
+- **`taste-skill`** — the design _process_: reading the brief, layout,
   hierarchy, verifying the result, avoiding generic AI-design slop.
-- **`skills/popular-web-designs/SKILL.md`** — when the user wants a specific visual
+- **`popular-web-designs`** — when the user wants a specific visual
   reference (Stripe, Linear, Vercel…).
 
 This is about the page a person sees — skip it for an internal-only API or a script with
@@ -38,22 +38,34 @@ no UI.
 First publish, and every later update — same call, same `name`, a new immutable version:
 
 ```
-publish({ dir: "dist", entrypoint: "node server.js", name: "status-board" })
+apps({ action: "publish", dir: "dist", entrypoint: "node server.js", name: "status-board", sandbox_id: "<selected sandbox ID>" })
 ```
 
 Roll back to an earlier version (an instant pointer flip):
 
 ```
-publish({ name: "status-board", rollbackTo: 3 })
+apps({ action: "publish", name: "status-board", rollbackTo: 3 })
 ```
 
 Give an auto-named deployment a friendly link:
 
 ```
-publish({ renameFrom: "s-1176-p-5050", name: "status-board" })
+apps({ action: "publish", renameFrom: "s-1176-p-5050", name: "status-board" })
 ```
 
-`publish` returns `{ id, name, version, url, dataDir? }` — give the user the `url` (`/d/<name>/`).
+`apps` action `publish` returns `{ id, name, version, url, dataDir? }` — give the user the full absolute `url`, whose path is `/d/<name>/`.
+
+## App bar and editing
+
+On a configured app subdomain, signed-in people who can manage the app automatically
+see a slim top bar. Chat opens a resizable editing conversation beside the app. Normal
+app links and refreshes keep editing available for the signed-in session; viewers with
+read-only access see the app alone.
+
+The bar uses a consistent neutral appearance, independent of the app's theme. Its
+name follows the app document title. The drawer opens directly into an empty composer;
+the app identity is supplied as conversation context, not pasted into the draft. The
+conversation survives app reloads after a publish.
 
 ## Durable data — where app state must live
 
@@ -84,7 +96,9 @@ the same as the app _working_. So for anything browsable, sanity-check it locall
 publish:
 
 1. Run it locally. Start the server in the background on a port — e.g.
-   `PORT=8080 node server.js` via the `background` tool, so it keeps serving while you check.
+   `PORT=8080 node server.js` via `execute` with the selected `sandbox_id`,
+   `background:true`, and `purpose: "App preview server"`, so it keeps serving while you check.
+   Use `background` with its returned `process_id` to poll or stop the server.
 2. Probe it with `curl` — confirm it answers, returns the status you expect, and the main
    page/endpoint is actually there (real content, not a stack trace or a blank 500):
 
@@ -93,25 +107,22 @@ publish:
    ```
 
 3. If it's broken, fix it and check again — don't tell the user a site is ready before you've
-   confirmed it serves. Only once it checks out do you `publish` and hand over the
+   confirmed it serves. Only once it checks out do you call `apps` action `publish` and hand over the
    `/d/<name>/` link.
 
 ## Sharing — say who can reach it
 
-By default a deployment is reachable only by its **owner scope** (personal for a DM, the
-team/channel for a channel turn). Share it the same way you'd share a file:
+New apps made in a channel are shared with that channel for authenticated read/use.
+Apps made in DMs stay private. Republishing never changes access; anonymous access is
+never enabled by default. Grant additional access separately with the app ID or handle:
 
 ```
-publish({
-  dir: "dist", entrypoint: "node server.js", name: "status-board",
-  share: [{ scope: "org:acme", permission: "read" }],
-})
+apps({ action: "share", id: "status-board", toScope: "org", permission: "read" })
 ```
 
 - **read** = can reach the app. **write** = can also manage it (redeploy/rollback).
-- Share to `personal:<id>` (one teammate), or `org:<id>` (the whole org). Team/channel
-  scopes can be granted, but team-membership reach at the link is not enforced yet — for
-  now use `org:` or `personal:` grants for reach.
+- Share to `personal:<id>` (one teammate), `channel:<id>` (a channel), or `org:<id>`
+  (the whole org). Channel access follows the current channel visibility and membership.
 
 ## What you can rely on
 
@@ -119,6 +130,9 @@ publish({
   `renameFrom` lets you change it on request without losing history or shares.
 - **Immutable versions + rollback.** Every publish is a new immutable version; `rollbackTo`
   is an instant pointer flip. Safe to ship often.
+- **Env carries over.** `env` is baked into each version; a republish that omits `env` keeps
+  the most recent version's (including a failed attempt), and passing `env` replaces it
+  (`{}` clears).
 - **Posture-aware egress.** Deployment network access follows the operator's configured
   deployment provider and egress policy. Declare required hosts and credentials explicitly;
   never assume arbitrary outbound access.
@@ -139,17 +153,19 @@ publish({
 
 ## If you can't publish
 
-Publishing needs the deployment runtime to be available on this computer. If `publish`
-errors (e.g. the runtime/Docker isn't present, the command is missing), **do not silently
-fall back to sending the files and tell the user they can "view the site" there.** Sending
+Publishing reads source files from the selected sandbox; the configured deployment provider
+starts the app separately. If `apps` action `publish` fails, inspect the actual error:
+source-path or sandbox-access failures differ from missing deployment configuration or
+provider build/start failures. Do not assume Docker must be installed on the source sandbox.
+**Do not silently fall back to sending the files and call that a hosted site.** Sending
 a file delivers it as a **downloadable attachment**, not a hosted, browsable site — a
 multi-file app (HTML + CSS + JS + assets) will NOT render from an attachment, and even a
 single `index.html` arrives as a file to download, not a live URL.
 
 So when publishing is unavailable:
 
-- Say plainly that you couldn't publish and why (the runtime isn't available here), and
-  what would fix it (the deployment runtime needs to be enabled on the agent computer).
+- Report the failed operation and actual error, and fix that cause where authorized.
+  If blocked, say what configuration, access, or app change is needed.
 - Only offer to send files for what that actually is: "I can send you the file(s) to
   download." It's a reasonable stopgap for a **single self-contained** `.html` (inline
   CSS/JS, no external assets) the user can open locally — describe it that way, not as a

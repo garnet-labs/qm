@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { createServer as createHttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createServer } from "../src/api/server.ts";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 
 const SECRET = "core-signing-secret".repeat(3);
@@ -215,4 +215,37 @@ test("public web creation rejects unauthenticated verification and malformed fil
     }),
   );
   assert.equal(destination.status, 400);
+});
+
+test("webhook history is relayed with the authenticated viewer, not a query-string impersonation", async () => {
+  const res = await fetch(
+    `${webBase}/api/webhooks`,
+    asUser("history-owner", {
+      method: "POST",
+      body: JSON.stringify({ action: "history test", verification: { scheme: "github" } }),
+    }),
+  );
+  const { webhook } = (await res.json()) as { webhook: { id: string } };
+  const path = `${webBase}/api/webhooks/${webhook.id}/events`;
+  const owner = await fetch(path, asUser("history-owner"));
+  assert.equal(owner.status, 200);
+  assert.deepEqual(await owner.json(), { events: [] });
+  const stranger = await fetch(`${path}?viewer=history-owner`, asUser("stranger"));
+  assert.equal(stranger.status, 404);
+});
+
+test("create accepts every scheme core verifies, including Linear, and core rejects unknown schemes", async () => {
+  const create = (scheme: string) =>
+    fetch(
+      `${webBase}/api/webhooks`,
+      asUser("linear-user", {
+        method: "POST",
+        body: JSON.stringify({ action: "triage Linear issues", verification: { scheme } }),
+      }),
+    );
+  const linear = await create("linear");
+  assert.equal(linear.status, 200);
+  const created = (await linear.json()) as { webhook: { verification: { scheme: string } } };
+  assert.equal(created.webhook.verification.scheme, "linear");
+  assert.equal((await create("bitbucket")).status, 400);
 });

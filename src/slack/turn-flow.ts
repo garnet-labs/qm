@@ -1,8 +1,8 @@
 import { swallow } from "../util/errors.ts";
-import { sleep, createInFlightThreadMap, type GoalNoticeView, type RunTaskView } from "./lib.ts";
+import { sleep, createInFlightThreadMap, type GoalNoticeView } from "./lib.ts";
 import type { SlackCoreClient } from "../api/slack-core-client.ts";
 import type { TurnRequest, TurnResult } from "../types.ts";
-import { GENERIC_FAILURE_CLAUSE, GENERIC_FAILURE_TEXT } from "../../plugins/chassis/src/failure-copy.ts";
+import { GENERIC_FAILURE_TEXT } from "../../plugins/chassis/src/failure-copy.ts";
 
 class SlackTurnFailure extends Error {
   constructor(message: string, cause: unknown) {
@@ -14,19 +14,15 @@ export function slackFailureText(err: unknown): string {
   return err instanceof SlackTurnFailure ? err.message : GENERIC_FAILURE_TEXT;
 }
 
-export function slackFailureClause(err: unknown): string {
-  return err instanceof SlackTurnFailure ? err.message : GENERIC_FAILURE_CLAUSE;
-}
-
 export type CoreTurnBody = Omit<TurnRequest, "surface">;
 
 interface TurnHooks {
-  deferOkAck?: boolean;
-  onQueued?: (runId: string) => void;
-  onSteered?: (runId: string) => void;
+  deferDeliveryAck?: boolean;
+  onQueued?: (runId: string) => void | Promise<void>;
+  onSteered?: (runId: string) => void | Promise<void>;
+  onReplying?: () => void;
   onFirstBlock?: (text: string) => void;
   onSurfacePosted?: () => void;
-  onTasks?: (tasks: RunTaskView[]) => void;
   onGoal?: (goal: GoalNoticeView) => void;
 }
 
@@ -93,11 +89,16 @@ export function createTurnFlow(core: SlackCoreClient): TurnFlow {
     }
     if (queued.status !== "queued" || !queued.runId) return queued;
     if (queued.steered) {
-      hooks.onSteered?.(queued.runId);
+      await hooks.onSteered?.(queued.runId);
       return { status: "silent", steered: true };
     }
-    hooks.onQueued?.(queued.runId);
-    return pollRun(queued.runId, hooks);
+    inFlightRuns.add(queued.runId);
+    try {
+      await hooks.onQueued?.(queued.runId);
+      return await pollRun(queued.runId, hooks);
+    } finally {
+      inFlightRuns.delete(queued.runId);
+    }
   }
 
   async function pollRun(runId: string, hooks: TurnHooks): Promise<TurnResult> {
@@ -105,9 +106,9 @@ export function createTurnFlow(core: SlackCoreClient): TurnFlow {
     let result: TurnResult | null;
     try {
       result = await core.waitRun(runId, {
+        ...(hooks.onReplying ? { onReplying: hooks.onReplying } : {}),
         ...(hooks.onFirstBlock ? { onFirstBlock: hooks.onFirstBlock } : {}),
         ...(hooks.onSurfacePosted ? { onSurfacePosted: hooks.onSurfacePosted } : {}),
-        ...(hooks.onTasks ? { onTasks: hooks.onTasks } : {}),
         ...(hooks.onGoal ? { onGoal: hooks.onGoal } : {}),
       });
     } catch (err) {
@@ -118,7 +119,7 @@ export function createTurnFlow(core: SlackCoreClient): TurnFlow {
       return result;
     }
     if (result && (result.status === "ok" || result.status === "refused" || result.status === "failed")) {
-      if (!(result.status === "ok" && hooks.deferOkAck)) ackRunDelivery(runId);
+      if (!hooks.deferDeliveryAck) ackRunDelivery(runId);
     } else {
       inFlightRuns.delete(runId);
     }

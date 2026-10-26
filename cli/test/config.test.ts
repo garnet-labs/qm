@@ -7,10 +7,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   CONFIG_FILENAME,
+  awsWorkloadArchitecture,
   loadConfigAt,
   loadConfigInDir,
-  mockHarnessWarning,
+  localSandboxActive,
   sandboxCoreEnv,
+  securityScreenEnv,
   updateConfigImageOverrides,
 } from "../src/config.ts";
 
@@ -29,7 +31,8 @@ function writeConfig(extra: Record<string, unknown>): { dir: string; path: strin
           },
         }
       : extra.env;
-  writeFileSync(path, JSON.stringify({ ...BASE, ...extra, ...(env === undefined ? {} : { env }) }));
+  const publicUrl = extra.target === "aws" ? { publicUrl: "https://agent.acme.example" } : {};
+  writeFileSync(path, JSON.stringify({ ...BASE, ...publicUrl, ...extra, ...(env === undefined ? {} : { env }) }));
   return { dir, path };
 }
 
@@ -417,7 +420,7 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
         target: "aws",
         publicUrl: "http://agent.acme.example",
         services: ["core", "web-ui", "portal"],
-        env: { core: { HARNESS: "mock" } },
+        env: { core: {} },
         aws: aws(["core", "web-ui", "portal"]),
       },
       error: /portal requires an HTTPS publicUrl/,
@@ -428,7 +431,7 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
         target: "aws",
         publicUrl: "https://agent.acme.example",
         services: ["core", "web-ui", "portal"],
-        env: { core: { HARNESS: "mock" }, portal: { OIDC_CLIENT_ID: "client", PORTAL_EXPECTED_TEAM_ID: " " } },
+        env: { core: {}, portal: { OIDC_CLIENT_ID: "client", PORTAL_EXPECTED_TEAM_ID: " " } },
         aws: aws(["core", "web-ui", "portal"]),
       },
       error: /PORTAL_EXPECTED_TEAM_ID/,
@@ -440,7 +443,7 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
         publicUrl: "https://agent.acme.example",
         services: ["core", "web-ui", "portal"],
         env: {
-          core: { HARNESS: "mock" },
+          core: {},
           portal: {
             OIDC_CLIENT_ID: "client",
             OIDC_ISSUER: "https://auth.example.com",
@@ -458,7 +461,7 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
         publicUrl: "https://agent.acme.example",
         services: ["core", "web-ui", "portal"],
         env: {
-          core: { HARNESS: "mock" },
+          core: {},
           portal: {
             OIDC_CLIENT_ID: "client",
             OIDC_ISSUER: "https://auth.example.com",
@@ -488,7 +491,7 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
         publicUrl: "https://agent.acme.example",
         apiUrl: "http://api.agent.acme.example",
         services: ["core"],
-        env: { core: { HARNESS: "mock" } },
+        env: { core: {} },
         aws: aws(["core"]),
       },
       error: /apiUrl must use the same protocol as publicUrl/,
@@ -499,9 +502,9 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
       label: `deployBranch ${JSON.stringify(deployBranch)}`,
       config: {
         target: "aws",
-        publicUrl: "http://agent.acme.example",
+        publicUrl: "https://agent.acme.example",
         services: ["core"],
-        env: { core: { HARNESS: "mock" } },
+        env: { core: {} },
         aws: { ...aws(["core"]), deployBranch },
       },
       error: /"aws\.deployBranch" must be a valid git branch name/,
@@ -510,9 +513,9 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
   withConfig(
     {
       target: "aws",
-      publicUrl: "http://agent.acme.example",
+      publicUrl: "https://agent.acme.example",
       services: ["core"],
-      env: { core: { HARNESS: "mock" } },
+      env: { core: {} },
       aws: { ...aws(["core"]), deployBranch: "release/prod-2", deployEnvironment: "production" },
     },
     ({ path }) => {
@@ -524,9 +527,9 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
     withConfig(
       {
         target: "aws",
-        publicUrl: "http://agent.acme.example",
+        publicUrl: "https://agent.acme.example",
         services: ["core"],
-        env: { core: { HARNESS: "mock" } },
+        env: { core: {} },
         aws: { ...aws(["core"]), deployEnvironment },
       },
       ({ path }) =>
@@ -545,11 +548,11 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
       target: "aws",
       publicUrl: "http://agent.acme.example",
       services: ["core"],
-      env: { core: { HARNESS: "mock" } },
+      env: { core: {} },
       aws: aws(["core"]),
     },
     ({ path }) => {
-      assert.equal(loadConfigAt(path).config.env.core?.HARNESS, "mock");
+      assert.throws(() => loadConfigAt(path), /AWS HARNESS=pi requires an HTTPS publicUrl/);
     },
   );
   withConfig(
@@ -605,6 +608,25 @@ test("AWS validates release labels, unique coordinates, Fargate sizes, and owned
     networking: { cloudMapNamespace: "acme.internal" },
     services: { core: service },
   };
+  for (const scopeBackend of ["modal", "aws"]) {
+    withConfig(
+      {
+        target: "aws",
+        aws,
+        env: {
+          core: {
+            DEPLOY_PROVIDER: "fly",
+            SANDBOX_BACKEND: "sprites",
+            AWS_DEPLOY_IMAGE: "",
+            SANDBOX_SCOPE_BACKENDS: JSON.stringify({ personal: scopeBackend }),
+          },
+        },
+      },
+      ({ path }) => {
+        assert.equal(loadConfigAt(path).config.env.core?.DEPLOY_PROVIDER, "fly");
+      },
+    );
+  }
   withConfig({ target: "aws", aws }, ({ path }) =>
     assert.equal(loadConfigAt(path).config.aws?.imageLabel, "release-1"),
   );
@@ -651,6 +673,14 @@ test("AWS validates release labels, unique coordinates, Fargate sizes, and owned
   for (const rdsInstance of ["", "9starts-with-digit", "double--hyphen", "ends-", "Mixed-Case"]) {
     withConfig({ target: "aws", aws: { ...aws, rdsInstance } }, ({ path }) => {
       assert.throws(() => loadConfigAt(path), /aws\.rdsInstance/);
+    });
+  }
+  withConfig({ target: "aws", aws: { ...aws, dbInstanceClass: "db.t4g.micro" } }, ({ path }) => {
+    assert.equal(loadConfigAt(path).config.aws!.dbInstanceClass, "db.t4g.micro");
+  });
+  for (const dbInstanceClass of ["", "t4g.micro", "db.T4g.micro", "db.t4g", "db..micro", "db.t4g.nano.micro"]) {
+    withConfig({ target: "aws", aws: { ...aws, dbInstanceClass } }, ({ path }) => {
+      assert.throws(() => loadConfigAt(path), /aws\.dbInstanceClass/);
     });
   }
   for (const objectStoreBucket of ["legacy-bucket", "assets.acme.example", "192.168.5.bucket"]) {
@@ -865,11 +895,11 @@ test("sandbox shape errors: object, app non-empty string, env string-map, secret
     { sandbox: { secretEnv: ["1BAD"] }, rx: /not a valid env var name/ },
     {
       sandbox: { backend: "k8s", app: "acme-sandboxes" },
-      rx: /"sandbox.backend" must be "local".*"sprites".*"aws".*or "agent37"/,
+      rx: /"sandbox.backend" must be "local".*"sprites".*"aws".*"agent37".*"superserve".*or "e2b"/,
     },
     {
       sandbox: { backend: "fly", app: "acme-sandboxes" },
-      rx: /"sandbox.backend" must be "local".*"sprites".*"aws".*or "agent37"/,
+      rx: /"sandbox.backend" must be "local".*"sprites".*"aws".*"agent37".*"superserve".*or "e2b"/,
     },
     {
       sandbox: { backend: "aws", app: "acme-sandboxes" },
@@ -917,6 +947,136 @@ test("agent37 is a deployment backend on every target and rejects unused Fly set
   });
 });
 
+test("e2b is a deployment backend on every target and rejects unused Fly settings", () => {
+  for (const target of ["docker", "fly"] as const) {
+    withConfig({ target, sandbox: { backend: "e2b" } }, ({ path }) => {
+      const { config } = loadConfigAt(path);
+      assert.deepEqual(sandboxCoreEnv(config), {
+        env: { SANDBOX_BACKEND: "e2b" },
+        missingSecrets: [],
+      });
+    });
+  }
+  withConfig({ sandbox: { backend: "e2b", app: "unused" } }, ({ path }) => {
+    assert.throws(() => loadConfigAt(path), /"sandbox.backend": "e2b" ignores "sandbox.app"/);
+  });
+});
+
+test("superserve backend requires the agent template in env.core", () => {
+  withConfig({ sandbox: { backend: "superserve" } }, ({ path }) => {
+    assert.throws(() => loadConfigAt(path), /superserve sandbox backend requires env.core.SUPERSERVE_TEMPLATE/);
+  });
+  withConfig({ env: { core: { SANDBOX_BACKEND: "superserve" } } }, ({ path }) => {
+    assert.throws(() => loadConfigAt(path), /superserve sandbox backend requires env.core.SUPERSERVE_TEMPLATE/);
+  });
+  withConfig({ sandbox: { backend: "superserve" }, env: { core: { SUPERSERVE_TEMPLATE: "  " } } }, ({ path }) => {
+    assert.throws(() => loadConfigAt(path), /superserve sandbox backend requires env.core.SUPERSERVE_TEMPLATE/);
+  });
+  withConfig(
+    { sandbox: { backend: "superserve" }, env: { core: { SUPERSERVE_TEMPLATE: "qm-agent-1.0.0" } } },
+    ({ path }) => {
+      const { config } = loadConfigAt(path);
+      assert.deepEqual(sandboxCoreEnv(config), { env: { SANDBOX_BACKEND: "superserve" }, missingSecrets: [] });
+    },
+  );
+  withConfig(
+    {
+      sandbox: { backend: "local" },
+      env: { core: { SANDBOX_SCOPE_BACKENDS: JSON.stringify({ personal: "superserve" }) } },
+    },
+    ({ path }) => assert.doesNotThrow(() => loadConfigAt(path)),
+  );
+});
+
+test("Superserve selection honors env.core.SANDBOX_BACKEND overrides", () => {
+  withConfig({ sandbox: { backend: "local" }, env: { core: { SANDBOX_BACKEND: "superserve" } } }, ({ path }) => {
+    assert.throws(() => loadConfigAt(path), /superserve sandbox backend requires env.core.SUPERSERVE_TEMPLATE/);
+  });
+  withConfig({ sandbox: { backend: "local" }, env: { core: { SANDBOX_BACKEND: " superserve " } } }, ({ path }) => {
+    assert.throws(() => loadConfigAt(path), /superserve sandbox backend requires env.core.SUPERSERVE_TEMPLATE/);
+  });
+  withConfig({ sandbox: { backend: "superserve" }, env: { core: { SANDBOX_BACKEND: "   " } } }, ({ path }) => {
+    assert.throws(
+      () => loadConfigAt(path),
+      /"env.core.SANDBOX_BACKEND" is blank/,
+      "a blank override is refused rather than rendered over the sandbox block",
+    );
+  });
+  withConfig(
+    {
+      target: "fly",
+      sandbox: { backend: "sprites", app: "acme-sandboxes", secretEnv: ["COMPANY_API_TOKEN"] },
+      env: { core: { SANDBOX_BACKEND: "superserve", SUPERSERVE_TEMPLATE: "qm-agent-1.0.0" } },
+    },
+    ({ path }) => {
+      const { config } = loadConfigAt(path);
+      assert.deepEqual(
+        sandboxCoreEnv(config),
+        { env: { SANDBOX_BACKEND: "superserve" }, missingSecrets: [] },
+        "the overridden backend's settings are not demanded or injected",
+      );
+    },
+  );
+  withConfig(
+    {
+      sandbox: { backend: "local" },
+      env: { core: { SANDBOX_BACKEND: "superserve", SUPERSERVE_TEMPLATE: "qm-agent-1.0.0" } },
+    },
+    ({ path }) => {
+      const { config } = loadConfigAt(path);
+      assert.equal(config.sandbox?.backend, "local");
+    },
+  );
+  withConfig({ sandbox: { backend: "superserve" }, env: { core: { SANDBOX_BACKEND: "local" } } }, ({ path }) => {
+    const { config } = loadConfigAt(path);
+    assert.equal(localSandboxActive(config), true, "docker prepares the local sandbox the override actually runs");
+    assert.equal(sandboxCoreEnv(config).env.SANDBOX_BACKEND, "local");
+  });
+  withConfig(
+    {
+      sandbox: { backend: "local" },
+      env: { core: { SANDBOX_BACKEND: "superserve", SUPERSERVE_TEMPLATE: "qm-agent-1.0.0" } },
+    },
+    ({ path }) => {
+      assert.equal(
+        localSandboxActive(loadConfigAt(path).config),
+        false,
+        "a remote override never mounts the host docker socket",
+      );
+    },
+  );
+});
+
+test("Superserve configuration preserves existing backend selection and validation", () => {
+  for (const override of ["agent37", "sprites", "", "   "]) {
+    withConfig({ sandbox: { backend: "local" }, env: { core: { SANDBOX_BACKEND: override } } }, ({ path }) => {
+      const { config } = loadConfigAt(path);
+      assert.equal(localSandboxActive(config), true);
+      assert.equal(sandboxCoreEnv(config).env.SANDBOX_BACKEND, "local");
+    });
+  }
+  withConfig({ sandbox: { backend: "agent37" }, env: { core: { SANDBOX_BACKEND: "sprites" } } }, ({ path }) =>
+    assert.equal(sandboxCoreEnv(loadConfigAt(path).config).env.SANDBOX_BACKEND, "agent37"),
+  );
+  for (const scopes of ["invalid", "[]", "null", "42"]) {
+    withConfig({ sandbox: { backend: "local" }, env: { core: { SANDBOX_SCOPE_BACKENDS: scopes } } }, ({ path }) =>
+      assert.doesNotThrow(() => loadConfigAt(path)),
+    );
+  }
+});
+
+test("sandbox.backend alone makes the backend's credential a required secret on every target", () => {
+  for (const target of ["docker", "fly"] as const) {
+    withConfig(
+      { target, sandbox: { backend: "superserve" }, env: { core: { SUPERSERVE_TEMPLATE: "qm-agent-1.0.0" } } },
+      ({ path }) => {
+        const secret = computedSecrets(loadConfigAt(path).config).find((s) => s.name === "SUPERSERVE_API_KEY");
+        assert.ok(secret?.required, `${target} requires the key without duplicating SANDBOX_BACKEND under env.core`);
+      },
+    );
+  }
+});
+
 test("aws target makes the sandbox substrate explicit: backend required with a sandbox block, aws forbids fly sandbox settings", () => {
   const aws = {
     accountId: "123456789012",
@@ -933,6 +1093,11 @@ test("aws target makes the sandbox substrate explicit: backend required with a s
   });
   withConfig({ target: "aws", aws, sandbox: { backend: "sprites", app: "acme-sandboxes" } }, ({ path }) => {
     assert.equal(loadConfigAt(path).config.sandbox?.backend, "sprites");
+  });
+  withConfig({ target: "aws", aws, sandbox: { backend: "sprites" } }, ({ path }) => {
+    const { config } = loadConfigAt(path);
+    assert.equal(config.sandbox?.backend, "sprites");
+    assert.equal(config.sandbox?.app, undefined);
   });
   withConfig({ target: "aws", aws, sandbox: { backend: "aws" } }, ({ path }) => {
     assert.equal(loadConfigAt(path).config.sandbox?.backend, "aws");
@@ -1049,28 +1214,29 @@ test("secretEnv (per-service) validates service keys, env-var names, and managed
 
 test("securityScreen declares one external proxy and requires secret-store routing", () => {
   const securityScreen = {
-    backend: "proxy",
+    mode: "observe",
+    classifier: "proxy",
     provider: "example-screen",
     endpoint: "https://screen.example.test/classify",
-    rollout: "shadow",
   };
   withConfig(
     { securityScreen, secretEnv: { core: { SECURITY_SCREEN_PROXY_TOKEN: "EXAMPLE_SCREEN_TOKEN" } } },
     ({ path }) => assert.deepEqual(loadConfigAt(path).config.securityScreen, securityScreen),
   );
   withConfig({ securityScreen }, ({ path }) =>
-    assert.throws(() => loadConfigAt(path), /securityScreen requires secretEnv\.core\.SECURITY_SCREEN_PROXY_TOKEN/),
+    assert.throws(() => loadConfigAt(path), /classifier proxy requires secretEnv\.core\.SECURITY_SCREEN_PROXY_TOKEN/),
   );
   withConfig({ secretEnv: { core: { SECURITY_SCREEN_PROXY_TOKEN: "EXAMPLE_SCREEN_TOKEN" } } }, ({ path }) =>
     assert.throws(() => loadConfigAt(path), /SECURITY_SCREEN_PROXY_TOKEN requires securityScreen/),
   );
   for (const invalid of [
-    { ...securityScreen, backend: "sdk" },
+    { ...securityScreen, classifier: "sdk" },
+    { ...securityScreen, mode: "shadow" },
+    { ...securityScreen, backend: "proxy" },
     { ...securityScreen, provider: "Bad Provider" },
     { ...securityScreen, provider: "surface" },
     { ...securityScreen, provider: "origin" },
     { ...securityScreen, endpoint: "http://screen.example.test/classify" },
-    { ...securityScreen, rollout: "gradual" },
     { ...securityScreen, extra: true },
   ]) {
     withConfig(
@@ -1082,10 +1248,10 @@ test("securityScreen declares one external proxy and requires secret-store routi
 
 test("securityScreen owns its derived environment and keeps its token on core", () => {
   const securityScreen = {
-    backend: "proxy",
+    mode: "enforce",
+    classifier: "proxy",
     provider: "example-screen",
     endpoint: "https://screen.example.test/classify",
-    rollout: "enforce",
   };
   withConfig(
     {
@@ -1126,13 +1292,13 @@ test("securityScreen owns its derived environment and keeps its token on core", 
       securityScreen,
       secretEnv: {
         core: { SECURITY_SCREEN_PROXY_TOKEN: "EXAMPLE_SCREEN_TOKEN" },
-        slack: { SECURITY_SCREEN_PROXY_ROLLOUT: "EXAMPLE_SCREEN_ROLLOUT" },
+        slack: { SECURITY_SCREEN_CLASSIFIER: "EXAMPLE_SCREEN_CLASSIFIER" },
       },
     },
     ({ path }) =>
       assert.throws(
         () => loadConfigAt(path),
-        /secretEnv\.slack\.SECURITY_SCREEN_PROXY_ROLLOUT.*managed by securityScreen/,
+        /secretEnv\.slack\.SECURITY_SCREEN_CLASSIFIER.*managed by securityScreen/,
       ),
   );
   withConfig(
@@ -1186,57 +1352,47 @@ test("modelProvider must name a vendor the configured harness can bill", () => {
   withConfig({ modelProvider: "openrouter", env: { core: { HARNESS: "pi" } } }, ({ path }) => {
     assert.equal(loadConfigAt(path).config.modelProvider, "openrouter");
   });
-  withConfig({ modelProvider: "openrouter", env: { core: { HARNESS: "codex" } } }, ({ path }) => {
+  withConfig({ modelProvider: "openrouter", env: { core: { HARNESS: "claude" } } }, ({ path }) => {
     assert.throws(
       () => loadConfigAt(path),
-      /model provider "openrouter" cannot serve a base model on env.core.HARNESS "codex"/,
+      /model provider "openrouter" cannot serve a base model on env.core.HARNESS "claude"/,
     );
   });
-  withConfig({ modelProvider: "anthropic", env: { core: { HARNESS: "codex" } } }, ({ path }) => {
+  withConfig({ modelProvider: "openai", env: { core: { HARNESS: "claude" } } }, ({ path }) => {
     assert.throws(() => loadConfigAt(path), /cannot serve a base model/);
   });
-  withConfig({ modelProvider: "openai", env: { core: { HARNESS: "codex" } } }, ({ path }) => {
+  withConfig({ modelProvider: "openai", env: { core: { HARNESS: "pi" } } }, ({ path }) => {
     assert.equal(loadConfigAt(path).config.modelProvider, "openai");
   });
+  for (const harness of ["codex", "opencode", "mock"]) {
+    withConfig({ env: { core: { HARNESS: harness } } }, ({ path }) => {
+      assert.throws(() => loadConfigAt(path), new RegExp(`env.core.HARNESS "${harness}" is not recognized`));
+    });
+  }
   withConfig({ modelProvider: "openrouter" }, ({ path }) => {
     assert.equal(
       loadConfigAt(path).config.modelProvider,
       "openrouter",
-      "an unset harness is mock, which bills anything",
+      "an unset harness is pi, which bills openrouter",
     );
   });
 });
 
 test("env.core.MODEL_PROVIDER is validated as the provider core will actually use", () => {
   withConfig(
-    { modelProvider: "openai", env: { core: { HARNESS: "codex", MODEL_PROVIDER: "anthropic" } } },
+    { modelProvider: "anthropic", env: { core: { HARNESS: "claude", MODEL_PROVIDER: "openai" } } },
     ({ path }) => {
-      assert.throws(() => loadConfigAt(path), /model provider "anthropic" cannot serve a base model/);
+      assert.throws(() => loadConfigAt(path), /model provider "openai" cannot serve a base model/);
     },
   );
   withConfig(
-    { modelProvider: "anthropic", env: { core: { HARNESS: "codex", MODEL_PROVIDER: "openai" } } },
+    { modelProvider: "openai", env: { core: { HARNESS: "claude", MODEL_PROVIDER: "anthropic" } } },
     ({ path }) => {
-      assert.equal(loadConfigAt(path).config.modelProvider, "anthropic", "the override decides, the declaration stays");
+      assert.equal(loadConfigAt(path).config.modelProvider, "openai", "the override decides, the declaration stays");
     },
   );
   withConfig({ env: { core: { HARNESS: "pi", MODEL_PROVIDER: "bedrock" } } }, ({ path }) => {
     assert.throws(() => loadConfigAt(path), /env.core.MODEL_PROVIDER must be one of/);
-  });
-});
-
-test("a mock deployment is named as one, and a real harness draws no warning", () => {
-  withConfig({ env: { core: {} } }, ({ path }) => {
-    assert.match(mockHarnessWarning(loadConfigAt(path).config)!, /unset, which means "mock".*calls no model provider/s);
-  });
-  withConfig({ env: { core: { HARNESS: "mock" } } }, ({ path }) => {
-    assert.match(mockHarnessWarning(loadConfigAt(path).config)!, /set to "mock"/);
-  });
-  withConfig({ env: { core: { HARNESS: "pi" } } }, ({ path }) => {
-    assert.equal(mockHarnessWarning(loadConfigAt(path).config), undefined);
-  });
-  withConfig({ target: "fly", appPrefix: "acme", env: { core: {} } }, ({ path }) => {
-    assert.equal(mockHarnessWarning(loadConfigAt(path).config), undefined, "the fly template renders HARNESS=pi");
   });
 });
 
@@ -1265,4 +1421,94 @@ test("blank model provider overrides preserve the declared provider in runtime a
       assert.equal(computedSecrets(config).find((secret) => secret.name === "OPENROUTER_API_KEY")?.required, true);
     },
   );
+});
+
+test("screening defaults off and the model classifier needs no proxy settings", () => {
+  assert.deepEqual(securityScreenEnv({}), { SECURITY_SCREEN: "off" });
+  for (const mode of ["off", "observe", "enforce"] as const) {
+    withConfig({ securityScreen: { mode } }, ({ path }) => {
+      const { config } = loadConfigAt(path);
+      assert.deepEqual(securityScreenEnv(config), { SECURITY_SCREEN: mode });
+    });
+    withConfig({ securityScreen: { mode, provider: "example-screen" } }, ({ path }) =>
+      assert.throws(() => loadConfigAt(path), /require classifier proxy/),
+    );
+    withConfig(
+      { securityScreen: { mode }, secretEnv: { core: { SECURITY_SCREEN_PROXY_TOKEN: "TOKEN" } } },
+      ({ path }) => assert.throws(() => loadConfigAt(path), /requires securityScreen classifier proxy/),
+    );
+  }
+  withConfig({ securityScreen: { backend: "off" } }, ({ path }) =>
+    assert.deepEqual(securityScreenEnv(loadConfigAt(path).config), { SECURITY_SCREEN: "off" }),
+  );
+  for (const retired of [
+    { backend: "model" },
+    { mode: "enforce", allPostures: true },
+    { mode: "observe", rollout: "shadow" },
+  ]) {
+    withConfig({ securityScreen: retired }, ({ path }) => assert.throws(() => loadConfigAt(path), /retired/));
+  }
+});
+
+test("AWS ownership control is opt-in and reserves deployment identity allocation", () => {
+  const aws = {
+    accountId: "123456789012",
+    region: "us-west-2",
+    cluster: "acme",
+    deployRoleArn: "arn:aws:iam::123456789012:role/deploy",
+    secretsPrefix: "acme/",
+    imageLabel: "release",
+    networking: { cloudMapNamespace: "acme.internal" },
+    services: { core: { ecrRepository: "core", ecsService: "acme-core", cpu: 512, memory: 1024 } },
+  };
+  withConfig({ target: "aws", aws }, ({ path }) =>
+    assert.equal(loadConfigAt(path).config.aws!.backgroundWorkControl, undefined),
+  );
+  withConfig({ target: "aws", aws: { ...aws, backgroundWorkControl: true } }, ({ path }) =>
+    assert.equal(loadConfigAt(path).config.aws!.backgroundWorkControl, true),
+  );
+  withConfig({ target: "aws", aws: { ...aws, backgroundWorkControl: "true" } }, ({ path }) =>
+    assert.throws(() => loadConfigAt(path), /backgroundWorkControl/),
+  );
+  withConfig({ target: "aws", aws, env: { core: { BACKGROUND_DEPLOYMENT_ID: "reused" } } }, ({ path }) =>
+    assert.throws(() => loadConfigAt(path), /allocated/),
+  );
+});
+
+test("proxy deployment rendering names the mode and classifier", () => {
+  withConfig(
+    {
+      securityScreen: {
+        mode: "enforce",
+        classifier: "proxy",
+        provider: "fixture",
+        endpoint: "https://screen.example.test/classify",
+      },
+      secretEnv: { core: { SECURITY_SCREEN_PROXY_TOKEN: "SCREEN_TOKEN" } },
+    },
+    ({ path }) => {
+      assert.deepEqual(securityScreenEnv(loadConfigAt(path).config), {
+        SECURITY_SCREEN: "enforce",
+        SECURITY_SCREEN_CLASSIFIER: "proxy",
+        SECURITY_SCREEN_PROXY_PROVIDER: "fixture",
+        SECURITY_SCREEN_PROXY_ENDPOINT: "https://screen.example.test/classify",
+      });
+    },
+  );
+});
+
+test("AWS built-in architecture defaults match published images and retain explicit choices", () => {
+  const workloads = ["core", "web-ui", "admin", "portal", "auth", "linear"];
+  const config = {
+    plugins: [{ name: "linear" }],
+    imageOverrides: {},
+    aws: { services: Object.fromEntries(workloads.map((name) => [name, {}])) },
+  } as unknown as import("../src/config.ts").QmConfig;
+  for (const workload of workloads) {
+    assert.equal(awsWorkloadArchitecture(config, workload), workload === "linear" ? "arm64" : "amd64");
+    for (const architecture of ["arm64", "amd64"] as const) {
+      config.aws!.services[workload]!.architecture = architecture;
+      assert.equal(awsWorkloadArchitecture(config, workload), architecture);
+    }
+  }
 });

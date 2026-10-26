@@ -1,5 +1,7 @@
 # qm
 
+**Read [`docs/SPEC.md`](./docs/SPEC.md) first.** It is the short source of truth for QM's north stars, subsystems and past mistakes. Where another doc disagrees, the spec wins.
+
 To run and test, see [`README.md`](./README.md).
 
 ## Working on the code
@@ -41,7 +43,7 @@ Two habits that keep task-focused changes from scarring the rest of the repo:
   is correct, and that belief is the bias review exists to defeat. Never self-review in the
   authoring context, however small the diff; a green CI run is not review either. What
   scales with risk is how deep the reviewer goes — a change with a narrow blast radius
-  warrants one reviewer at modest effort scoped to the diff, while core control flow, auth
+  warrants modest effort scoped to the diff for each reviewer, while core control flow, auth
   and credentials, data loss or migrations, concurrency and retry logic, spend, public API
   contracts, the shared helpers above that every path flows through, or a diff too large to
   hold in your head warrant high effort and several reviewers with distinct lenses. Judge
@@ -49,12 +51,53 @@ Two habits that keep task-focused changes from scarring the rest of the repo:
   fifty importers is not a small change. The reviewer, not the author, has the last word on
   depth: a modest pass that spots risk it wasn't scoped for escalates on its own initiative
   rather than staying in its lane. Resolve what they find before merging.
+- **Run independent Wall of shame reviews in parallel for every PR.** First triage:
+  give one fast, cheap model (Haiku-class) the diff and every lens in the current
+  [Wall of shame](./docs/SPEC.md#wall-of-shame), and have it mark each lens relevant or
+  not, keeping any lens it is unsure about. Lenses marked _always reviewed_ in the spec
+  skip triage and always get a reviewer. Then dispatch a separate fresh-context
+  subagent or independent reviewer for each relevant lens. Only
+  Honorable mentions may share one combined reviewer. Launch reviews asynchronously
+  and in parallel within available capacity, queuing any overflow. Do not wait for
+  reviews before opening or updating the PR, running checks, or continuing other work.
+  Each reviewer reads their lens and examples, examines the diff and affected paths,
+  and returns **accept** or **request changes**, a **score out of 100** (higher is
+  better), and **1–2 sentences** explaining their assessment. Cite concrete findings
+  and state the smallest correction needed; explain when a lens has no applicable
+  concerns. Scores are informational, with no aggregate score or numeric merge threshold.
+  Put each reviewer's actual verdict, score, and concise assessment in the **PR
+  description**, labeled by lens and reviewer and tied to the reviewed commit. Update
+  the description as reviews arrive; mark pending reviews honestly and never invent
+  results or substitute the author's self-review. After edits, have independent
+  reviewers reassess affected lenses and explicitly carry forward unaffected results.
+  These reviews run alongside PR work; before merging, every relevant lens must have accepted
+  and all requested changes must be resolved. They supplement the correctness,
+  security, and regression review above. The `Wall of shame review` CI check fails
+  until the description's report covers every lens for the PR head: relevant lenses with
+  an Accept verdict, and the rest as `Not relevant` with the triage model as reviewer and
+  its one-line reason as the assessment.
+- **Disclose configuration changes in the PR description.** Name added, removed,
+  or changed settings, flags, modes, and providers, including defaults, precedence,
+  and supported combinations. Explain why; keep this proportional to the change.
+- **Keep humans in the loop on schema and data types.** Humans must see and review
+  changes to tables and persisted/API payload shapes. Surface them in chat and the
+  PR description as you make them: complete affected old and new shapes, including
+  keys, indexes, constraints, enum variants, and JSON fields, with representative
+  before/after rows. Label invented examples. Account for every field kept, moved,
+  transformed, or dropped; explain migration, backfill, rollout, and compatibility
+  effects. Distinguish approved design, implemented code, and live schema. A migration
+  diff alone is not enough. If configuration or schema is unchanged, say so explicitly.
 - **Verify locally with the affected tests, not the whole suite.** Run the tests covering
   what you changed plus typecheck and lint, then push and let CI be the full gate — CI
   shards the suite across parallel runners, and reproducing that serially costs several
   times the wall clock for the same signal. Judge "affected" by callers rather than by diff
   size, for the same reason as above; run everything locally when you can't tell what a
   change reaches.
+- **Test what a user or caller sees, never the source.** Run the code and assert on its
+  output; don't assert on source text, CSS, or prompt wording. A bug fix's test must fail
+  on the old code through the real path and assert the correct behavior, not the inverse
+  of the specific fix. Don't write checks that can't fail — a fixture compared against
+  itself, a job that always reports success. When a feature is removed, delete its tests.
 - **Verify non-trivial behavior changes in a live dev instance before opening a PR.**
   When a change is substantial enough that unit tests alone won't prove it works
   end-to-end — new or changed agent behavior, or anything touching the Slack/web
@@ -64,6 +107,17 @@ Two habits that keep task-focused changes from scarring the rest of the repo:
   Slack Mac app, and don't ask permission first — do it on your own; don't wait to be
   asked. Skip it for trivial refactors, docs, config, or pure-logic changes already
   covered by tests.
+  Leave review instances running until the PR merges, unless the user asks to stop
+  earlier. After merge, tear down that worktree's instance and verify its processes
+  and lease are gone before removing the worktree. Preserve shared Postgres and
+  persistent data. If the user asks to keep an instance beyond merge, keep its
+  worktree too.
+- **Keep screenshots out of Git and app assets.** Never commit screenshots or create
+  a tracked screenshots directory, including under docs or QA. Capture review images
+  in a temporary directory outside the checkout or an ignored local output directory,
+  and attach them to the PR or host them externally. Do not bundle review screenshots
+  into the app. Only actual product assets, such as icons and instructional media,
+  belong in the app bundle.
 - **Demo every front-end change in the PR.** Anything an operator or user sees
   rendered — admin/web/portal UI, Slack surfaces, emails — ships with a way for a
   reviewer to see the result without booting it. Prefer a link to a live demo app
@@ -71,33 +125,35 @@ Two habits that keep task-focused changes from scarring the rest of the repo:
   reviewer can click around the real thing; note in the PR what's mocked. Fall back
   to screenshots only when a live demo isn't practical (e.g. Slack surfaces, emails),
   and then show the after state (before/after for changes to something that existed),
-  rendered against realistic data.
+  rendered against realistic data. Attach or externally host these screenshots; never
+  commit them to satisfy this requirement.
 
-## Private forks
+## Deployment repositories and source forks
 
-Organizations run qm from private forks of this repository. A private fork is a
-standalone private repository whose history begins as a clone of qm. Everything
-organization-specific is confined to `deploy/layers/<org>/`, and every file outside
-that directory, which these rules call core, stays byte-identical to upstream. Core
-here covers the plugins, the CLI, the docs, and CI as much as the runtime under
-`src/`. A private fork is created with a plain clone and never with
-GitHub's fork feature, because a GitHub fork of a public repository cannot be made
-private and its commits stay fetchable by SHA from the public side. The README section
-"Customize your instance" gives the creation procedure.
+Before acting, run `git remote -v` and inspect the checkout. `origin` pointing at
+`yc-software/qm` identifies upstream. Another origin alone does not identify a source
+fork: a package deployment has its own `qm.config.jsonc` and pinned `@yc-software/qm`
+dependency, while a source fork carries the QM source tree and upstream ancestry.
 
-Before you act, determine which repository this checkout is by running `git remote -v`.
-If `origin` points at `yc-software/qm`, you are in upstream qm. If `origin`
-points anywhere else, you are in a private fork, and five rules apply. Do not edit core;
-a change to core belongs in upstream qm, and the `upstream-pr` skill sends it there
-without leaking organization context. Keep every organization-specific file under
-`deploy/layers/<org>/`. Sync from upstream with the `update-qm` skill, which merges and
-never rebases. Pass `--repo` to every `gh` command, because `gh` may otherwise pick the
-upstream repository through the `upstream` remote and read or edit the wrong
-repository's pull requests. Never reference an upstream issue or pull request by number
-(`yc-software/qm#123`) in a fork's PRs, issues, comments, or commit messages: GitHub
-mirrors such mentions onto the referenced upstream item as a permanent timeline event,
-so the fork's existence and the mentioning title become visible to whoever GitHub
-decides may see them. Name upstream work in plain words instead.
+Package deployments customize config, tools, skills, and services without copying core.
+Source forks may modify core freely, including runtime, plugins, CLI, docs, and CI;
+contributing those changes upstream is optional. Keep private deployment material under
+`deploy/layers/<org>/` in private source forks or in a separate private deployment
+repository for public source checkouts. Secrets never enter Git. The README section
+"Customize your instance" documents both paths and explicit source builds.
+
+Create private source forks as standalone repositories outside GitHub's fork network.
+Seed only `main` and set the default branch explicitly; never use `git push --mirror`.
+Use `update-qm` to merge source updates without rebasing published history or discarding
+intentional local changes. Land source-sync PRs without squashing or rebasing away their
+upstream ancestry. Package deployments update their dependency instead.
+
+In downstream repositories, pass `--repo` to every `gh` command so the upstream remote
+cannot redirect an operation. When contributing from private work, use `upstream-pr`
+to prepare a clean branch and scrub outgoing content and history. Never reference an
+upstream issue or PR by number in private repository PRs, issues, comments, or commit
+messages: GitHub cross-references can disclose their existence and titles upstream.
+Name upstream work in plain words instead.
 
 ## Durable by default
 
@@ -107,7 +163,7 @@ per-instance and wiped by every deploy. Anything an operator or the system reads
 later (audit, logs, resolved config, queued or in-flight work) must live in a durable
 store, never RAM alone. RAM-only is fine only as a cache in front of a durable store, or
 for genuinely disposable, re-derivable state. If you're adding a log, audit, queue, or
-resolved config, back it with Postgres; the spec's data-model & durability section tracks the gaps.
+resolved config, back it with Postgres; see the spec's “Free the brain” north star.
 
 > `CLAUDE.md` is a symlink to `AGENTS.md`, so every tool (Claude Code, Codex,
 > Cursor, …) reads the same guidance from this one file. If a tool-specific

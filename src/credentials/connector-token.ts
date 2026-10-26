@@ -10,12 +10,20 @@ export function envKey(host: string, principalId?: string): string {
   return `VAULT_TOKEN_${normalizedHost}__${normalizedPrincipal}_${tag}`;
 }
 
+export function connectorTokenNote(host: string): string {
+  return `token in \`$${envKey(host)}\`; send it yourself as \`Authorization: Bearer\`; nothing adds it for you`;
+}
+
 export function withOperatorTokenFallback(
   store: ConnectorTokenStore,
   serviceHosts: string[],
   secrets: SecretSource = createEnvSecretSource(),
 ): ConnectorTokenStore {
   return {
+    operatorFallbackHosts: serviceHosts,
+    ...(store.listConnectorsByOwners
+      ? { listConnectorsByOwners: (ownerIds: string[]) => store.listConnectorsByOwners!(ownerIds) }
+      : {}),
     setConnectorToken: (host, principalId, token, accountType) =>
       store.setConnectorToken(host, principalId, token, accountType),
     deleteConnectorToken: (host, principalId, accountType) =>

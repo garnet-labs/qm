@@ -1,3 +1,4 @@
+import { buildTimeline } from "../src/timeline.ts";
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
@@ -34,7 +35,7 @@ function blankAssistant(): AssistantMessage {
 }
 
 function freshAcc(t0: number): Acc {
-  return { acc: "", lastProgressAt: t0 };
+  return { acc: "", startOffset: 0, lastProgressAt: t0 };
 }
 
 function drain(stream: ReturnType<typeof createAssistantMessageEventStream>): Promise<AssistantMessage> {
@@ -339,7 +340,7 @@ test("approval denial is rendered as a normal status, not a stream error", async
 
   const streamFn = makeRunResumeStreamFn("run-denied", {
     status: "done",
-    result: { status: "refused", reason: "approval denied for git push --force origin main" },
+    result: { status: "refused", refusalKind: "approval_denied", reason: "the approver declined this push" },
     partial: "",
     activity: [
       {
@@ -363,6 +364,20 @@ test("approval denial is rendered as a normal status, not a stream error", async
   assert.equal(block?.type === "text" ? block.text : "", "Denied.");
   assert.equal(work?.status, "complete");
   assert.equal(work?.activity.length, 1);
+});
+
+test("a refusal that only mentions a denied approval in its reason is a failure, not a denial", async () => {
+  const streamFn = makeRunResumeStreamFn("run-refused", {
+    status: "done",
+    result: { status: "refused", reason: "approval denied for git push --force origin main" },
+    partial: "",
+    startedAt: 100,
+    finishedAt: 200,
+  });
+  const final = await drain(await streamFn(MODEL, { systemPrompt: "", messages: [], tools: [] } as never));
+
+  assert.equal((final as AssistantWork & { approvalDecision?: string }).approvalDecision, undefined);
+  assert.equal((final as AssistantWork).work?.status, "failed");
 });
 
 test("a failed run renders friendly copy, never the internal failure reason", async () => {
@@ -414,4 +429,50 @@ test("a stored quarantine refusal renders the canned copy on the web, never the 
   assert.equal(final.stopReason, "error");
   assert.doesNotMatch(final.errorMessage ?? "", /internal screening details/);
   assert.match(final.errorMessage ?? "", /security screen flagged/);
+});
+
+test("live run polling includes only consumed visible steering in activity order", async () => {
+  instantSleep();
+  stubRuns([
+    {
+      status: "done",
+      result: { status: "ok", reply: "Done" },
+      activity: [
+        { seq: 1, type: "user", createdAt: 1, payload: { text: "start" } },
+        { seq: 2, type: "tool_call", createdAt: 2, payload: { tool: "execute", callId: "a" } },
+        { seq: 3, type: "tool_result", createdAt: 3, payload: { tool: "execute", callId: "a" } },
+        { seq: 4, type: "user", createdAt: 4, payload: { text: "Change direction", steered: true } },
+        { seq: 5, type: "user", createdAt: 5, payload: { text: "Hidden", steered: true, hidden: true } },
+        { seq: 6, type: "tool_call", createdAt: 6, payload: { tool: "execute", callId: "b" } },
+      ],
+    },
+  ]);
+  const stream = createAssistantMessageEventStream();
+  const partial = blankAssistant() as AssistantWork;
+  partial.work = { status: "thinking", activity: [] };
+  await pollRun(stream, partial, "run-steer", freshAcc(Date.now()));
+  const final = (await drain(stream)) as AssistantWork;
+  assert.deepEqual(
+    final.work!.activity.map((entry) => entry.seq),
+    [2, 3, 4, 6],
+  );
+  assert.deepEqual(
+    buildTimeline(final.work!).map((item) => item.kind),
+    ["tool", "steer", "tool"],
+  );
+});
+
+test("polling advances a trimmed window even when every snapshot has the same length", async () => {
+  instantSleep();
+  stubRuns([
+    { status: "running", result: null, partial: "first tail", partialStartOffset: 200_000 },
+    { status: "running", result: null, partial: "later tail", partialStartOffset: 200_010 },
+    { status: "done", result: { status: "ok" }, partial: "final tail", partialStartOffset: 200_020 },
+  ]);
+  const stream = createAssistantMessageEventStream();
+  const partial = blankAssistant();
+  const st = freshAcc(Date.now());
+  await pollRun(stream, partial, "r", st);
+  assert.deepEqual((await drain(stream)).content, [{ type: "text", text: "final tail" }]);
+  assert.equal(st.startOffset, 200_020);
 });

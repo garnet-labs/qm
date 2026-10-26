@@ -9,6 +9,7 @@ import { createIdempotencyStore, type IdempotencyRecord } from "../src/idempoten
 import { createIdentityService } from "../src/identity/identity-service.ts";
 import { createPostgresMapFactory } from "../src/persistence/durable-map.ts";
 import { scopeId, type Cron, type TurnRequest, type TurnResult } from "../src/types.ts";
+import { singleProcessDeps } from "./support/single-process.ts";
 
 const URL = process.env.DATABASE_URL;
 const skip = URL ? false : "set DATABASE_URL (a Postgres) to run the cron queue tests";
@@ -41,6 +42,7 @@ function instance(calls: TurnRequest[], turnMs = 0, fires?: CronFireStore): { sc
     return { status: "ok", reply: "QUEUE-OUTPUT" };
   };
   const scheduler = createScheduler({
+    ...singleProcessDeps(),
     crons,
     deliveries: createDeliveryStore(),
     idempotency: createIdempotencyStore(maps.map<IdempotencyRecord>(IDEM_TABLE)),
@@ -69,6 +71,7 @@ test(
         createdBy: "U1",
         ownerScopeId: scopeId("personal", "U1"),
       });
+      a.scheduler.notifyChanged(cron.id);
       await until(() => calls.length >= 1, 30_000);
       assert.equal(calls.length, 1, "the due slot starts exactly one turn");
       await new Promise((r) => setTimeout(r, 16_000));
@@ -100,6 +103,7 @@ test(
         createdBy: "U2",
         ownerScopeId: scopeId("personal", "U2"),
       });
+      a.scheduler.notifyChanged(cron.id);
       const fires = () => calls.filter((c) => c.idempotencyKey?.startsWith(`cron:${cron.id}:`)).length;
       await until(() => fires() >= 3, 45_000);
       assert.ok(fires() >= 3, "a recurring cron chains fire jobs across instances");
@@ -107,9 +111,41 @@ test(
       assert.equal(new Set(keys).size, keys.length, "no slot fires twice");
 
       await b.crons.update(cron.id, { schedule: { everyMs: 60_000 } });
+      b.scheduler.notifyChanged(cron.id);
       const at = fires();
       await new Promise((r) => setTimeout(r, 6_000));
       assert.equal(fires(), at, "a rescheduled cron's stale slot jobs do not fire");
+    } finally {
+      a.scheduler.stop();
+      b.scheduler.stop();
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  },
+);
+
+test(
+  "pg-boss queue: a cron persisted without its fire job is enqueued once by startup reconciliation",
+  { skip, timeout: 120_000 },
+  async () => {
+    const calls: TurnRequest[] = [];
+    const fires = createMemoryCronFireStore();
+    const a = instance(calls, 0, fires);
+    const b = instance(calls, 0, fires);
+    const cron = await a.crons.create({
+      schedule: { firstFireAt: Date.now() - 1000 },
+      action: "survive the crash",
+      owner: "U3",
+      createdBy: "U3",
+      ownerScopeId: scopeId("personal", "U3"),
+    });
+    a.scheduler.start(1000);
+    b.scheduler.start(1000);
+    try {
+      const fired = () => calls.filter((c) => c.idempotencyKey?.startsWith(`cron:${cron.id}:`)).length;
+      await until(() => fired() >= 1, 30_000);
+      await new Promise((r) => setTimeout(r, 3_000));
+      assert.equal(fired(), 1, "the orphaned slot fires exactly once across both instances");
+      assert.equal((await a.crons.listFires(cron.id)).total, 1);
     } finally {
       a.scheduler.stop();
       b.scheduler.stop();

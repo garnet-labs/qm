@@ -1,4 +1,5 @@
-import type { TurnOrigin, TurnRequest } from "../../types.ts";
+import { fromJSONSchema, z, ZodObject } from "zod";
+import type { ClientToolDeclaration, TurnOrigin, TurnRequest } from "../../types.ts";
 import { resolveTurnOrigin } from "../../core/turn-origin.ts";
 import { samePerson } from "../../directory/person.ts";
 import { sendJson } from "../http.ts";
@@ -14,6 +15,68 @@ function isTurnRequest(body: unknown): body is TurnRequest {
     body.actor.externalId !== "" &&
     isObj(body.conversation)
   );
+}
+
+const MAX_CLIENT_TOOL_SCHEMA_CHARS = 16_000;
+
+function convertsToObjectSchema(schema: Record<string, unknown>): boolean {
+  try {
+    return fromJSONSchema(schema as Parameters<typeof fromJSONSchema>[0]) instanceof ZodObject;
+  } catch {
+    return false;
+  }
+}
+
+const clientToolInputSchema = z
+  .looseObject({
+    type: z.literal("object"),
+    properties: z.record(z.string(), z.unknown()).optional(),
+    required: z.array(z.string()).optional(),
+  })
+  .refine((schema) => JSON.stringify(schema).length <= MAX_CLIENT_TOOL_SCHEMA_CHARS, {
+    message: `must be at most ${MAX_CLIENT_TOOL_SCHEMA_CHARS} characters of JSON`,
+    abort: true,
+  })
+  .refine(convertsToObjectSchema, { message: "must convert to a plain object schema" });
+
+const clientToolsSchema = z
+  .array(
+    z.object({
+      name: z.string().regex(/^ui__[a-z0-9_]{1,60}$/),
+      description: z
+        .string()
+        .max(2_000)
+        .refine((description) => description.trim() !== "", { message: "must not be blank" }),
+      inputSchema: clientToolInputSchema,
+      timeoutMs: z.int().min(1_000).max(60_000).optional(),
+    }),
+  )
+  .max(32)
+  .refine((tools) => new Set(tools.map((tool) => tool.name)).size === tools.length, {
+    message: "names must be unique",
+  });
+
+const clientResultSchema = z.object({
+  callId: z.string().min(1).max(256),
+  result: z.object({
+    content: z.string(),
+    structured: z.unknown().optional(),
+    isError: z.boolean().optional(),
+    images: z
+      .array(
+        z.object({
+          data: z.string().max(4_000_000).base64(),
+          mimeType: z.enum(["image/png", "image/jpeg"]),
+        }),
+      )
+      .max(4)
+      .optional(),
+  }),
+});
+
+function zodMessage(field: string, error: z.ZodError): string {
+  const issue = error.issues[0]!;
+  return `${[field, ...issue.path.map(String)].join(".")}: ${issue.message}`;
 }
 
 function publicOrigin(origin: TurnOrigin | undefined): TurnOrigin | undefined {
@@ -38,6 +101,8 @@ function publicTurnOrigin(body: TurnRequest): { origin?: TurnOrigin; error?: str
 
 function sanitizedTurnRequest(body: TurnRequest): { request: TurnRequest } | { error: string } {
   const {
+    slackSource: _slackSource,
+    externalSlack: _externalSlack,
     ownerKeychainUnion: _ownerKeychainUnion,
     spawned: _spawned,
     unattendedGrants: _unattendedGrants,
@@ -49,7 +114,16 @@ function sanitizedTurnRequest(body: TurnRequest): { request: TurnRequest } | { e
   const resolvedOrigin = publicTurnOrigin(safeBody);
   if (resolvedOrigin.error) return { error: resolvedOrigin.error };
   const origin = resolvedOrigin.origin;
-  return { request: { ...safeBody, ...(origin ? { origin } : {}) } };
+  const { clientTools: rawClientTools, ...rest } = safeBody;
+  if (rest.desktopClientId !== undefined && !z.uuid().safeParse(rest.desktopClientId).success)
+    return { error: "desktopClientId must be a UUID" };
+  let clientTools: ClientToolDeclaration[] | undefined;
+  if (rawClientTools !== undefined) {
+    const parsed = clientToolsSchema.safeParse(rawClientTools);
+    if (!parsed.success) return { error: zodMessage("clientTools", parsed.error) };
+    clientTools = parsed.data;
+  }
+  return { request: { ...rest, ...(origin ? { origin } : {}), ...(clientTools?.length ? { clientTools } : {}) } };
 }
 
 async function postTurn(ctx: ApiCtx): Promise<void> {
@@ -95,10 +169,23 @@ async function postRunSignal(ctx: ApiCtx): Promise<void> {
   const { res, app, body, actor } = ctx;
   const id = ctx.params.id!;
   const kind = isObj(body) && typeof body.kind === "string" ? body.kind : "";
-  if (kind !== "abort" && kind !== "steer") {
-    return sendJson(res, 400, { error: "bad_request", message: "kind must be abort or steer" });
+  if (kind !== "abort" && kind !== "steer" && kind !== "client_result") {
+    return sendJson(res, 400, { error: "bad_request", message: "kind must be abort, steer or client_result" });
+  }
+  if (kind === "client_result") {
+    const run = await ctx.deps.runs?.get(id);
+    if (run?.request.desktopClientId && (!isObj(body) || body.desktopClientId !== run.request.desktopClientId))
+      return sendJson(res, 403, { error: "wrong_desktop_client" });
+    const parsed = clientResultSchema.safeParse(body);
+    if (!parsed.success)
+      return sendJson(res, 400, { error: "bad_request", message: zodMessage("client_result", parsed.error) });
+    const outcome = await app.signalRun(id, { kind, ...parsed.data }, actor?.p);
+    if (outcome.accepted) return sendJson(res, 200, outcome);
+    if (outcome.reason === "not_found") return sendJson(res, 404, { error: "not_found" });
+    return sendJson(res, 409, outcome);
   }
   const text = isObj(body) && typeof body.text === "string" ? body.text : undefined;
+  const queuedRunId = isObj(body) && typeof body.queuedRunId === "string" ? body.queuedRunId : undefined;
   const ts = isObj(body) && typeof body.ts === "string" && body.ts ? body.ts : undefined;
   let request: TurnRequest | undefined;
   if (isObj(body) && body.request !== undefined) {
@@ -114,7 +201,13 @@ async function postRunSignal(ctx: ApiCtx): Promise<void> {
   }
   const outcome = await app.signalRun(
     id,
-    { kind, ...(text !== undefined ? { text } : {}), ...(ts ? { ts } : {}), ...(request ? { request } : {}) },
+    {
+      kind,
+      ...(text !== undefined ? { text } : {}),
+      ...(ts ? { ts } : {}),
+      ...(request ? { request } : {}),
+      ...(queuedRunId ? { queuedRunId } : {}),
+    },
     actor?.p,
   );
   if (outcome.accepted) return sendJson(res, 200, outcome);
@@ -144,6 +237,16 @@ async function getActiveRunForThread(ctx: ApiCtx): Promise<void> {
   if (!threadRef) return sendJson(res, 400, { error: "bad_request", message: "threadRef required" });
   const active = await app.activeRunForThread(threadRef, actor?.p);
   return sendJson(res, 200, { runId: active?.runId ?? null, ...(active?.queued ? { queued: active.queued } : {}) });
+}
+
+async function patchQueuedRun(ctx: ApiCtx): Promise<void> {
+  const { res, app, actor, body } = ctx;
+  if (!isObj(body) || typeof body.text !== "string" || typeof body.expectedText !== "string")
+    return sendJson(res, 400, { error: "bad_request", message: "text and expectedText required" });
+  const outcome = await app.editQueuedRun(ctx.params.id!, body.text, body.expectedText, actor?.p);
+  if (outcome.edited) return sendJson(res, 200, outcome);
+  if (outcome.reason === "not_found") return sendJson(res, 404, { error: "not_found" });
+  return sendJson(res, outcome.reason === "empty_text" ? 400 : 409, outcome);
 }
 
 async function postRunWithdraw(ctx: ApiCtx): Promise<void> {
@@ -184,36 +287,23 @@ async function ackDeliveryByKey(ctx: ApiCtx): Promise<void> {
   return sendJson(res, 200, { ok: true });
 }
 
-async function postTurnMetrics(ctx: ApiCtx): Promise<void> {
-  const { res, deps, body } = ctx;
-  const runId = ctx.params.runId!;
-  const num = (v: unknown): number | undefined =>
-    typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined;
-  const deliverMs = isObj(body) ? num(body.deliverMs) : undefined;
-  const slackInflightMs = isObj(body) ? num(body.slackInflightMs) : undefined;
-  if (deliverMs === undefined && slackInflightMs === undefined) {
-    return sendJson(res, 400, { error: "bad_request", message: "deliverMs or slackInflightMs required" });
-  }
-  await deps.metrics
-    ?.updateByRunId(runId, {
-      ...(deliverMs !== undefined ? { deliverMs } : {}),
-      ...(slackInflightMs !== undefined ? { slackInflightMs } : {}),
-    })
-    .catch(() => undefined);
-  return sendJson(res, 200, { ok: true });
-}
-
 export const turnRoutes: ReadonlyArray<Route<ApiCtx>> = [
-  { method: "POST", path: "/v1/turns", auth: "source", handle: postTurn },
-  { method: "POST", path: "/v1/turns/:runId/metrics", auth: "source", handle: postTurnMetrics },
-  { method: "GET", path: "/v1/approvals/pending", auth: "source", handle: getPendingApproval },
-  { method: "GET", path: "/v1/approvals/:id", auth: "source", handle: getApproval },
-  { method: "POST", path: "/v1/runs/:id/delivery-state", auth: "source", handle: postRunDeliveryState },
-  { method: "POST", path: "/v1/runs/:id/signal", auth: "source", handle: postRunSignal },
+  { method: "POST", path: "/v1/turns", actor: "system", auth: "source", handle: postTurn },
+  { method: "GET", path: "/v1/approvals/pending", actor: "person", auth: "source", handle: getPendingApproval },
+  { method: "GET", path: "/v1/approvals/:id", actor: "person", auth: "source", handle: getApproval },
+  {
+    method: "POST",
+    path: "/v1/runs/:id/delivery-state",
+    actor: "system",
+    auth: "source",
+    handle: postRunDeliveryState,
+  },
+  { method: "POST", path: "/v1/runs/:id/signal", auth: "source", maxBodyBytes: 6_000_000, handle: postRunSignal },
+  { method: "PATCH", path: "/v1/runs/:id/input", auth: "source", handle: patchQueuedRun },
   { method: "POST", path: "/v1/runs/:id/withdraw", auth: "source", handle: postRunWithdraw },
-  { method: "GET", path: "/v1/runs/:id", auth: "source", handle: getRun },
-  { method: "GET", path: "/v1/runs", auth: "source", handle: getActiveRunForThread },
+  { method: "GET", path: "/v1/runs/:id", actor: "person", auth: "source", handle: getRun },
+  { method: "GET", path: "/v1/runs", actor: "person", auth: "source", handle: getActiveRunForThread },
   { method: "GET", path: "/v1/deliveries", auth: "source", handle: listDeliveries },
-  { method: "POST", path: "/v1/deliveries/:id/ack", auth: "source", handle: ackDelivery },
-  { method: "POST", path: "/v1/deliveries/ack-by-key", auth: "source", handle: ackDeliveryByKey },
+  { method: "POST", path: "/v1/deliveries/:id/ack", actor: "system", auth: "source", handle: ackDelivery },
+  { method: "POST", path: "/v1/deliveries/ack-by-key", actor: "system", auth: "source", handle: ackDeliveryByKey },
 ];

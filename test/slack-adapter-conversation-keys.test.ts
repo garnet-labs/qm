@@ -10,7 +10,7 @@ function raw(over: Record<string, unknown> = {}): Record<string, unknown> {
     from: "Alex",
     snippet: "also what about the deck?",
     receivedAt: 1_000,
-    slack: { channelId: "G555", ts: "1000.100" },
+    slack: { channelId: "G555", ts: "1000.100", isDirectMessage: true },
     ...over,
   };
 }
@@ -19,18 +19,44 @@ test("DMs and group DMs dedupe on the channel alone — one card per conversatio
   const parsed = slackAdapter.parse(raw());
   assert.ok(!("error" in parsed));
   assert.equal(parsed.dedupeKey, "G555");
-  const dm = slackAdapter.parse(raw({ slack: { channelId: "D42", ts: "9.9" } }));
+  const dm = slackAdapter.parse(raw({ slack: { channelId: "D42", ts: "9.9", isDirectMessage: true } }));
   assert.ok(!("error" in dm));
   assert.equal(dm.dedupeKey, "D42");
 });
 
 test("channel asks dedupe per thread", () => {
-  const threaded = slackAdapter.parse(raw({ slack: { channelId: "C7", ts: "300.3", threadTs: "100.1" } }));
+  const threaded = slackAdapter.parse(
+    raw({ slack: { channelId: "C7", ts: "300.3", threadTs: "100.1", isDirectMessage: false } }),
+  );
   assert.ok(!("error" in threaded));
   assert.equal(threaded.dedupeKey, "C7:100.1");
-  const topLevel = slackAdapter.parse(raw({ slack: { channelId: "C7", ts: "300.3" } }));
+  const topLevel = slackAdapter.parse(raw({ slack: { channelId: "C7", ts: "300.3", isDirectMessage: false } }));
   assert.ok(!("error" in topLevel));
   assert.equal(topLevel.dedupeKey, "C7:300.3");
+});
+
+test("conversation kind comes from isDirectMessage, never the channel id prefix", () => {
+  for (const channelId of ["G555", "D555"]) {
+    const parsed = slackAdapter.parse(raw({ slack: { channelId, ts: "1000.100", isDirectMessage: false } }));
+    assert.ok(!("error" in parsed));
+    assert.equal(parsed.dedupeKey, `${channelId}:1000.100`);
+  }
+  assert.deepEqual(slackAdapter.parse(raw({ slack: { channelId: "D555", ts: "1000.100" } })), {
+    error: "slack items need slack.channelId, slack.ts and slack.isDirectMessage",
+  });
+});
+
+test("explicit DM threads remain separate from the unthreaded conversation", () => {
+  for (const channelId of ["D42", "G555", "C555"]) {
+    const parsed = slackAdapter.parse(
+      raw({ slack: { channelId, ts: "300.3", threadTs: "100.1", isDirectMessage: true } }),
+    );
+    assert.ok(!("error" in parsed));
+    assert.equal(parsed.dedupeKey, `${channelId}:100.1`);
+    const unthreaded = slackAdapter.parse(raw({ slack: { channelId, ts: "300.3", isDirectMessage: true } }));
+    assert.ok(!("error" in unthreaded));
+    assert.equal(unthreaded.dedupeKey, channelId);
+  }
 });
 
 test("probablyResolved and image URLs survive parsing", () => {
@@ -47,4 +73,19 @@ test("probablyResolved and image URLs survive parsing", () => {
   assert.deepEqual(payload.images, ["https://files.slack.com/a.png"]);
   const context = payload.context as Array<Record<string, unknown>>;
   assert.deepEqual(context[0]!.images, ["https://files.slack.com/b.png"]);
+});
+
+test("only DM items match the bare-channel ref; channel and unflagged items match their message ref", () => {
+  const stored = (isDirectMessage?: boolean) =>
+    ({
+      sourcePayload: {
+        slack: { channelId: "G555", ts: "1.1", ...(isDirectMessage === undefined ? {} : { isDirectMessage }) },
+      },
+    }) as never;
+  for (const isDirectMessage of [false, undefined]) {
+    assert.equal(slackAdapter.matchesEvent(stored(isDirectMessage), "G555"), false);
+    assert.equal(slackAdapter.matchesEvent(stored(isDirectMessage), "G555:1.1"), true);
+  }
+  assert.equal(slackAdapter.matchesEvent(stored(true), "G555"), true);
+  assert.equal(slackAdapter.matchesEvent(stored(true), "G555:1.1"), true);
 });

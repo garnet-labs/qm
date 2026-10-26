@@ -1,13 +1,15 @@
 import { existsSync, openSync, readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { writePidFile } from "./lease.ts";
 import { run } from "./proc.ts";
 import { ensureDockerDaemon } from "./postgres.ts";
 import { bestEffortValue, sleep } from "./util.ts";
+import type { DevSandboxBackend, DevSandboxChoice } from "./types.ts";
 
 export interface SandboxResolution {
-  backend: "local" | "sprites" | "smolmachines" | "e2b" | "porter" | "agent37";
+  backend: DevSandboxBackend;
   env: Record<string, string>;
   detail: string;
   publicApiUrl: string | null;
@@ -24,7 +26,7 @@ async function localImagePresent(image: string): Promise<boolean> {
 
 export async function resolveSandbox(opts: {
   worktree: string;
-  requested: "local" | "sprites" | "smolmachines" | "e2b" | "porter" | "agent37" | "auto";
+  requested: DevSandboxChoice;
   corePort: number;
   lock: string;
   baseEnv: Record<string, string>;
@@ -150,6 +152,82 @@ export async function resolveSandbox(opts: {
     return { backend: "agent37", env, detail: "Agent37 (api.agent37.com)", publicApiUrl: apiUrl, warnings };
   }
 
+  if (backend === "superserve") {
+    const apiKey = opts.baseEnv.SUPERSERVE_API_KEY?.trim();
+    const template = opts.baseEnv.SUPERSERVE_TEMPLATE?.trim();
+    if (!apiKey)
+      throw new Error(
+        "--sandbox superserve requires SUPERSERVE_API_KEY in the environment (create an API key in the Superserve console)",
+      );
+    if (!template)
+      throw new Error(
+        "--sandbox superserve requires SUPERSERVE_TEMPLATE in the environment (the ready qm-agent-<release> template that carries the agent toolchain)",
+      );
+    let apiUrl = opts.baseEnv.PUBLIC_API_URL || null;
+    if (!apiUrl) {
+      apiUrl = await startQuickTunnel(opts.corePort, opts.lock, opts.log);
+      if (!apiUrl)
+        warnings.push(
+          "cloudflared tunnel didn't come up -- agent self-API (crons/sends) won't be reachable from the sandbox",
+        );
+    }
+    const env: Record<string, string> = {
+      SANDBOX_BACKEND: "superserve",
+      SUPERSERVE_API_KEY: apiKey,
+      SUPERSERVE_TEMPLATE: template,
+      SUPERSERVE_NAME_PREFIX:
+        opts.baseEnv.SUPERSERVE_NAME_PREFIX ||
+        `qmdev-${createHash("sha1").update(opts.worktree).digest("hex").slice(0, 12)}`,
+    };
+    if (opts.baseEnv.SUPERSERVE_BASE_URL) env.SUPERSERVE_BASE_URL = opts.baseEnv.SUPERSERVE_BASE_URL;
+    if (opts.baseEnv.SUPERSERVE_EGRESS_ALLOW) env.SUPERSERVE_EGRESS_ALLOW = opts.baseEnv.SUPERSERVE_EGRESS_ALLOW;
+    if (opts.baseEnv.SUPERSERVE_EGRESS_DENY) env.SUPERSERVE_EGRESS_DENY = opts.baseEnv.SUPERSERVE_EGRESS_DENY;
+    if (!opts.baseEnv.SUPERSERVE_EGRESS_ALLOW && !opts.baseEnv.SUPERSERVE_EGRESS_DENY)
+      warnings.push(
+        "SUPERSERVE_EGRESS_ALLOW/SUPERSERVE_EGRESS_DENY unset -- superserve sandbox runs with open egress; set one to QA the enforced path",
+      );
+    if (apiUrl) env.PUBLIC_API_URL = apiUrl;
+    return { backend: "superserve", env, detail: `Superserve (template ${template})`, publicApiUrl: apiUrl, warnings };
+  }
+
+  if (backend === "do-managed-agents") {
+    const managedAgentsToken = opts.baseEnv.DO_AGENTS_API_TOKEN?.trim();
+    if (!managedAgentsToken)
+      throw new Error(
+        "--sandbox do-managed-agents requires DO_AGENTS_API_TOKEN in the environment (a DigitalOcean API token for a team with Managed Agents access)",
+      );
+    let managedAgentsApiUrl = opts.baseEnv.PUBLIC_API_URL || null;
+    if (!managedAgentsApiUrl) {
+      managedAgentsApiUrl = await startQuickTunnel(opts.corePort, opts.lock, opts.log);
+      if (!managedAgentsApiUrl)
+        warnings.push(
+          "cloudflared tunnel didn't come up -- agent self-API (crons/sends) won't be reachable from the sandbox",
+        );
+    }
+    const env: Record<string, string> = {
+      SANDBOX_BACKEND: "do-managed-agents",
+      DO_AGENTS_API_TOKEN: managedAgentsToken,
+      DO_AGENTS_NAME_PREFIX: opts.baseEnv.DO_AGENTS_NAME_PREFIX || "qmdev",
+    };
+    if (opts.baseEnv.DO_AGENTS_API_BASE_URL) env.DO_AGENTS_API_BASE_URL = opts.baseEnv.DO_AGENTS_API_BASE_URL;
+    if (opts.baseEnv.DO_AGENTS_TEMPLATE) env.DO_AGENTS_TEMPLATE = opts.baseEnv.DO_AGENTS_TEMPLATE;
+    if (opts.baseEnv.DO_AGENTS_SIZE_SLUG) env.DO_AGENTS_SIZE_SLUG = opts.baseEnv.DO_AGENTS_SIZE_SLUG;
+    if (opts.baseEnv.DO_AGENTS_EGRESS_PROXY_URL)
+      env.DO_AGENTS_EGRESS_PROXY_URL = opts.baseEnv.DO_AGENTS_EGRESS_PROXY_URL;
+    else
+      warnings.push(
+        "DO_AGENTS_EGRESS_PROXY_URL unset -- do-managed-agents sandbox runs with NO egress enforcement; set it to QA the forced-proxy path",
+      );
+    if (managedAgentsApiUrl) env.PUBLIC_API_URL = managedAgentsApiUrl;
+    return {
+      backend: "do-managed-agents",
+      env,
+      detail: `Managed Agents (${opts.baseEnv.DO_AGENTS_API_BASE_URL || "api.digitalocean.com"})`,
+      publicApiUrl: managedAgentsApiUrl,
+      warnings,
+    };
+  }
+
   if (backend === "porter") {
     const porterToken = opts.baseEnv.PORTER_DEPLOY_API_TOKEN;
     const projectId = opts.baseEnv.PORTER_DEPLOY_PROJECT_ID;
@@ -172,6 +250,7 @@ export async function resolveSandbox(opts: {
       PORTER_DEPLOY_PROJECT_ID: projectId,
       PORTER_DEPLOY_CLUSTER_ID: clusterId,
       PORTER_SANDBOX_NAME_PREFIX: opts.baseEnv.PORTER_SANDBOX_NAME_PREFIX || "qmdev",
+      PORTER_DEPLOY_VISIBILITY: opts.baseEnv.PORTER_DEPLOY_VISIBILITY || "private",
     };
     if (opts.baseEnv.PORTER_DEPLOY_URL) env.PORTER_DEPLOY_URL = opts.baseEnv.PORTER_DEPLOY_URL;
     if (opts.baseEnv.PORTER_SANDBOX_IMAGE) env.PORTER_SANDBOX_IMAGE = opts.baseEnv.PORTER_SANDBOX_IMAGE;

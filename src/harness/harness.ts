@@ -1,17 +1,24 @@
-import type { RuntimeControl, RuntimeHandoff } from "./runtime-types.ts";
-import type { AttachmentMeta, ConversationTurn, ScopeId, Session, SessionEntry } from "../types.ts";
-import type { HarnessId } from "../model/pi-models.ts";
+import type { ReplayImageLoader } from "./replay-images.ts";
+import type { ResumableToolCall } from "../core/turn-resume.ts";
+import type { DocumentInput } from "../core/document-inputs.ts";
+import type { RuntimeControl, HarnessHandoff } from "./runtime-types.ts";
 import type {
-  GapPhases,
-  GapWork,
-  LlmCallUsage,
-  LlmTransportMeta,
-  NewEntry,
-  NewTapeRecord,
-  TapeRecord,
-} from "../sessions/session-store.ts";
+  AttachmentMeta,
+  ClientToolDeclaration,
+  ConversationTurn,
+  ScopeId,
+  Session,
+  SessionEntry,
+  TurnRequest,
+  TurnRuntime,
+} from "../types.ts";
+import type { HarnessId } from "../model/pi-models.ts";
+import type { GapPhases, GapWork, LlmCallUsage, LlmTransportMeta, NewEntry } from "../sessions/session-store.ts";
 export type { GapWork } from "../sessions/session-store.ts";
 import type { OverheardEntryPayload } from "./replay.ts";
+import type { GoalRecord } from "./goal.ts";
+import type { GrindMeter } from "./grind.ts";
+import type { McpToolDescriptor } from "../mcp/mcp-tool-service.ts";
 import type { ProviderKeys } from "./pi-harness.ts";
 import type { ToolContext } from "../tools/primitives.ts";
 import type { SecurityScreenVerdict, ToolResultScreen, ToolResultScreenInput } from "../security/security-posture.ts";
@@ -29,9 +36,27 @@ interface HarnessImage {
   artifactId?: string;
 }
 
-export function envelopeWithoutMessages(payload: unknown): unknown {
+export function promptEnvelopeWithoutHistory(payload: unknown): unknown {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
-  return Object.fromEntries(Object.entries(payload as Record<string, unknown>).filter(([k]) => k !== "messages"));
+  const envelope: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(payload)) {
+    if (key === "contents") continue;
+    if (key === "messages" || key === "input") {
+      if (Array.isArray(value)) {
+        const instructions = value.filter(
+          (item: unknown) =>
+            item !== null &&
+            typeof item === "object" &&
+            "role" in item &&
+            (item.role === "system" || item.role === "developer"),
+        );
+        if (instructions.length) envelope[key] = instructions;
+      }
+    } else {
+      envelope[key] = key === "context" ? promptEnvelopeWithoutHistory(value) : value;
+    }
+  }
+  return envelope;
 }
 
 export interface HarnessLlmRequestRecord {
@@ -59,69 +84,82 @@ export interface HarnessSecurityScreenInput {
   recordLlmRequest?(rec: HarnessLlmRequestRecord, signal?: AbortSignal): void | Promise<void>;
 }
 
-/**
- * Derived per-turn Codex auth: access + id token only. The refresh token
- * stays in the keychain; the harness (and its jail) never see it.
- */
-export interface CodexTurnAuth {
-  accessToken: string;
-  idToken: string;
-  accountId?: string;
-  expiresAt?: number;
-}
-
 export interface HarnessTurnInput {
+  loadImage?: ReplayImageLoader;
   session: Session;
   runId?: string;
   cancel?: AbortSignal;
+  continueTurn?: boolean;
+  resumeUserSeq?: number;
+  shutdown?: AbortSignal;
   input: string;
   triggerTs?: string;
   entryTs?: string;
   environment?: string;
+  timezone?: string;
   priorTurns?: ConversationTurn[];
   overheard?: OverheardEntryPayload[];
   attachments?: AttachmentMeta[];
   images?: HarnessImage[];
+  prepareSteer?(
+    text: string,
+    request?: TurnRequest,
+  ): Promise<{
+    text: string;
+    attachments?: AttachmentMeta[];
+    images?: HarnessImage[];
+    documents?: DocumentInput[];
+    author?: string;
+  }>;
+  documents?: DocumentInput[];
   runtime?: Partial<RuntimeChoice>;
+  runtimePurpose?: import("../resolution/config-store.ts").RuntimePurpose;
   runtimeControl?: RuntimeControl;
   runtimeActorId?: string;
   readOnly?: boolean;
   surfaceTools?: boolean;
+  delegateWork?: boolean;
   surfaceName?: string;
+  clientTools?: readonly ClientToolDeclaration[];
   pollFire?: boolean;
   turnWallClockMs?: number;
   systemPrompt: string;
   history: SessionEntry[];
+  goal?: GoalRecord | null;
+  goalContinuation?: boolean;
+  goalMeter?: GrindMeter;
+  saveGoal?(goal: GoalRecord): Promise<void>;
+  goalInbox?: import("./goal.ts").GoalInbox;
   tools: ToolContext;
-  credentialExecServices?: readonly { service: string; binary: string }[];
+  mcpTools?: McpToolDescriptor[];
   commandCredentialHandles?: readonly string[];
-  toolApprovalGate?(tool: string): boolean;
+  toolApprovalGate?(tool: string, callKey?: string): boolean;
   emit(entry: NewEntry): Promise<SessionEntry>;
-  tape?(rec: NewTapeRecord): Promise<unknown>;
-  tapeRows?: TapeRecord[];
-  tapeMode?: "shadow" | "serve";
-  tapeFold?: unknown[];
+  resumeToolCall?: ResumableToolCall;
   scopeLabel: ScopeId;
   orgScopeId: ScopeId;
   providerKeys?: ProviderKeys;
   runtimePinned?: boolean;
+  onRuntime?(runtime: TurnRuntime): void;
   claudeOauthToken?: string;
-  codexAuth?: CodexTurnAuth;
   recordModelCall(rec: { model: string; inputTokens: number; entryCount: number }): void;
   recordLlmRequest?(rec: HarnessLlmRequestRecord, signal?: AbortSignal): void | Promise<void>;
   onProgress?(p: { toolCalls: number; tokens?: number }): void;
   onGapWork?(sink: (work: GapWork) => void): void;
   onDelta?(chunk: string): void;
-  onTextBlockStart?(): void;
+  onReasoningDelta?(step: string, index: number, chunk: string): void;
+  onTextBlockStart?(phase?: "commentary" | "final_answer"): void | Promise<void>;
+  onToolCallStart?(name: string): void;
   screenToolResult?(input: ToolResultScreenInput): Promise<ToolResultScreen>;
+  governGoal?: import("./goal.ts").GoalGovernor;
 }
 
 export interface HarnessTurnResult {
-  runtimeHandoff?: RuntimeHandoff;
+  runtimeHandoff?: HarnessHandoff;
   reply: string;
   silent?: boolean;
   stopped?: true;
-  stoppedTapeComplete?: true;
+  stoppedByUser?: true;
   pendingApprovals?: Array<{
     command: string;
     reason: string;
@@ -129,11 +167,11 @@ export interface HarnessTurnResult {
     matched?: string;
     purpose?: string;
     approvalKey?: string;
+    grantModes?: { session: boolean; always: boolean };
   }>;
   pausedOnApproval?: boolean;
   modelCalls?: number;
   cacheUsage?: { cacheRead: number; cacheWrite: number; uncachedInput: number };
-  compileMs?: number;
 }
 
 export interface HarnessDetectInput {
@@ -170,17 +208,17 @@ export interface HarnessModelUtilities {
   compactHistory?(input: HarnessCompactInput): Promise<string>;
   contextTokenBudget?(scopeLabel?: string, model?: string): number | undefined;
   oneShot?(systemPrompt: string, prompt: string): Promise<string | undefined>;
-  judge?(systemPrompt: string, prompt: string): Promise<string | undefined>;
+  judge?(systemPrompt: string, prompt: string, signal?: AbortSignal): Promise<string | undefined>;
   screenSecurity?(input: HarnessSecurityScreenInput): Promise<SecurityScreenVerdict | undefined>;
   pickAckEmoji?(text: string, candidates: readonly string[]): Promise<string | undefined>;
   generateTitle?(transcript: string): Promise<string | undefined>;
   summarizeApproval?(command: string, reason: string, purpose?: string): Promise<string | undefined>;
 }
 
-type HarnessControlTransport = "mock" | "in-process" | "sdk" | "http" | "json-rpc" | "api";
-type HarnessToolTransport = "mock" | "in-process" | "plugin" | "dynamic" | "in-process-mcp" | "mcp";
+type HarnessControlTransport = "in-process" | "sdk" | "http" | "json-rpc" | "api";
+type HarnessToolTransport = "in-process" | "plugin" | "dynamic" | "in-process-mcp" | "mcp";
 type HarnessCapability =
-  "abort" | "steer" | "images" | "thinking-level" | "fast-mode" | "provider-sessions" | "native-tape";
+  "abort" | "steer" | "images" | "thinking-level" | "fast-mode" | "provider-sessions" | "goal-enforcement";
 
 export interface HarnessAdapterProfile {
   id: string;

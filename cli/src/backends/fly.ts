@@ -70,26 +70,93 @@ const flyServiceCtx = (config: QmConfig, appPrefix: string, deployAppPrefix: str
 const FLY_RESPONSE = "QM_LAYER_RESPONSE=";
 const FLY_REMOTE_ERROR = "QM_LAYER_ERROR=";
 const FLY_REQUEST_TIMEOUT_MS = 120_000;
+const FLY_EXEC_TIMEOUT_SEC = 120;
+const FLY_EXEC_ARG_BYTES = 64 * 1024;
+const FLY_APP_NOT_FOUND = /could not find app|app not found/i;
+const FLY_MACHINES_API = "https://api.machines.dev/v1";
 
-function flyRequest(config: QmConfig, method: "GET" | "PUT", body: string): { status: number; body: string } {
-  const app = `${appPrefixOf(config)}-core`;
-  const script = `const fs=require("node:fs"),{createHmac}=require("node:crypto");const fail=error=>{const code=error&&(error.cause&&error.cause.code||error.code);console.log(${JSON.stringify(FLY_REMOTE_ERROR)}+JSON.stringify({message:error&&error.message?error.message:String(error),...(typeof code==="string"?{code}:{})}))};try{const method=${JSON.stringify(method)},path="/v1/deployment-layer",body=fs.readFileSync(0,"utf8"),timestamp=Math.floor(Date.now()/1000),canonical=method+"\\n"+path+"\\n"+body,secret=process.env.CORE_SIGNING_SECRET;if(!secret)throw new Error("CORE_SIGNING_SECRET is not set on core");const signature=createHmac("sha256",secret).update("v0:"+timestamp+":"+canonical).digest("hex");fetch("http://127.0.0.1:"+(process.env.PORT||8080)+path,{method,headers:{"content-type":"application/json","x-timestamp":String(timestamp),"x-signature":"v0="+signature},...(method==="PUT"?{body}: {})}).then(async response=>console.log(${JSON.stringify(FLY_RESPONSE)}+JSON.stringify({status:response.status,body:await response.text()}))).catch(fail)}catch(error){fail(error)}`;
-  const encoded = Buffer.from(script).toString("base64");
-  const command = `node -e "eval(Buffer.from('${encoded}','base64').toString())"`;
-  let output: string;
+function classifyFlyReachability(app: string, detail: string): never {
+  if (FLY_APP_NOT_FOUND.test(detail)) throw new CliError(`Fly app ${app} not found: ${detail}`);
+  throw new CoreUnreachableError(`could not reach the Fly core: ${detail}`);
+}
+
+function flyCoreMachineId(app: string): string {
+  let raw: string;
   try {
-    output = execFileSync(flyBin(), ["ssh", "console", "-a", app, "-C", command], {
-      encoding: "utf8",
-      input: body,
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: FLY_REQUEST_TIMEOUT_MS,
-    });
+    raw = fly(["status", "-a", app, "--json"]);
   } catch (error) {
-    const detail = error as { stdout?: string; stderr?: string; message?: string };
-    const text = `${detail.stderr ?? ""}${detail.stdout ?? ""}`.trim() || detail.message || "fly ssh failed";
-    if (/could not find app|app not found/i.test(text)) throw new CliError(`Fly app ${app} not found: ${text}`);
-    throw new CoreUnreachableError(`could not reach the Fly core: ${text}`);
+    classifyFlyReachability(app, errMessage(error));
   }
+  if (FLY_APP_NOT_FOUND.test(raw)) classifyFlyReachability(app, raw);
+  let parsed: { Machines?: Array<{ id?: string; ID?: string; state?: string }> };
+  try {
+    parsed = JSON.parse(raw) as typeof parsed;
+  } catch {
+    throw new CoreUnreachableError(`could not reach the Fly core: fly status returned invalid JSON`);
+  }
+  const machine = parsed.Machines?.find((entry) => entry.state === "started") ?? parsed.Machines?.[0];
+  const machineId = machine?.id ?? machine?.ID;
+  if (!machineId) throw new CoreUnreachableError(`could not reach the Fly core: no machine on ${app}`);
+  return machineId;
+}
+
+function flyApiAuthorization(): string {
+  try {
+    const token = process.env.FLY_API_TOKEN?.trim() || fly(["auth", "token"]).trim();
+    if (!token) throw new Error("Fly API token is missing");
+    return token.startsWith("FlyV1") || token.startsWith("Bearer ") ? token : `Bearer ${token}`;
+  } catch (error) {
+    throw new CoreUnreachableError(`could not reach the Fly core: ${errMessage(error)}`);
+  }
+}
+
+function flyExecOutput(payload: unknown): string {
+  const { stdout, stderr } = (payload ?? {}) as { stdout?: unknown; stderr?: unknown };
+  return [stdout, stderr].filter((value): value is string => typeof value === "string" && value !== "").join("\n");
+}
+
+async function flyRequest(
+  config: QmConfig,
+  method: "GET" | "PUT",
+  body: string,
+): Promise<{ status: number; body: string }> {
+  const app = `${appPrefixOf(config)}-core`;
+  const script = `const{createHmac}=require("node:crypto");const fail=error=>{const code=error&&(error.cause&&error.cause.code||error.code);console.log(${JSON.stringify(FLY_REMOTE_ERROR)}+JSON.stringify({message:error&&error.message?error.message:String(error),...(typeof code==="string"?{code}:{})}))};try{const method=${JSON.stringify(method)},path="/v1/deployment-layer",body=Buffer.from(process.argv.slice(1).join(""),"base64").toString("utf8"),timestamp=Math.floor(Date.now()/1000),canonical=method+"\\n"+path+"\\n"+body,secret=process.env.CORE_SIGNING_SECRET;if(!secret)throw new Error("CORE_SIGNING_SECRET is not set on core");const signature=createHmac("sha256",secret).update("v0:"+timestamp+":"+canonical).digest("hex");fetch("http://127.0.0.1:"+(process.env.PORT||8080)+path,{method,headers:{"content-type":"application/json","x-timestamp":String(timestamp),"x-signature":"v0="+signature},...(method==="PUT"?{body}: {})}).then(async response=>console.log(${JSON.stringify(FLY_RESPONSE)}+JSON.stringify({status:response.status,body:await response.text()}))).catch(fail)}catch(error){fail(error)}`;
+  const encodedBody = Buffer.from(body).toString("base64");
+  const bodyArgs = Array.from({ length: Math.ceil(encodedBody.length / FLY_EXEC_ARG_BYTES) }, (_, index) =>
+    encodedBody.slice(index * FLY_EXEC_ARG_BYTES, (index + 1) * FLY_EXEC_ARG_BYTES),
+  );
+  const machineId = flyCoreMachineId(app);
+  let response: Response;
+  let text: string;
+  try {
+    response = await fetch(
+      `${FLY_MACHINES_API}/apps/${encodeURIComponent(app)}/machines/${encodeURIComponent(machineId)}/exec`,
+      {
+        method: "POST",
+        headers: {
+          authorization: flyApiAuthorization(),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          command: ["node", "-e", script, ...bodyArgs],
+          timeout: FLY_EXEC_TIMEOUT_SEC,
+        }),
+        signal: AbortSignal.timeout(FLY_REQUEST_TIMEOUT_MS),
+      },
+    );
+    text = await response.text();
+  } catch (error) {
+    throw new CoreUnreachableError(`could not reach the Fly core: ${errMessage(error)}`);
+  }
+  if (!response.ok) classifyFlyReachability(app, text || `HTTP ${response.status}`);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new CoreUnreachableError(`could not reach the Fly core: unparseable machine exec response`);
+  }
+  const output = flyExecOutput(parsed);
   const remoteError = output.split("\n").find((value) => value.startsWith(FLY_REMOTE_ERROR));
   if (remoteError) {
     const detail = JSON.parse(remoteError.slice(FLY_REMOTE_ERROR.length)) as { message?: string; code?: string };
@@ -104,9 +171,8 @@ function flyRequest(config: QmConfig, method: "GET" | "PUT", body: string): { st
   return JSON.parse(line.slice(FLY_RESPONSE.length)) as { status: number; body: string };
 }
 
-/** Deployment-layer transport for Fly: a signed request executed on the core VM over fly ssh. */
 export const flyDeploymentLayerTransport: DeploymentLayerTransport = (opts) =>
-  Promise.resolve(flyRequest(opts.config, opts.method, opts.body));
+  flyRequest(opts.config, opts.method, opts.body);
 
 import { doctorCommon, localDoctorSecrets, requireFlyAuth } from "./doctor.ts";
 
@@ -124,7 +190,6 @@ export interface FlyUpOpts {
 
 interface FlyCtx {
   config: QmConfig;
-  templateRoot: string;
   generatedRoot: string;
   commandCwd: string;
   sourceRoot?: string;
@@ -269,8 +334,7 @@ const flyOwnershipMarker = (flyOrg: string, orgId: string, appPrefix: string): s
 
 function deriveToml(ctx: FlyCtx, service: ServiceName): string {
   const spec = serviceDef(service).fly!;
-  const nested = join(ctx.templateRoot, service, "fly.toml");
-  const base = readFileSync(existsSync(nested) ? nested : join(ctx.templateRoot, `${service}.toml`), "utf8");
+  const base = readFileSync(join(flyTemplateRoot(), `${service}.toml`), "utf8");
   const sandboxEnv = service === "core" ? sandboxCoreEnv(ctx.config).env : {};
   const virtualEnv = service === "core" ? virtualServiceEnv(ctx.config.services, ctx.config.env) : {};
   const modelEnv: Record<string, string> =
@@ -363,7 +427,6 @@ export function derivedTomlFor(config: QmConfig, service: ServiceName, repoRoot:
   const deployAppPrefix = config.deployAppPrefix ?? `${appPrefix}-d`;
   const ctx: FlyCtx = {
     config,
-    templateRoot: join(repoRoot, "deploy"),
     generatedRoot: join(repoRoot, "deploy", "stacks", ".generated"),
     commandCwd: repoRoot,
     sourceRoot: repoRoot,
@@ -386,8 +449,6 @@ function writeDerived(ctx: FlyCtx, service: ServiceName): string {
   writeFileSync(path, deriveToml(ctx, service));
   return path;
 }
-
-const FLY_APP_NOT_FOUND = /app not found|Could not find App/i;
 
 function secretNames(app: string): Set<string> | undefined {
   const out = fly(["secrets", "list", "-a", app], { allow: FLY_APP_NOT_FOUND });
@@ -468,7 +529,7 @@ export function flyS3ProbeCommand(): string {
 }
 
 function flyS3RoundTrip(app: string, machineId: string): void {
-  fly(["ssh", "console", "-a", app, "--machine", machineId, "--command", flyS3ProbeCommand(), "--quiet"]);
+  fly(["machine", "exec", "-a", app, machineId, flyS3ProbeCommand(), "--timeout", String(FLY_EXEC_TIMEOUT_SEC)]);
 }
 
 export function flyLiveSessionCommand(): string {
@@ -476,7 +537,7 @@ export function flyLiveSessionCommand(): string {
 }
 
 function flyLiveSession(app: string, machineId: string): void {
-  fly(["ssh", "console", "-a", app, "--machine", machineId, "--command", flyLiveSessionCommand(), "--quiet"]);
+  fly(["machine", "exec", "-a", app, machineId, flyLiveSessionCommand(), "--timeout", String(FLY_EXEC_TIMEOUT_SEC)]);
 }
 
 function flyOrgApps(flyOrg: string): Set<string> {
@@ -608,6 +669,24 @@ function ensureFlycast(app: string): void {
   note(`flycast: allocated private v6 for ${app}`);
 }
 
+function ensurePublicIngress(app: string): void {
+  let ips: Array<{ Type?: string }>;
+  try {
+    ips = JSON.parse(fly(["ips", "list", "-a", app, "--json"]) || "[]");
+  } catch {
+    throw new CliError(`fly ips list returned invalid JSON for ${app}`);
+  }
+  const types = new Set(ips.map((ip) => ip.Type));
+  if (!types.has("v6")) {
+    fly(["ips", "allocate-v6", "-a", app]);
+    note(`public ingress: allocated v6 for ${app}`);
+  }
+  if (!types.has("v4") && !types.has("shared_v4")) {
+    fly(["ips", "allocate-v4", "--shared", "-a", app]);
+    note(`public ingress: allocated shared v4 for ${app}`);
+  }
+}
+
 interface FlyImageDetail {
   digest: string;
   immutableReference: string;
@@ -726,7 +805,6 @@ function sourceRootFor(configDir: string, explicit?: string): string | undefined
     const root = resolve(explicit);
     return existsSync(join(root, "package.json")) &&
       existsSync(join(root, "src", "index.ts")) &&
-      existsSync(join(root, "deploy", "core", "fly.toml")) &&
       existsSync(join(root, "deploy", "core", "Dockerfile"))
       ? root
       : undefined;
@@ -744,12 +822,11 @@ function sourceRootFor(configDir: string, explicit?: string): string | undefined
     (root) =>
       existsSync(join(root, "package.json")) &&
       existsSync(join(root, "src", "index.ts")) &&
-      existsSync(join(root, "deploy", "core", "fly.toml")) &&
       existsSync(join(root, "deploy", "core", "Dockerfile")),
   );
 }
 
-function packagedFlyTemplateRoot(): string {
+function flyTemplateRoot(): string {
   const source = fileURLToPath(new URL("../../templates/fly", import.meta.url));
   if (existsSync(source)) return source;
   return fileURLToPath(new URL("../../../templates/fly", import.meta.url));
@@ -767,7 +844,6 @@ function buildCtx(config: QmConfig, configDir: string, opts: Pick<FlyUpOpts, "bu
   const deployAppPrefix = config.deployAppPrefix ?? `${appPrefix}-d`;
   return {
     config,
-    templateRoot: sourceRoot ? join(sourceRoot, "deploy") : packagedFlyTemplateRoot(),
     generatedRoot: join(configDir, ".generated", "fly"),
     commandCwd: configDir,
     ...(sourceRoot ? { sourceRoot } : {}),
@@ -790,6 +866,7 @@ async function deployService(
   note(`\n=== deploying ${app} ===`);
   if (service === "core") timing.time(service, "Postgres ensure", () => ensurePostgres(ctx));
   if (spec.flycast) timing.time(service, "Flycast ensure", () => ensureFlycast(app));
+  if (spec.publicIngress) timing.time(service, "public ingress ensure", () => ensurePublicIngress(app));
   const cfgPath = serviceCfgPath(ctx, service);
   const args = ["deploy", "--yes", "-c", cfgPath, ...spec.deployFlags];
   if (imageSource?.kind === "tagged") {
@@ -1011,7 +1088,7 @@ function runFlyDeploy(args: string[], cwd: string): Promise<void> {
 }
 
 function unsetDisabledSecurityScreenToken(config: QmConfig, appPrefix: string): void {
-  if (config.securityScreen) return;
+  if (config.securityScreen?.classifier === "proxy") return;
   const app = `${appPrefix}-core`;
   if (!secretNames(app)?.has("SECURITY_SCREEN_PROXY_TOKEN")) return;
   fly(["secrets", "unset", "--stage", "-a", app, "SECURITY_SCREEN_PROXY_TOKEN"]);
@@ -1464,8 +1541,13 @@ export function verifyLocalFlyTokens(config: QmConfig, secrets: ReadonlyMap<stri
     }
     step(`${name}: live authorization ok`);
   };
-  if (config.flyOrg && config.env.core?.DEPLOY_PROVIDER === "fly") {
-    verify("FLY_DEPLOY_API_TOKEN", ["apps", "list", "-o", config.flyOrg, "--json"], `organization ${config.flyOrg}`);
+  if (config.env.core?.DEPLOY_PROVIDER === "fly") {
+    const sharedApp = config.env.core.FLY_DEPLOY_SHARED_APP_NAME?.trim();
+    if (sharedApp) {
+      verify("FLY_DEPLOY_API_TOKEN", ["machines", "list", "-a", sharedApp, "--json"], `application ${sharedApp}`);
+    } else if (config.flyOrg) {
+      verify("FLY_DEPLOY_API_TOKEN", ["apps", "list", "-o", config.flyOrg, "--json"], `organization ${config.flyOrg}`);
+    }
   }
 }
 

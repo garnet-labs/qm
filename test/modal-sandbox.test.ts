@@ -1,3 +1,4 @@
+import { createMemoryAdvisoryLock } from "../src/persistence/advisory-lock.ts";
 import { pollProcess } from "../src/sandbox/process-poll.ts";
 import { test, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
@@ -12,10 +13,13 @@ import { supportsBlobStaging, supportsProcessSessions } from "../src/sandbox/san
 import { createMemoryMap, type DurableMap } from "../src/persistence/durable-map.ts";
 import { createMemoryBlobTransferStore } from "../src/persistence/blob-transfer.ts";
 import { scopeId } from "../src/types.ts";
+import { orgId } from "../src/config.ts";
 import { mintCapabilityToken, EGRESS_PROXY_AUD } from "../src/auth/capability-token.ts";
 import { installFakeModal, type FakeModal } from "./support/fake-modal.ts";
-import { ModalSandboxGoneError, type ModalClient } from "../src/sandbox/modal-client.ts";
+import { ModalSandboxGoneError, type ModalClient, type ModalSession } from "../src/sandbox/modal-client.ts";
 import type { Sandbox } from "../src/sandbox/sandbox.ts";
+import { singleProcessDeps } from "./support/single-process.ts";
+import { createMemorySnapshotStore } from "../src/sandbox/home-snapshot.ts";
 
 let fake: FakeModal;
 let sandbox: Sandbox;
@@ -25,11 +29,36 @@ const scopeName = (): string => sandboxScopeName("qmt", scope);
 
 function make(extra: Record<string, unknown> = {}): Sandbox {
   return createModalSandbox(createLocalWorkspaceStore(mkdtempSync(join(tmpdir(), "modal-ws-"))), {
+    snapshots: createMemorySnapshotStore(),
+    store: createMemoryMap(),
+    ...singleProcessDeps(),
     client: fake.client,
     namePrefix: "qmt",
-    nativeSnapshotsEnabled: true,
     ...extra,
   });
+}
+
+type Checkpoint = Awaited<ReturnType<ModalSession["snapshotHome"]>>;
+
+function checkpointing(around: (snapshot: () => Promise<Checkpoint>) => Promise<Checkpoint>): ModalClient {
+  const wrap = (session: ModalSession): ModalSession => ({
+    ...session,
+    snapshotHome: () => around(() => session.snapshotHome()),
+  });
+  return {
+    ...fake.client,
+    create: async (options) => wrap(await fake.client.create(options)),
+    fromId: async (id) => wrap(await fake.client.fromId(id)),
+  };
+}
+
+async function seedPortableHome(s: Sandbox, files: Record<string, string | Uint8Array>): Promise<void> {
+  const h = await s.provision(layers);
+  for (const [path, data] of Object.entries(files))
+    if (typeof data === "string") await s.writeFile(h, path, data);
+    else await s.writeFileBytes(h, path, data);
+  await s.persistHomeSnapshot!(scope);
+  fake.terminate(h.id);
 }
 
 beforeEach(() => {
@@ -111,8 +140,9 @@ test("force-through proxy env is set when a proxy url and token are present", as
     "secret",
   );
   const h = await s.provision(layers, { egressToken: token });
-  const r = await s.run(h, "echo PROXY=$HTTPS_PROXY");
+  const r = await s.run(h, "echo PROXY=$HTTPS_PROXY; echo $GIT_HTTP_PROXY_AUTHMETHOD");
   assert.match(r.stdout, /PROXY=https?:\/\/[^ ]*proxy\.example\.com/);
+  assert.match(r.stdout, /^basic$/m);
 });
 
 test("large command output survives intact", async () => {
@@ -153,6 +183,9 @@ test("a create race with another core instance adopts the winner instead of erro
   };
   await make().provision(layers);
   const s = createModalSandbox(createLocalWorkspaceStore(mkdtempSync(join(tmpdir(), "modal-ws-"))), {
+    snapshots: createMemorySnapshotStore(),
+    store: createMemoryMap(),
+    ...singleProcessDeps(),
     client: racing,
     namePrefix: "qmt",
   });
@@ -185,13 +218,13 @@ test("scratch sandboxes are unnamed, ephemeral, and terminated at release", asyn
   assert.equal(fake.runningCount(), 0);
 });
 
-test("teardown snapshots the home and leaves the sandbox running", async () => {
-  const counting = instrumentedSnapshotStore();
-  const s = make({ snapshots: counting.store });
+test("teardown checkpoints the home and leaves the sandbox running", async () => {
+  const store = createMemoryMap<StoredModalSandbox>();
+  const s = make({ store });
   const a = await s.provision(layers);
   await s.teardown(a);
   assert.equal(fake.current(a.id)?.state, "running", "no pause exists on modal — the warm path is staying up");
-  assert.equal(counting.puts(), 1);
+  assert.ok((await store.get(scope))?.nativeSnapshotId);
   const b = await s.provision(layers);
   assert.equal(b.coldStart, false);
   assert.equal(fake.createdCount(scopeName()), 1);
@@ -228,9 +261,9 @@ test("a sandbox that dies mid-turn is revived transparently for the next command
   assert.equal(fake.createdCount(scopeName()), 2);
 });
 
-test("a sandbox older than rotateAfterMs is rotated at provision with files intact", async () => {
+test("a sandbox older than rotateAfterMs is rotated at provision with files intact, without a portable store", async () => {
   const store = createMemoryMap<StoredModalSandbox>();
-  const s = make({ store });
+  const s = make({ store, snapshots: undefined });
   const a = await s.provision(layers);
   await s.writeFile(a, "keep.txt", "survives rotation\n");
   await s.teardown(a);
@@ -253,36 +286,22 @@ test("rotation snapshots changes written since the last teardown snapshot", asyn
   assert.equal(await s.readFile(b, "late.txt"), "written after teardown\n");
 });
 
-test("teardown snapshots are throttled by snapshotIntervalMs", async () => {
-  const counting = instrumentedSnapshotStore();
-  const s = make({ snapshots: counting.store, snapshotIntervalMs: 60 * 60_000 });
+test("teardown checkpoints are throttled by nativeSnapshotIntervalMs", async () => {
+  const store = createMemoryMap<StoredModalSandbox>();
+  const s = make({ store, nativeSnapshotIntervalMs: 60 * 60_000 });
   const a = await s.provision(layers);
   await s.teardown(a);
+  const first = (await store.get(scope))?.nativeSnapshotId;
   const b = await s.provision(layers);
   await s.teardown(b);
-  assert.equal(counting.puts(), 1, "second teardown inside the interval skips the snapshot");
-});
-
-test("reapDeepIdle snapshots, terminates, and forgets idle scopes", async () => {
-  const store = createMemoryMap<StoredModalSandbox>();
-  const s = make({ store });
-  const h = await s.provision(layers);
-  await s.writeFile(h, "keep.txt", "parked\n");
-  await s.teardown(h);
-  await store.merge(scope, { lastActivityMs: Date.now() - 7 * 3600_000 });
-  const r = await s.reapDeepIdle!(72 * 3600_000);
   assert.equal(
-    r.reaped,
-    1,
-    "the driver clamps the global cutoff to its own reapIdleMs — 3 idle days never accrue on a per-second-billed box",
+    (await store.get(scope))?.nativeSnapshotId,
+    first,
+    "second teardown inside the interval skips the checkpoint",
   );
-  assert.equal(fake.current(scopeName()), null);
-  assert.equal(await store.get(scope), null);
-  const b = await s.provision(layers);
-  assert.equal(await s.readFile(b, "keep.txt"), "parked\n", "the reap snapshot preserved the home");
 });
 
-test("reapDeepIdle leaves recently active scopes alone and cleans rows for already-gone boxes", async () => {
+test("reapDeepIdle leaves recently active scopes alone and keeps the checkpoint of an already-gone box", async () => {
   const store = createMemoryMap<StoredModalSandbox>();
   const s = make({ store });
   const h = await s.provision(layers);
@@ -294,7 +313,7 @@ test("reapDeepIdle leaves recently active scopes alone and cleans rows for alrea
   await store.merge(scope, { lastActivityMs: Date.now() - 7 * 3600_000 });
   const gone = await s.reapDeepIdle!(72 * 3600_000);
   assert.equal(gone.reaped, 0);
-  assert.equal(await store.get(scope), null, "a row whose box is already gone is cleaned up");
+  assert.ok((await store.get(scope))?.nativeSnapshotId, "a gone box keeps its checkpoint reference");
 });
 
 test("computerStatus probes the guest", async () => {
@@ -315,11 +334,12 @@ test("computerStatus reports a gone sandbox as unprovisioned, not wedged", async
   assert.equal(status.provisioned, false, "a sandbox the platform says is gone needs a re-provision, not a restart");
 });
 
-test("profile advertises snapshot persistence and process sessions", () => {
+test("profile advertises provider-managed persistence and process sessions", () => {
   assert.equal(sandbox.profile.backend, "modal");
-  assert.equal(sandbox.profile.writablePersistence, "snapshot_to_workspace");
+  assert.equal(sandbox.profile.writablePersistence, "provider_managed");
   assert.equal(sandbox.profile.processSessions, true);
   assert.equal(sandbox.profile.egressEnforcement, "none");
+  assert.equal(make({ egressProxyUrl: "https://proxy.example.com" }).profile.egressEnforcement, "domain");
 });
 
 test("file reads and writes revive a sandbox that died mid-turn", async () => {
@@ -352,13 +372,24 @@ test("a scratch sandbox that dies mid-turn is revived as scratch, not as a durab
   assert.equal(fake.totalCreated(), 2);
 });
 
-test("a failing snapshot store fails the fallback provision instead of cold-starting empty", async () => {
+test("a scope with only an older portable home is restored from it and then natively checkpointed", async () => {
+  const store = createMemoryMap<StoredModalSandbox>();
+  const portable = instrumentedSnapshotStore();
+  const s = make({ store, snapshots: portable.store });
+  await seedPortableHome(s, { "legacy.txt": "from the portable era\n" });
+  assert.equal((await store.get(scope))?.nativeSnapshotId, undefined);
+  const b = await s.provision(layers);
+  assert.equal(b.coldStart, false);
+  assert.equal(await s.readFile(b, "legacy.txt"), "from the portable era\n");
+  await s.teardown(b);
+  assert.ok((await store.get(scope))?.nativeSnapshotId);
+  assert.equal(portable.puts(), 1, "routine checkpoints never write the portable store");
+});
+
+test("a failing snapshot store fails the legacy portable restore instead of cold-starting empty", async () => {
   const flaky = instrumentedSnapshotStore();
   const s = make({ snapshots: flaky.store });
-  const a = await s.provision(layers);
-  await s.writeFile(a, "precious.txt", "irreplaceable\n");
-  await s.teardown(a);
-  fake.terminate(a.id);
+  await seedPortableHome(s, { "precious.txt": "irreplaceable\n" });
   flaky.failReads(true);
   await assert.rejects(() => s.provision(layers), /hydration failed/);
   flaky.failReads(false);
@@ -412,52 +443,40 @@ test("stageIn pulls a blob into the guest atomically (temp then mv)", async () =
   assert.match(script, /curl -fsS/, "-f so an HTTP error fails loudly instead of writing the error body");
 });
 
-test("adoptHomeSnapshot promotes a staged blob to the snapshot store and resets the scope's sandbox", async () => {
-  const { Readable } = await import("node:stream");
-  const { makeTar } = await import("../src/sandbox/tar.ts");
-  const blobs = createMemoryBlobTransferStore();
-  const s = make({ blobTransfer: blobs, capabilitySecret: "blob-secret", apiBaseUrl: "http://core.internal:8080" });
-
-  const a = await s.provision(layers);
-  await s.writeFile(a, "old.txt", "stale e2b-era sandbox\n");
-  await s.teardown(a, { keepWarm: true });
-
-  const tar = await makeTar([{ path: "migrated.txt", data: Buffer.from("came from e2b\n") }]);
-  const { blobId } = await blobs.put(Readable.from([Buffer.from(tar)]));
-  assert.ok(s.adoptHomeSnapshot);
-  await s.adoptHomeSnapshot!(scope, blobId);
-
-  const b = await s.provision(layers);
-  assert.equal(await s.readFile(b, "../migrated.txt"), "came from e2b\n", "hydrates from the adopted snapshot");
-  assert.equal(await s.readFile(b, "../old.txt"), null, "the pre-adopt sandbox was discarded, not reused");
-});
-
 test("persistHomeSnapshot writes the live home to the snapshot store on demand", async () => {
   const store = createMemoryMap<StoredModalSandbox>();
   const counting = instrumentedSnapshotStore();
-  const s = make({ store, snapshots: counting.store, snapshotIntervalMs: 60 * 60_000 });
+  const s = make({ store, snapshots: counting.store });
   const h = await s.provision(layers);
   await s.writeFile(h, "keep.txt", "persist me\n");
   assert.ok(s.persistHomeSnapshot);
   await s.persistHomeSnapshot!(scope);
-  assert.equal(counting.puts(), 1, "persists immediately, ignoring the teardown throttle");
+  assert.equal(counting.puts(), 1);
 });
 
-test("rotation aborts and keeps the old box when the pre-rotation snapshot fails", async () => {
-  const flaky = instrumentedSnapshotStore();
+test("rotation aborts and keeps the old box when the pre-rotation checkpoint fails", async () => {
+  let fail = false;
   const store = createMemoryMap<StoredModalSandbox>();
-  const s = make({ store, snapshots: flaky.store, rotationHoldMs: 0 });
+  const client = checkpointing(async (snapshot) => {
+    if (fail) throw new Error("provider checkpoint unavailable");
+    return snapshot();
+  });
+  const s = make({ store, client, rotationHoldMs: 0 });
   const a = await s.provision(layers);
   await s.writeFile(a, "keep.txt", "must not vanish\n");
   await s.teardown(a);
   await store.merge(scope, { createdAtMs: Date.now() - 21 * 3600_000 });
-  flaky.failWrites(true);
+  fail = true;
   const b = await s.provision(layers);
-  assert.equal(fake.createdCount(scopeName()), 1, "a failed snapshot must abort the rotation, never terminate the box");
+  assert.equal(
+    fake.createdCount(scopeName()),
+    1,
+    "a failed checkpoint must abort the rotation, never terminate the box",
+  );
   assert.equal((await s.run(b, "cat keep.txt")).stdout, "must not vanish\n");
-  flaky.failWrites(false);
+  fail = false;
   const c = await s.provision(layers);
-  assert.equal(fake.createdCount(scopeName()), 2, "rotation resumes once the snapshot store recovers");
+  assert.equal(fake.createdCount(scopeName()), 2, "rotation resumes once checkpoints recover");
   assert.equal(await s.readFile(c, "keep.txt"), "must not vanish\n");
 });
 
@@ -504,40 +523,41 @@ test("rotation aborts and keeps the old box when terminating it fails", async ()
   assert.equal(await s.readFile(c, "keep.txt"), "still here\n");
 });
 
-test("homes larger than the file chunk size snapshot and hydrate through chunked transfers", async () => {
+test("portable homes larger than the file chunk size export and restore through chunked transfers", async () => {
   const s = make({ fileChunkBytes: 8 * 1024 });
-  const h = await s.provision(layers);
   const big = Buffer.alloc(50 * 1024 + 7);
   for (let i = 0; i < big.length; i++) big[i] = (i * 31) % 256;
-  await s.writeFileBytes(h, "../big.bin", big);
-  await s.teardown(h);
-  fake.terminate(h.id);
+  await seedPortableHome(s, { "big.bin": big });
   const b = await s.provision(layers);
-  const back = await s.readFileBytes(b, "../big.bin");
+  const back = await s.readFileBytes(b, "big.bin");
   assert.ok(back && Buffer.from(back).equals(big), "chunked snapshot + hydrate round-trips the exact bytes");
 });
 
-test("teardown of a box the turn never used skips the snapshot only while the stored home is clean", async () => {
-  const counting = instrumentedSnapshotStore();
+test("teardown of a box the turn never used skips the checkpoint only while the stored home is clean", async () => {
+  let checkpoints = 0;
+  let fail = false;
+  const client = checkpointing(async (snapshot) => {
+    if (fail) throw new Error("provider checkpoint unavailable");
+    checkpoints++;
+    return snapshot();
+  });
   const store = createMemoryMap<StoredModalSandbox>();
-  const s = make({ store, snapshots: counting.store });
+  const s = make({ store, client, nativeSnapshotIntervalMs: 0 });
   await s.teardown(await s.provision(layers), { homeUnchanged: true });
-  assert.equal(counting.puts(), 1, "a home that was never snapshotted is saved even by an unused turn");
+  assert.equal(checkpoints, 1, "a home that was never checkpointed is saved even by an unused turn");
   await s.teardown(await s.provision(layers), { homeUnchanged: true });
-  assert.equal(counting.puts(), 1, "a clean home is not re-saved by an unused turn");
-  counting.failWrites(true);
+  assert.equal(checkpoints, 1, "a clean home is not re-saved by an unused turn");
+  fail = true;
   await s.teardown(await s.provision(layers));
-  assert.equal(counting.puts(), 1);
-  assert.equal((await store.get(scope))?.homeDirty, true, "a used turn whose snapshot failed leaves the home dirty");
-  counting.failWrites(false);
+  assert.equal(checkpoints, 1);
+  assert.equal((await store.get(scope))?.homeDirty, true, "a used turn whose checkpoint failed leaves the home dirty");
+  fail = false;
   await s.teardown(await s.provision(layers), { homeUnchanged: true });
-  assert.equal(counting.puts(), 2, "the next unused turn catches up the missed snapshot");
+  assert.equal(checkpoints, 2, "the next unused turn catches up the missed checkpoint");
   assert.equal((await store.get(scope))?.homeDirty, false);
 });
 
 test("native checkpoints restore across rotation and core restarts without transferring a tar", async () => {
-  fake.cleanup();
-  fake = installFakeModal({ native: true });
   const store = createMemoryMap<StoredModalSandbox>();
   const portable = instrumentedSnapshotStore();
   const first = make({ store, snapshots: portable.store });
@@ -559,8 +579,6 @@ test("native checkpoints restore across rotation and core restarts without trans
 });
 
 test("native checkpoint references survive deep-idle reaping", async () => {
-  fake.cleanup();
-  fake = installFakeModal({ native: true });
   const store = createMemoryMap<StoredModalSandbox>();
   const first = make({ store });
   const handle = await first.provision(layers);
@@ -574,8 +592,6 @@ test("native checkpoint references survive deep-idle reaping", async () => {
 });
 
 test("expired native checkpoints block replacement without falling back to stale portable data", async () => {
-  fake.cleanup();
-  fake = installFakeModal({ native: true });
   const store = createMemoryMap<StoredModalSandbox>();
   const first = make({ store });
   const handle = await first.provision(layers);
@@ -589,23 +605,12 @@ test("expired native checkpoints block replacement without falling back to stale
 });
 
 test("native checkpoint failure preserves the previous reference and keeps the source running", async () => {
-  fake.cleanup();
-  fake = installFakeModal({ native: true });
   const store = createMemoryMap<StoredModalSandbox>();
   let fail = false;
-  const wrapped: ModalClient = {
-    ...fake.client,
-    async create(options) {
-      const session = await fake.client.create(options);
-      return {
-        ...session,
-        async snapshotHome() {
-          if (fail) throw new Error("provider checkpoint unavailable");
-          return session.snapshotHome!();
-        },
-      };
-    },
-  };
+  const wrapped = checkpointing(async (snapshot) => {
+    if (fail) throw new Error("provider checkpoint unavailable");
+    return snapshot();
+  });
   const first = make({ store, client: wrapped, rotationHoldMs: 0 });
   const handle = await first.provision(layers);
   await first.teardown(handle);
@@ -618,11 +623,9 @@ test("native checkpoint failure preserves the previous reference and keeps the s
   assert.match((await store.get(scope))?.recoveryError ?? "", /unavailable/);
 });
 
-test("native scheduling ignores disabled legacy tar intervals and refreshes active homes in maintenance", async () => {
-  fake.cleanup();
-  fake = installFakeModal({ native: true });
+test("maintenance refreshes the checkpoint of an active home", async () => {
   const store = createMemoryMap<StoredModalSandbox>();
-  const first = make({ store, client: { ...fake.client, nativeSnapshots: true }, snapshotIntervalMs: 1e15 });
+  const first = make({ store });
   const handle = await first.provision(layers);
   await first.teardown(handle);
   const initial = (await store.get(scope))?.nativeSnapshotId;
@@ -638,8 +641,6 @@ test("native scheduling ignores disabled legacy tar intervals and refreshes acti
 });
 
 test("a late checkpoint from another core cannot replace a newer committed checkpoint", async () => {
-  fake.cleanup();
-  fake = installFakeModal({ native: true });
   const store = createMemoryMap<StoredModalSandbox>();
   let release!: () => void;
   let started!: () => void;
@@ -650,28 +651,21 @@ test("a late checkpoint from another core cannot replace a newer committed check
     started = resolve;
   });
   let calls = 0;
-  const wrap = (session: Awaited<ReturnType<ModalClient["create"]>>) => ({
-    ...session,
-    async snapshotHome() {
-      const snapshot = await session.snapshotHome!();
-      if (++calls === 1) {
-        started();
-        await wait;
-      }
-      return snapshot;
-    },
+  const client = checkpointing(async (snapshot) => {
+    const checkpoint = await snapshot();
+    if (++calls === 1) {
+      started();
+      await wait;
+    }
+    return checkpoint;
   });
-  const client: ModalClient = {
-    ...fake.client,
-    create: async (options) => wrap(await fake.client.create(options)),
-    fromId: async (id) => wrap(await fake.client.fromId(id)),
-  };
   const first = make({ store, client });
   const second = make({ store, client });
   const one = await first.provision(layers);
   const two = await second.provision(layers);
   const older = first.teardown(one);
   await entered;
+  await store.merge(scope, { lastSnapshotAttemptMs: 1 });
   await second.teardown(two);
   const newest = (await store.get(scope))?.nativeSnapshotId;
   release();
@@ -681,10 +675,8 @@ test("a late checkpoint from another core cannot replace a newer committed check
 });
 
 test("maintenance checkpoints an idle scope with a live background job without reaping it", async () => {
-  fake.cleanup();
-  fake = installFakeModal({ native: true });
   const store = createMemoryMap<StoredModalSandbox>();
-  const first = make({ store, client: { ...fake.client, nativeSnapshots: true } });
+  const first = make({ store, client: fake.client });
   const handle = await first.provision(layers);
   assert.ok(supportsProcessSessions(first));
   if (!supportsProcessSessions(first)) return;
@@ -697,40 +689,6 @@ test("maintenance checkpoints an idle scope with a live background job without r
   assert.equal(result.reaped, 0);
   assert.equal(fake.current(scopeName())?.state, "running");
   assert.notEqual((await store.get(scope))?.nativeSnapshotId, checkpoint);
-});
-
-test("native capture requires activation and adopted native scopes remain native after flag rollback", async () => {
-  fake.cleanup();
-  fake = installFakeModal({ native: true });
-  const store = createMemoryMap<StoredModalSandbox>();
-  const portable = instrumentedSnapshotStore();
-  const first = make({ store, snapshots: portable.store, nativeSnapshotsEnabled: undefined });
-  const handle = await first.provision(layers);
-  await first.writeFile(handle, "working.txt", "portable generation");
-  await first.teardown(handle);
-  assert.equal((await store.get(scope))?.nativeSnapshotId, undefined);
-  assert.equal(portable.puts(), 1);
-
-  const activated = make({ store, snapshots: portable.store, nativeSnapshotsEnabled: true });
-  const active = await activated.provision(layers);
-  await activated.writeFile(active, "working.txt", "native generation");
-  await store.merge(scope, { lastSnapshotMs: 0 });
-  await activated.teardown(active);
-  assert.ok((await store.get(scope))?.nativeSnapshotId);
-  assert.equal(portable.puts(), 1);
-  fake.terminate(scopeName());
-
-  const rollback = make({ store, snapshots: portable.store, nativeSnapshotsEnabled: false });
-  const recovered = await rollback.provision(layers);
-  assert.equal(await rollback.readFile(recovered, "working.txt"), "native generation");
-  await rollback.writeFile(recovered, "working.txt", "reader rollback generation");
-  await store.merge(scope, { lastSnapshotMs: 0 });
-  await rollback.teardown(recovered);
-  assert.equal(portable.puts(), 1);
-  fake.terminate(scopeName());
-  const restarted = make({ store, snapshots: portable.store, nativeSnapshotsEnabled: false });
-  const restored = await restarted.provision(layers);
-  assert.equal(await restarted.readFile(restored, "working.txt"), "reader rollback generation");
 });
 
 test("interrupted hydration cannot expose a partially restored home through stored adoption", async () => {
@@ -748,8 +706,6 @@ test("interrupted hydration cannot expose a partially restored home through stor
 });
 
 test("explicit restart of interrupted hydration retains the checkpoint and retries it", async () => {
-  fake.cleanup();
-  fake = installFakeModal({ native: true });
   const store = createMemoryMap<StoredModalSandbox>();
   const first = make({ store });
   const handle = await first.provision(layers);
@@ -758,7 +714,7 @@ test("explicit restart of interrupted hydration retains the checkpoint and retri
   const checkpoint = (await store.get(scope))!.nativeSnapshotId;
   await first.writeFile(handle, "working.txt", "incomplete replacement content");
   await store.merge(scope, { hydrationPending: true });
-  const restarted = make({ store, nativeSnapshotsEnabled: false });
+  const restarted = make({ store });
   await restarted.restartComputer!(scope);
   assert.equal((await store.get(scope))!.nativeSnapshotId, checkpoint);
   const restored = await restarted.provision(layers);
@@ -853,4 +809,278 @@ test("repeated destroy teardown never targets an unrelated default scope", async
   await backend.teardown(handle, { destroy: true });
   assert.deepEqual(await store.get("default"), defaultRecord);
   assert.equal(await store.get(scope), null);
+});
+
+test("warm commands and process controls do not wait for a checkpoint", { timeout: 10000 }, async () => {
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const s = make({
+    store: createMemoryMap<StoredModalSandbox>(),
+    client: checkpointing(async (snapshot) => {
+      entered.resolve();
+      await release.promise;
+      return snapshot();
+    }),
+  });
+  const handle = await s.provision(layers);
+  await s.writeFile(handle, "keep.txt", "before snapshot");
+  const saving = s.teardown(handle);
+  try {
+    await entered.promise;
+    assert.equal((await s.run(handle, "echo responsive")).stdout.trim(), "responsive");
+    assert.equal(await s.readFile(handle, "keep.txt"), "before snapshot");
+    assert.ok(supportsProcessSessions(s));
+    assert.deepEqual(await s.listProcesses(handle), []);
+  } finally {
+    release.resolve();
+    await saving;
+  }
+});
+
+test("ordinary calls never rotate an aged warm sandbox", async () => {
+  const store = createMemoryMap<StoredModalSandbox>();
+  const s = make({ store, rotateAfterMs: 1 });
+  const handle = await s.provision(layers);
+  await store.merge(scope, { createdAtMs: 0 });
+  const id = (await store.get(scope))!.sandboxId;
+  await s.run(handle, "echo same machine");
+  await s.writeFile(handle, "keep.txt", "same machine");
+  assert.equal((await store.get(scope))!.sandboxId, id);
+  assert.equal(fake.createdCount(scopeName()), 1);
+  await s.provision(layers);
+  assert.notEqual((await store.get(scope))!.sandboxId, id);
+});
+
+test("checkpoint writers from separate cores share the durable lifecycle lock", { timeout: 10000 }, async () => {
+  const store = createMemoryMap<StoredModalSandbox>();
+  const advisoryLock = createMemoryAdvisoryLock();
+  const counting = instrumentedSnapshotStore();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let writers = 0;
+  let maximum = 0;
+  const snapshots = {
+    ...counting.store,
+    createUpload: async (id: string) => {
+      writers++;
+      maximum = Math.max(maximum, writers);
+      const upload = await counting.store.createUpload(id);
+      return {
+        ...upload,
+        complete: async () => {
+          await upload.complete();
+          writers--;
+        },
+      };
+    },
+  };
+  const client = checkpointing(async (snapshot) => {
+    writers++;
+    maximum = Math.max(maximum, writers);
+    entered.resolve();
+    await release.promise;
+    writers--;
+    return snapshot();
+  });
+  const first = make({ store, snapshots, advisoryLock, client });
+  const second = make({ store, snapshots, advisoryLock, client });
+  const a = await first.provision(layers);
+  const b = await second.provision(layers);
+  const saving = first.teardown(a);
+  await entered.promise;
+  const exporting = second.persistHomeSnapshot!(scope);
+  try {
+    assert.equal((await second.run(b, "echo second core")).stdout.trim(), "second core");
+    await Promise.race([exporting, new Promise((resolve) => setTimeout(resolve, 200))]);
+  } finally {
+    release.resolve();
+    await Promise.all([saving, exporting]);
+  }
+  assert.equal(maximum, 1);
+  assert.equal(counting.puts(), 1);
+  assert.ok((await store.get(scope))?.nativeSnapshotId);
+});
+
+test("failed native checkpoints wait for the interval across cleanup and maintenance", async () => {
+  const store = createMemoryMap<StoredModalSandbox>();
+  let attempts = 0;
+  let fail = false;
+  const client = checkpointing(async (snapshot) => {
+    attempts++;
+    if (fail) throw new Error("Timeout expired");
+    return snapshot();
+  });
+  const s = make({ store, client });
+  const h = await s.provision(layers);
+  await s.teardown(h);
+  const saved = (await store.get(scope))!.nativeSnapshotId;
+  fail = true;
+  await store.merge(scope, { lastSnapshotMs: 1, lastSnapshotAttemptMs: 1 });
+  await s.teardown(h);
+  assert.equal(attempts, 2);
+  await s.teardown(h);
+  await s.reapDeepIdle!(6 * 3600_000);
+  assert.equal(attempts, 2);
+  const restarted = make({ store, client });
+  await restarted.reapDeepIdle!(6 * 3600_000);
+  assert.equal(attempts, 2);
+  assert.equal((await store.get(scope))!.nativeSnapshotId, saved);
+  assert.equal((await store.get(scope))!.recoveryError, "Timeout expired");
+  await store.merge(scope, { lastSnapshotAttemptMs: 1 });
+  await s.teardown(h);
+  assert.equal(attempts, 3);
+});
+
+test("deep idle termination excludes writes from another core until recovery", { timeout: 10000 }, async () => {
+  const store = createMemoryMap<StoredModalSandbox>();
+  const advisoryLock = createMemoryAdvisoryLock();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let block = false;
+  const client = checkpointing(async (snapshot) => {
+    const checkpoint = await snapshot();
+    if (block) {
+      entered.resolve();
+      await release.promise;
+    }
+    return checkpoint;
+  });
+  const first = make({ store, client, advisoryLock });
+  const second = make({ store, client, advisoryLock });
+  const one = await first.provision(layers);
+  const two = await second.provision(layers);
+  await first.teardown(one);
+  await store.merge(scope, { lastActivityMs: Date.now() - 7 * 3600_000 });
+  block = true;
+  const reaping = first.reapDeepIdle!(6 * 3600_000);
+  await entered.promise;
+  let completed = false;
+  const writing = second.writeFile(two, "after-checkpoint.txt", "must survive").then(() => {
+    completed = true;
+  });
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(completed, false);
+  } finally {
+    release.resolve();
+    await Promise.all([reaping, writing]);
+  }
+  assert.equal(await second.readFile(two, "after-checkpoint.txt"), "must survive");
+  assert.equal(fake.createdCount(scopeName()), 2);
+});
+
+test("turn env reaches commands through the exec env parameter, never as inlined exports", async () => {
+  const h = await sandbox.provision(layers, { env: { MY_TOKEN: "hunter2" } });
+  const r = await sandbox.run(h, "echo TOKEN=$MY_TOKEN");
+  assert.match(r.stdout, /TOKEN=hunter2/);
+  assert.ok(!fake.execScripts().some((script) => script.includes("hunter2")));
+});
+
+test("scope and scratch sandboxes carry ownership tags", async () => {
+  const h = await sandbox.provision(layers);
+  assert.deepEqual(fake.tagsOf(fake.current(h.id)!.sandboxId), {
+    "qm-org": orgId(),
+    "qm-prefix": "qmt",
+    "qm-kind": "scope",
+  });
+  const scratch = await sandbox.provision(layers, { scratch: { key: "worker-1" } });
+  const scratchIds: string[] = [];
+  for await (const id of fake.client.listRunning!({ "qm-kind": "scratch" })) scratchIds.push(id);
+  assert.equal(scratchIds.length, 1);
+  assert.deepEqual(fake.tagsOf(scratchIds[0]!), { "qm-org": orgId(), "qm-prefix": "qmt", "qm-kind": "scratch" });
+  await sandbox.teardown(scratch);
+});
+
+test("a near-expiry checkpoint of a reaped scope is renewed before Modal deletes it", async () => {
+  const store = createMemoryMap<StoredModalSandbox>();
+  const s = make({ store });
+  const handle = await s.provision(layers);
+  await s.writeFile(handle, "work.txt", "idle for a month");
+  await store.merge(scope, { lastActivityMs: 1 });
+  assert.equal((await s.reapDeepIdle!(1)).reaped, 1);
+  const parked = (await store.get(scope))!;
+  assert.ok(parked.nativeSnapshotId);
+  const day = 24 * 3600_000;
+  await store.merge(scope, { nativeSnapshotExpiresAtMs: Date.now() + 20 * day, lastSnapshotMs: Date.now() - 10 * day });
+  await s.reapDeepIdle!(1);
+  assert.equal((await store.get(scope))!.nativeSnapshotId, parked.nativeSnapshotId, "far from expiry: untouched");
+  await store.merge(scope, { nativeSnapshotExpiresAtMs: Date.now() + 3600_000, lastSnapshotMs: Date.now() - 29 * day });
+  await s.reapDeepIdle!(1);
+  const renewed = (await store.get(scope))!;
+  assert.notEqual(renewed.nativeSnapshotId, parked.nativeSnapshotId);
+  assert.ok(renewed.nativeSnapshotExpiresAtMs! > Date.now() + 29 * day);
+  assert.equal(renewed.lastActivityMs, 1, "renewal is maintenance, not user activity");
+  assert.equal(renewed.hydrationPending, false);
+  assert.equal(fake.current(scopeName()), null, "the renewal sandbox is terminated again");
+  assert.equal(fake.runningCount(), 0);
+  const restarted = make({ store });
+  const restored = await restarted.provision(layers);
+  assert.equal(await restarted.readFile(restored, "work.txt"), "idle for a month");
+});
+
+test("checkpoint renewal skips expired and short-lived checkpoints instead of looping", async () => {
+  const store = createMemoryMap<StoredModalSandbox>();
+  const s = make({ store });
+  await s.provision(layers);
+  await store.merge(scope, { lastActivityMs: 1 });
+  await s.reapDeepIdle!(1);
+  const parked = (await store.get(scope))!;
+  await store.merge(scope, { nativeSnapshotExpiresAtMs: Date.now() + 40_000, lastSnapshotMs: Date.now() - 20_000 });
+  await s.reapDeepIdle!(1);
+  assert.equal((await store.get(scope))!.nativeSnapshotId, parked.nativeSnapshotId, "still in the first half-life");
+  await store.merge(scope, { nativeSnapshotExpiresAtMs: 1 });
+  await s.reapDeepIdle!(1);
+  assert.equal((await store.get(scope))!.nativeSnapshotId, parked.nativeSnapshotId, "expired: nothing to renew");
+  assert.equal(fake.createdCount(scopeName()), 1);
+});
+
+test("a sandbox approaching Modal's lifetime limit is checkpointed and retired even while busy", async () => {
+  const store = createMemoryMap<StoredModalSandbox>();
+  const s = make({ store, client: { ...fake.client, lifetimeMs: 24 * 3600_000 } });
+  const handle = await s.provision(layers);
+  await s.writeFile(handle, "job.txt", "in flight");
+  assert.ok(supportsProcessSessions(s));
+  if (!supportsProcessSessions(s)) return;
+  await s.startProcess(handle, "sleep 30");
+  assert.equal((await s.reapDeepIdle!(72 * 3600_000)).reaped, 0, "a fresh busy sandbox is left alone");
+  await store.merge(scope, { expiresAtMs: Date.now() + 60_000 });
+  assert.equal((await s.reapDeepIdle!(72 * 3600_000)).reaped, 1);
+  assert.equal(fake.current(scopeName()), null);
+  assert.ok((await store.get(scope))!.nativeSnapshotId);
+  const next = await s.provision(layers);
+  assert.equal(await s.readFile(next, "job.txt"), "in flight");
+  assert.ok((await store.get(scope))!.expiresAtMs! > Date.now() + 23 * 3600_000);
+});
+
+test("untracked scope sandboxes are terminated after a grace period while scratch and other deployments are kept", async () => {
+  const store = createMemoryMap<StoredModalSandbox>();
+  const s = make({ store, orphanGraceMs: 40 });
+  const handle = await s.provision(layers);
+  const tracked = fake.current(handle.id)!.sandboxId;
+  const orphan = fake.createUntracked({ "qm-org": orgId(), "qm-prefix": "qmt", "qm-kind": "scope" });
+  const scratch = fake.createUntracked({ "qm-org": orgId(), "qm-prefix": "qmt", "qm-kind": "scratch" });
+  const foreign = fake.createUntracked({ "qm-org": orgId(), "qm-prefix": "other", "qm-kind": "scope" });
+  assert.equal((await s.reapDeepIdle!(72 * 3600_000)).reaped, 0, "first sighting starts the grace period");
+  assert.equal(fake.runningCount(), 4);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal((await s.reapDeepIdle!(72 * 3600_000)).reaped, 1);
+  const running = new Set<string>();
+  for await (const id of fake.client.listRunning!({})) running.add(id);
+  assert.deepEqual(running, new Set([tracked, scratch, foreign]));
+  assert.equal(running.has(orphan), false);
+});
+
+test("forced scratch destruction surfaces failure and retries the same live session", async () => {
+  const handle = await sandbox.provision(layers, { scratch: { key: "destroy-retry" } });
+  fake.failTerminateOnce();
+  await assert.rejects(sandbox.teardown(handle, { destroy: true }));
+  assert.equal(fake.runningCount(), 1);
+  await sandbox.teardown(handle, { destroy: true });
+  assert.equal(fake.runningCount(), 0);
+});
+
+test("released scratch handles cannot recreate a persistent sandbox", async () => {
+  const handle = await sandbox.provision(layers, { scratch: { key: "released-handle" } });
+  await sandbox.teardown(handle, { destroy: true });
+  await assert.rejects(sandbox.run(handle, "true"), /handle has been released/);
 });

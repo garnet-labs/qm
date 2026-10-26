@@ -1,9 +1,9 @@
 /**
  * Custom model providers.
  *
- * An org admin can register additional model providers that speak one of
- * the two wire protocols we already run — OpenAI-compatible or
- * Anthropic-compatible — by giving a base URL, an API key, and the model
+ * An org admin can register additional model providers that speak a wire
+ * protocol we already run — OpenAI Chat Completions, OpenAI Responses,
+ * or Anthropic Messages — by giving a base URL, an API key, and the model
  * ids to expose. Registered models resolve like built-ins (the pi
  * harness reaches them through the same request path), surface in the
  * catalog, and are gated to harnesses that route through pi-ai.
@@ -13,15 +13,15 @@
  * resolved per-call by wiring alongside the built-in provider keys.
  */
 
-import { modelIdReserved } from "./pi-models.ts";
 import { parseProviderBaseUrl, PROVIDER_IDS } from "./provider-endpoints.ts";
 
-export const CUSTOM_PROVIDER_PROTOCOLS = ["openai", "anthropic"] as const;
+export const CUSTOM_PROVIDER_PROTOCOLS = ["openai", "openai-responses", "anthropic"] as const;
 export type CustomProviderProtocol = (typeof CUSTOM_PROVIDER_PROTOCOLS)[number];
 
 interface CustomModelSpec {
   id: string;
   name?: string;
+  reasoning?: boolean;
   contextWindow?: number;
   maxTokens?: number;
   /** USD per million input tokens. Defaults to 0 (unknown / not metered). */
@@ -40,7 +40,7 @@ export interface CustomProviderSpec {
 }
 
 const SLUG_RE = /^[a-z][a-z0-9-]{1,31}$/;
-const RESERVED = new Set<string>([...PROVIDER_IDS, "mock"]);
+const RESERVED = new Set<string>(PROVIDER_IDS);
 
 export function validateCustomProviderSpec(spec: CustomProviderSpec): void {
   if (!SLUG_RE.test(spec.id)) {
@@ -62,13 +62,19 @@ export function validateCustomProviderSpec(spec: CustomProviderSpec): void {
     if (!m.id?.trim() || m.id.length > 200) throw new Error("every model needs an id (<=200 chars)");
     if (m.name !== undefined && (typeof m.name !== "string" || m.name.length > 200))
       throw new Error(`model "${m.id}": name must be a string of 200 chars or fewer`);
-    if (modelIdReserved(m.id) || (registry.has(m.id) && registry.get(m.id)?.provider !== spec.id))
-      throw new Error(`model id "${m.id}" is already registered`);
+    if (m.reasoning !== undefined && typeof m.reasoning !== "boolean")
+      throw new Error(`model "${m.id}": reasoning must be a boolean`);
     if (seen.has(m.id)) throw new Error(`duplicate model id "${m.id}"`);
     seen.add(m.id);
     for (const [field, v] of [
       ["contextWindow", m.contextWindow],
       ["maxTokens", m.maxTokens],
+    ] as const) {
+      if (v !== undefined && (!Number.isSafeInteger(v) || v <= 0)) {
+        throw new Error(`model "${m.id}": ${field} must be a positive safe integer`);
+      }
+    }
+    for (const [field, v] of [
       ["input", m.input],
       ["output", m.output],
     ] as const) {
@@ -86,9 +92,10 @@ export function validateCustomProviderSpec(spec: CustomProviderSpec): void {
  */
 export interface CustomRuntimeModel {
   id: string;
+  upstreamId: string;
   name: string;
   provider: string;
-  api: "openai-completions" | "anthropic-messages";
+  api: "openai-completions" | "openai-responses" | "anthropic-messages";
   baseUrl: string;
   reasoning: boolean;
   input: ("text" | "image")[];
@@ -97,17 +104,25 @@ export interface CustomRuntimeModel {
   maxTokens: number;
 }
 
+const CUSTOM_MODEL_PREFIX = "custom/";
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_TOKENS = 8_192;
 
+function customProviderApi(protocol: CustomProviderProtocol): CustomRuntimeModel["api"] {
+  if (protocol === "anthropic") return "anthropic-messages";
+  if (protocol === "openai-responses") return "openai-responses";
+  return "openai-completions";
+}
+
 function toRuntimeModel(provider: CustomProviderSpec, m: CustomModelSpec): CustomRuntimeModel {
   return {
-    id: m.id,
+    id: `${CUSTOM_MODEL_PREFIX}${provider.id}/${m.id}`,
+    upstreamId: m.id,
     name: m.name?.trim() || m.id,
     provider: provider.id,
-    api: provider.protocol === "anthropic" ? "anthropic-messages" : "openai-completions",
+    api: customProviderApi(provider.protocol),
     baseUrl: provider.baseUrl,
-    reasoning: false,
+    reasoning: m.reasoning ?? false,
     input: ["text"],
     cost: { input: m.input ?? 0, output: m.output ?? 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: m.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
@@ -131,7 +146,8 @@ export function setCustomProviders(specs: CustomProviderSpec[]): void {
   const next = new Map<string, CustomRuntimeModel>();
   for (const spec of specs) {
     for (const m of spec.models) {
-      next.set(m.id, toRuntimeModel(spec, m));
+      const model = toRuntimeModel(spec, m);
+      next.set(model.id, model);
     }
   }
   registry = next;
@@ -142,6 +158,10 @@ export function setCustomProviders(specs: CustomProviderSpec[]): void {
 /** Bumps on every registry change — lets callers cache derived artifacts. */
 export function customProvidersVersion(): number {
   return version;
+}
+
+export function hasCustomModelPrefix(id: string): boolean {
+  return id.startsWith(CUSTOM_MODEL_PREFIX);
 }
 
 export function resolveCustomModel(id: string): CustomRuntimeModel | undefined {
@@ -172,14 +192,17 @@ export function customModelsJson(): { providers: Record<string, unknown> } | und
         {
           name: spec.name,
           baseUrl: spec.baseUrl,
-          api: spec.protocol === "anthropic" ? "anthropic-messages" : "openai-completions",
-          models: spec.models.map((m) => ({
-            id: m.id,
-            name: m.name ?? m.id,
-            contextWindow: m.contextWindow ?? 128_000,
-            maxTokens: m.maxTokens ?? 8_192,
-            cost: { input: m.input ?? 0, output: m.output ?? 0, cacheRead: 0, cacheWrite: 0 },
-          })),
+          api: customProviderApi(spec.protocol),
+          models: [...registry.values()]
+            .filter((m) => m.provider === spec.id)
+            .map(({ id, name, reasoning, contextWindow, maxTokens, cost }) => ({
+              id,
+              name,
+              reasoning,
+              contextWindow,
+              maxTokens,
+              cost,
+            })),
         },
       ]),
     ),

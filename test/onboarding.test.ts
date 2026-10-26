@@ -5,19 +5,22 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import type { Config } from "../src/config.ts";
 import { scopeId, type TurnRequest } from "../src/types.ts";
-import { detectOnboardingStatus, setOnboardingStatus } from "../src/onboarding/onboarding.ts";
+import { detectOnboardingStatus, setOnboardingStatus, PROACTIVE_OPENER_PROMPT } from "../src/onboarding/onboarding.ts";
 import { testConfig } from "./support/test-config.ts";
+import { createMemoryService } from "../src/memory/memory-service.ts";
+import { createLocalWorkspaceStore } from "../src/workspace/workspace-store.ts";
 
 const actor = { externalId: "U1" };
 const onboardingSkillDir = join(process.cwd(), "plugins/onboarding/skills");
 
-function freshApp() {
+function freshApp(overrides: Partial<Config> = {}) {
   const config: Config = testConfig({
     dataDir: mkdtempSync(join(tmpdir(), "ap-onboarding-")),
     pluginSkillDirs: [onboardingSkillDir],
+    ...overrides,
   });
   return buildApp(config);
 }
@@ -37,30 +40,23 @@ test("onboarding memory markers are detected from readable memory bullets", () =
   assert.equal(detectOnboardingStatus("- Onboarding: dismissed v2 on 2026-06-09."), "dismissed");
 });
 
-test("setOnboardingStatus rewrites the marker and round-trips through detect", () => {
-  const completed = setOnboardingStatus("## Notes\n\nsome prefs\n", "completed", "2026-06-22");
+test("setOnboardingStatus replaces the marker fact and round-trips through detect", async () => {
+  const memory = createMemoryService(createLocalWorkspaceStore(mkdtempSync(join(tmpdir(), "onboarding-mem-"))));
+  const scope = scopeId("personal", "U1");
+  await memory.capture(scope, ["some prefs", "onboarding:  Pending v2."], Date.UTC(2026, 5, 1));
+
+  await setOnboardingStatus(memory, scope, "completed", "2026-06-22", "admin");
+  const completed = await memory.read(scope);
   assert.equal(detectOnboardingStatus(completed), "completed");
-  assert.match(completed, /- Onboarding: completed v2 on 2026-06-22\./);
+  assert.doesNotMatch(completed, /pending/i);
   assert.match(completed, /some prefs/);
 
-  const reset = setOnboardingStatus(completed, "not_started", "2026-06-22");
-  assert.equal(detectOnboardingStatus(reset), "not_started");
-  assert.doesNotMatch(reset, /Onboarding:/);
-  assert.match(reset, /some prefs/);
-
-  const flipped = setOnboardingStatus(
-    "- (2026-01-01) Onboarding: completed v2 on 2026-01-01.\n",
-    "dismissed",
-    "2026-06-22",
-  );
-  assert.equal(detectOnboardingStatus(flipped), "dismissed");
-  assert.doesNotMatch(flipped, /completed/);
-
-  assert.equal(setOnboardingStatus("", "not_started", "2026-06-22"), "");
-  assert.equal(detectOnboardingStatus(setOnboardingStatus("", "pending", "2026-06-22")), "pending");
+  await setOnboardingStatus(memory, scope, "not_started", "2026-06-22", "admin");
+  assert.equal(detectOnboardingStatus(await memory.read(scope)), "not_started");
+  assert.match(await memory.read(scope), /some prefs/);
 });
 
-test("a new personal DM gets the high-priority pending onboarding prompt", async () => {
+test("a new personal DM offers onboarding through the skills index", async () => {
   const { app, skills } = freshApp();
   await waitForOnboardingSkill(skills);
 
@@ -71,45 +67,36 @@ test("a new personal DM gets the high-priority pending onboarding prompt", async
     text: "!sysprompt",
   } as TurnRequest);
 
-  assert.match(sys.reply ?? "", /## Pending Onboarding/);
-  assert.match(sys.reply ?? "", /high-priority setup task/);
-  assert.match(sys.reply ?? "", /no reason to skip it/);
-  assert.match(sys.reply ?? "", /skills\/onboarding\/SKILL\.md/);
+  assert.match(sys.reply ?? "", /\*\*onboarding\*\*/);
 });
 
-test("completed or dismissed onboarding markers suppress the pending prompt", async () => {
+test("the opener defers Slack setup until status can be checked without requiring provider configuration", () => {
+  assert.match(PROACTIVE_OPENER_PROMPT, /Do not mention Slack bot setup in this automatic greeting/);
+  assert.match(PROACTIVE_OPENER_PROMPT, /wait for their reply before reading admin-only status/);
+  assert.match(PROACTIVE_OPENER_PROMPT, /empty direct OAuth list does not rule out Composio/);
+  assert.match(PROACTIVE_OPENER_PROMPT, /skip connections and continue onboarding/);
+  assert.match(PROACTIVE_OPENER_PROMPT, /Never ask regular users to create OAuth apps or supply project keys/);
+});
+
+test("ideas web conversations bypass onboarding on every turn without completing it", async () => {
   const { app, skills, memory } = freshApp();
   await waitForOnboardingSkill(skills);
-  await memory.replace(scopeId("personal", "U1"), "## Onboarding\n\n- Onboarding: completed v2 on 2026-06-09.\n");
-
-  const completed = await app.turn({
-    surface: "test",
+  const threadRef = "web:U1:ideas:12345678-1234-4123-8123-123456789abc";
+  for (let i = 0; i < 2; i++) {
+    const sys = await app.turn({
+      surface: "web",
+      actor,
+      conversation: { kind: "dm", threadRef },
+      text: "!sysprompt",
+    } as TurnRequest);
+    assert.match(sys.reply ?? "", /Skip the onboarding skill and setup flow for this entire conversation/);
+  }
+  assert.equal(detectOnboardingStatus(await memory.read(scopeId("personal", "U1"))), "not_started");
+  const ordinary = await app.turn({
+    surface: "web",
     actor,
-    conversation: { kind: "dm", threadRef: "dm:U1:onboarding-completed" },
+    conversation: { kind: "dm", threadRef: "web:U1:ordinary" },
     text: "!sysprompt",
   } as TurnRequest);
-  assert.doesNotMatch(completed.reply ?? "", /## Pending Onboarding/);
-
-  await memory.replace(scopeId("personal", "U1"), "## Onboarding\n\n- Onboarding: dismissed v2 on 2026-06-09.\n");
-  const dismissed = await app.turn({
-    surface: "test",
-    actor,
-    conversation: { kind: "dm", threadRef: "dm:U1:onboarding-dismissed" },
-    text: "!sysprompt",
-  } as TurnRequest);
-  assert.doesNotMatch(dismissed.reply ?? "", /## Pending Onboarding/);
-});
-
-test("onboarding prompt does not appear in channel sessions", async () => {
-  const { app, skills } = freshApp();
-  await waitForOnboardingSkill(skills);
-
-  const sys = await app.turn({
-    surface: "test",
-    actor,
-    conversation: { kind: "channel", threadRef: "C1:onboarding", channelRef: "C1", audience: [actor] },
-    text: "!sysprompt",
-  } as TurnRequest);
-
-  assert.doesNotMatch(sys.reply ?? "", /## Pending Onboarding/);
+  assert.doesNotMatch(ordinary.reply ?? "", /## Ideas conversation/);
 });

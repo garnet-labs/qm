@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import type { Config } from "../src/config.ts";
 import { createAgentTools, type ToolContextRef } from "../src/harness/agent-tools.ts";
 import {
@@ -16,8 +16,7 @@ import {
 } from "../src/tools/primitives.ts";
 import { createDirectoryStore } from "../src/directory/directory-store.ts";
 import { resolveReachableChannel } from "../src/resolution/scope-reach.ts";
-import { filterHistoryForAudience } from "../src/resolution/context-filter.ts";
-import { scopeId, type Principal, type TurnRequest, type WorkspaceLayer } from "../src/types.ts";
+import { scopeId, type TurnRequest, type WorkspaceLayer } from "../src/types.ts";
 import type { Sandbox, SandboxHandle } from "../src/sandbox/sandbox.ts";
 import type { AuditEvent, AuditLog } from "../src/audit/audit-log.ts";
 import { testConfig } from "./support/test-config.ts";
@@ -228,53 +227,44 @@ const schemaProps = (tool: ReturnType<typeof createAgentTools>[number]): string[
 
 test("reachExec OFF: the execute scope never accepts a room", () => {
   const ref: ToolContextRef = { current: null };
-  const [legacy] = createAgentTools(ref);
-  assert.ok(!schemaProps(legacy!).includes("scope"), "legacy surface has no scope param");
-  const [scratchOnly] = createAgentTools(ref, { scratchExec: true });
-  const scopeSchema = (scratchOnly as unknown as { parameters: { properties: { scope?: { anyOf?: unknown[] } } } })
+  const [execute] = createAgentTools(ref);
+  const scopeSchema = (execute as unknown as { parameters: { properties: { scope?: { anyOf?: unknown[] } } } })
     .parameters.properties.scope;
-  assert.ok(
-    Array.isArray(scopeSchema?.anyOf),
-    "scratch-only scope is a closed union (scratch|scoped), not a free room string",
-  );
+  assert.ok(Array.isArray(scopeSchema?.anyOf), "without reach, scope is a closed union, not a free room string");
 });
 
-test("reachExec ON (no scratch): scope is a free string; a room routes to reachTarget; default is scoped", async () => {
+test("reachExec ON: scope accepts scoped, scratch, AND a room", async () => {
   const { tc, seen } = sinkToolContext();
   const [execute] = createAgentTools({ current: tc }, { reachExec: true });
-  assert.deepEqual(schemaProps(execute!), ["command", "sandbox_id", "purpose", "timeout_seconds", "scope"]);
-  await call(execute, { command: "cat x", scope: "#project-alpha" });
-  assert.deepEqual(seen.at(-1)!.opts, { reachTarget: "#project-alpha" });
-  await call(execute, { command: "echo hi" });
-  assert.deepEqual(seen.at(-1)!.opts, undefined, "omitted scope = the scoped box");
-  await call(execute, { command: "echo hi", scope: "scoped" });
-  assert.deepEqual(seen.at(-1)!.opts, undefined);
-  const err = textOf(await call(execute, { command: "x", scope: "scratch" }));
-  assert.match(err, /scratch box isn't available here/);
-});
-
-test("reachExec ON + scratchExec ON: scope accepts scoped, scratch, AND a room", async () => {
-  const { tc, seen } = sinkToolContext();
-  const [execute] = createAgentTools({ current: tc }, { reachExec: true, scratchExec: true });
-  assert.deepEqual(schemaProps(execute!), ["command", "sandbox_id", "purpose", "timeout_seconds", "scope", "durable"]);
-  await call(execute, { command: "x", scope: "scratch" });
+  assert.deepEqual(schemaProps(execute!), [
+    "command",
+    "background",
+    "sandbox_id",
+    "purpose",
+    "timeout_seconds",
+    "credentials",
+    "scope",
+    "durable",
+    "retrySafe",
+  ]);
+  await call(execute, { command: "x", scope: "scratch", purpose: "Run test command" });
   assert.deepEqual(seen.at(-1)!.opts, { scratch: true });
-  await call(execute, { command: "x", scope: "#ops" });
+  await call(execute, { command: "x", scope: "#ops", purpose: "Run test command" });
   assert.deepEqual(seen.at(-1)!.opts, { reachTarget: "#ops" });
-  await call(execute, { command: "x" });
+  await call(execute, { command: "x", purpose: "Run test command" });
   assert.deepEqual(seen.at(-1)!.opts, undefined);
-  const e = textOf(await call(execute, { command: "x", scope: "scratch", durable: true }));
+  const e = textOf(await call(execute, { command: "x", scope: "scratch", durable: true, purpose: "Run test command" }));
   assert.match(e, /scratch box cannot be made durable/);
 });
 
 test("reachExec ON: the scoped/scratch keywords match case-insensitively, never routed as a room", async () => {
   const { tc, seen } = sinkToolContext();
-  const [execute] = createAgentTools({ current: tc }, { reachExec: true, scratchExec: true });
-  await call(execute, { command: "x", scope: "Scoped" });
+  const [execute] = createAgentTools({ current: tc }, { reachExec: true });
+  await call(execute, { command: "x", scope: "Scoped", purpose: "Run test command" });
   assert.deepEqual(seen.at(-1)!.opts, undefined, '"Scoped" is the scoped box, not a reach target');
-  await call(execute, { command: "x", scope: "SCRATCH" });
+  await call(execute, { command: "x", scope: "SCRATCH", purpose: "Run test command" });
   assert.deepEqual(seen.at(-1)!.opts, { scratch: true }, '"SCRATCH" is the scratch box, not a reach target');
-  await call(execute, { command: "x", scope: "#project-alpha" });
+  await call(execute, { command: "x", scope: "#project-alpha", purpose: "Run test command" });
   assert.deepEqual(
     seen.at(-1)!.opts,
     { reachTarget: "#project-alpha" },
@@ -288,7 +278,6 @@ test("reachExec ON: the description advertises rooms and the 'other computers' p
   const desc = (execute as unknown as { description: string }).description;
   assert.match(desc, /a room like "#project-alpha"/);
   assert.match(desc, /Other computers you can reach/);
-  assert.doesNotMatch(desc, /"scratch":/, "scratch is not advertised when only reach is on");
 });
 
 test("Trap 1: a reach result prefixes provenance and keeps the SESSION scope label, not the channel", async () => {
@@ -301,7 +290,7 @@ test("Trap 1: a reach result prefixes provenance and keeps the SESSION scope lab
     orgScopeId: scopeId("org", "default-org"),
   };
   const [execute] = createAgentTools(ref, { reachExec: true });
-  const r = await call(execute, { command: "cat x", scope: "#project-alpha" });
+  const r = await call(execute, { command: "cat x", scope: "#project-alpha", purpose: "Run test command" });
   assert.match(textOf(r), /\[ran on #project-alpha's computer\]/);
   const toolResult = emitted.find((e) => e.type === "tool_result")!;
   assert.equal(
@@ -317,6 +306,16 @@ function freshApp(extra: Partial<Config> = {}) {
     ...extra,
   });
   return buildApp(config);
+}
+
+async function roomApp() {
+  const built = freshApp({ reachExecEnabled: true });
+  await built.directory.replaceChannels([{ channelId: "C-ph", name: "project-alpha" }]);
+  const room = scopeId("channel", "C-ph");
+  const resources = built.sandboxResources.forTurn({ actorId: "U1", scopeId: room, isCurrent: async () => true });
+  const record = await resources.create("U1", room, resources.defaultBackend(), "project-alpha", "room-ph");
+  await resources.setDefault("U1", room, record.id);
+  return built;
 }
 
 const dm = (text: string): TurnRequest => ({
@@ -340,55 +339,32 @@ const channelTurn = (text: string): TurnRequest => ({
 });
 
 test("DM + directory + flag: execute(scope:#room) runs on that channel's own computer", async () => {
-  const built = freshApp({ reachExecEnabled: true });
-  await built.directory.replaceChannels([{ channelId: "C-ph", name: "project-alpha" }]);
+  const built = await roomApp();
   const res = await built.app.turn(
     dm("!reach #project-alpha sh -c \"echo 'still here' > smoke.txt && cat smoke.txt\""),
   );
   assert.equal(res.status, "ok");
   assert.equal(res.reply, "still here");
   assert.ok(
-    fakeSprites.calls.some((c) => c.method === "POST" && /\/sprites\/qm-channel-c-ph-[^/]+\/exec$/.test(c.path)),
+    fakeSprites.calls.some((c) => c.method === "WS" && /\/sprites\/qm-sandbox-room-ph-[^/]+\/exec$/.test(c.path)),
     "the command landed on the channel's computer",
   );
 });
 
-test("reach teardown destroys a visited room that has no computer of its own (no leaked box)", async () => {
-  const built = freshApp({ reachExecEnabled: true });
-  await built.directory.replaceChannels([{ channelId: "C-ph", name: "project-alpha" }]);
-  await built.app.turn(dm("!reach #project-alpha echo hi"));
-  assert.equal(
-    fakeSprites.names().some((n) => n.startsWith("qm-channel-c-ph-")),
-    false,
-    "the visitor box is destroyed",
-  );
+test("reach preserves a durable workspace even without a login-probe cache", async () => {
+  const built = await roomApp();
+  await built.app.turn(dm("!reach #project-alpha printf retained > keep.txt"));
+  assert.ok(fakeSprites.names().some((n) => n.startsWith("qm-sandbox-room-ph-")));
+  const result = await built.app.turn(dm("!reach #project-alpha cat keep.txt"));
+  assert.equal(result.reply, "retained");
 });
 
 test("reach teardown keeps (does not destroy) a room with its own computer", async () => {
-  const built = freshApp({ reachExecEnabled: true });
-  await built.directory.replaceChannels([{ channelId: "C-ph", name: "project-alpha" }]);
-  await built.livenessCache.put({ scopeId: scopeId("channel", "C-ph"), checkedAt: 1, connectors: {} });
+  const built = await roomApp();
   await built.app.turn(dm("!reach #project-alpha echo hi"));
   assert.ok(
-    fakeSprites.names().some((n) => n.startsWith("qm-channel-c-ph-")),
+    fakeSprites.names().some((n) => n.startsWith("qm-sandbox-room-ph-")),
     "an operated room's computer is kept, not destroyed",
-  );
-});
-
-test("Trap 1 e2e: the reach tool_result is labeled the session scope and survives the audience filter", async () => {
-  const built = freshApp({ reachExecEnabled: true });
-  await built.directory.replaceChannels([{ channelId: "C-ph", name: "project-alpha" }]);
-  const res = await built.app.turn(dm("!reach #project-alpha echo hello"));
-  assert.equal(res.reply, "hello");
-  const entries = await built.sessions.getEntries(res.sessionId!);
-  const toolResults = entries.filter((e) => e.type === "tool_result");
-  assert.ok(toolResults.length >= 1, "a reach tool_result was recorded");
-  for (const e of toolResults) assert.equal(e.scopeLabel, scopeId("personal", "U1"));
-  const audience: Principal[] = [{ id: "U1", type: "internal" }];
-  const kept = filterHistoryForAudience(entries, audience, scopeId("personal", "U1"), scopeId("org", "default-org"));
-  assert.ok(
-    kept.some((e) => e.type === "tool_result"),
-    "the reach result is not dropped from the DM's own next turn",
   );
 });
 

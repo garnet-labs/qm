@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { scopeId, type TurnRequest } from "../src/types.ts";
 import { testConfig } from "./support/test-config.ts";
 
@@ -293,13 +293,6 @@ test("addressed + no post → exactly one nudge → the agent posts on the conti
     await sleep(300);
     const all = (await built.deliveries.pending("slack")) as any[];
     assert.equal(all.filter((d) => d.text === "nudged reply").length, 1, "the nudge fires at most once");
-    const session = await built.sessions.getByThread("ch:C-nudge:700.1");
-    const entries = await built.sessions.getEntries(session!.id);
-    assert.equal(
-      await built.sessions.tapeCoverage(session!.id),
-      entries.at(-1)!.seq,
-      "the watermark is a write-completeness claim: no append failed, so a nudged turn still advances it",
-    );
   } finally {
     await built.runtime.stop();
   }
@@ -395,20 +388,12 @@ test("reply-or-decline nudge preserves the trigger image and environment", async
   }
 });
 
-test("nudge tape reread failure falls back to refreshed history, never the stale pre-turn fold", async () => {
+test("the nudge continuation is rebuilt from history containing the first sub-turn", async () => {
   const built = freshApp();
   built.runtime.start();
   try {
     await built.app.turn(mention("!post prior", "C-nudge-read", "711.1"));
     assert.ok(await pollFor(built.deliveries, (d) => d.text === "prior"));
-
-    const originalGetTape = built.sessions.getTape.bind(built.sessions);
-    let reads = 0;
-    built.sessions.getTape = async (sessionId) => {
-      reads++;
-      if (reads >= 2) throw new Error("nudge tape read failed");
-      return originalGetTape(sessionId);
-    };
 
     await built.app.turn(mention("!shedmute", "C-nudge-read", "711.1"));
     assert.ok(await pollFor(built.deliveries, (d) => d.text === "worklog: did the thing but never posted"));
@@ -420,9 +405,8 @@ test("nudge tape reread failure falls back to refreshed history, never the stale
       nudgeRequest.messages?.some(
         (message) => message.role === "assistant" && message.content === "worklog: did the thing but never posted",
       ),
-      "a failed reread reconstructs from history containing the first sub-turn",
+      "the nudge sees the first sub-turn",
     );
-    assert.ok(reads >= 2, "the nudge attempted a fresh tape read");
   } finally {
     await built.runtime.stop();
   }
@@ -458,15 +442,15 @@ test("first action is `post` (speaking deliberately) → the opening text is NOT
   }
 });
 
-test("addressed + stay_silent → no nudge (explicit decline is accepted)", async () => {
+test("addressed + finish_silently → no nudge (explicit decline is accepted)", async () => {
   const built = freshApp();
   built.runtime.start();
   try {
-    const res = await built.app.turn({ ...mention("!staysilent no comment", "C-decline", "700.2"), async: false });
-    assert.equal(res.status, "silent", "an explicit stay_silent ends the turn silently");
+    const res = await built.app.turn({ ...mention("!finish-silent", "C-decline", "700.2"), async: false });
+    assert.equal(res.status, "silent", "an explicit finish_silently ends the turn silently");
     await sleep(300);
     const all = (await built.deliveries.pending("slack")) as any[];
-    assert.equal(all.filter((d) => d.text === "nudged reply").length, 0, "stay_silent suppresses the nudge");
+    assert.equal(all.length, 0, "finish_silently suppresses the nudge and closing reply");
   } finally {
     await built.runtime.stop();
   }
@@ -626,6 +610,41 @@ test("Door 2: an unprompted thread-follow is NOT envelope-wrapped (its detection
       /^<wake/,
       "a thread-follow keeps the raw-text path (wake envelope deferred to a follow-up)",
     );
+  } finally {
+    await built.runtime.stop();
+  }
+});
+
+for (const command of ["!finish-silent-approval", "!finish-silent-paused"]) {
+  test(`surface silence preserves pending approval: ${command}`, async () => {
+    const built = freshApp();
+    const result = await built.app.turn({ ...mention(command, "C-approval", command), async: false });
+    assert.equal(result.status, "pending_approval");
+    assert.equal(result.pendingApprovals?.length, 1);
+    assert.equal((await built.deliveries.pending("slack")).length, 0);
+  });
+}
+
+test("a shared web project turn answers with its final text, not surface tools", async () => {
+  const built = freshApp();
+  built.runtime.start();
+  try {
+    const project = await built.app.createProject("U1", "Launch");
+    assert.ok(project);
+    const ref = project.scopeId.slice("group:".length);
+    const result = await built.app.turn({
+      surface: "web",
+      actor,
+      conversation: { kind: "group", threadRef: `web:U1:${crypto.randomUUID()}`, channelRef: ref, audience: [actor] },
+      text: "hello project",
+      liveActor: true,
+    });
+    assert.equal(result.status, "ok", result.reason);
+    assert.ok(result.reply, "the final text is the reply");
+    const run = (await built.runs.list()).find((r) => r.request.text === "hello project");
+    assert.ok(run);
+    assert.notEqual(run.request.surfaceTools, true, "web project turns do not get the Slack surface-tools protocol");
+    assert.equal(((await built.deliveries.pending("slack")) as unknown[]).length, 0);
   } finally {
     await built.runtime.stop();
   }

@@ -16,9 +16,15 @@ test("core deploy image includes git", () => {
   );
   assert.match(
     dockerfile,
-    /npm audit --omit=dev --audit-level=moderate/,
-    "the production dependency threshold is a build gate",
+    /npm ci --omit=dev --ignore-scripts && npm run audit:prod/,
+    "the production install skips dependency lifecycle scripts and the dependency audit is a build gate",
   );
+  const packageJson = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8")) as {
+    scripts: Record<string, string>;
+  };
+  assert.equal(packageJson.scripts["audit:prod"], "npm audit --omit=dev --audit-level=moderate");
+  const workflow = readFileSync(join(repoRoot, ".github/workflows/cicd.yml"), "utf8");
+  assert.match(workflow, /run: npm run audit:prod/, "CI runs the same audit as the core image build");
   assert.doesNotMatch(dockerfile, /patch-pi-shrinkwrap/, "the dependency layer should be lockfile-only");
   assert.match(
     dockerfile,
@@ -27,6 +33,13 @@ test("core deploy image includes git", () => {
   );
   for (const line of dockerfile.split("\n").filter((candidate) => candidate.startsWith("COPY "))) {
     const sources = line.trim().split(/\s+/).slice(1, -1);
+    if (sources[0]?.startsWith("--from=")) {
+      const stage = sources[0].slice("--from=".length);
+      const stages = [...dockerfile.matchAll(/^FROM\s+\S+\s+AS\s+(\S+)$/gm)].map((match) => match[1]);
+      assert.ok(stages.includes(stage), `core Dockerfile COPY references an undeclared stage: ${stage}`);
+      assert.ok(sources.length > 1, "stage COPY must include a source path");
+      continue;
+    }
     for (const source of sources) {
       assert.equal(existsSync(join(repoRoot, source)), true, `core Dockerfile COPY source does not exist: ${source}`);
     }

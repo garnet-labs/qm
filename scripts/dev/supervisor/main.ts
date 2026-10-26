@@ -24,7 +24,15 @@ import { envSha as computeEnvSha, errMessage, nowEpoch, sleep } from "../lib/uti
 import { discoverCanaryChannel } from "../lib/canary.ts";
 import { buildChildSpecs, type SpecInputs } from "./specs.ts";
 import { Child } from "./children.ts";
-import type { BootPhaseEvent, BootResult, BootSpec, ChildName, SlackHealth, StatusReport } from "../lib/types.ts";
+import type {
+  BootPhaseEvent,
+  BootResult,
+  BootSpec,
+  CanaryReply,
+  ChildName,
+  SlackHealth,
+  StatusReport,
+} from "../lib/types.ts";
 import { CHILD_ORDER, EXIT } from "../lib/types.ts";
 
 const HEALTH_INTERVAL_MS = 10_000;
@@ -75,7 +83,7 @@ let currentGitSha = "";
 let handle = "";
 let sandbox: SandboxResolution | null = null;
 let durability = { sessionStore: "memory", runStore: "memory", databaseUrl: "" };
-let harness = "mock";
+let harness = "pi";
 let watch = true;
 let bootId = "";
 let bootedAt: number | null = null;
@@ -157,17 +165,14 @@ async function fetchSlackHealth(): Promise<SlackHealth | null> {
   }
 }
 
-async function runCanary(
-  channel: string,
-  timeoutMs = 15_000,
-): Promise<{ ok: boolean; rttMs?: number; reason?: string }> {
+async function runCanary(channel: string, timeoutMs = 15_000): Promise<CanaryReply> {
   try {
     const res = await fetch(`http://127.0.0.1:${ports.slackHealth}/canary`, {
       method: "POST",
       body: JSON.stringify({ channel, timeoutMs }),
       signal: AbortSignal.timeout(timeoutMs + 5000),
     });
-    return (await res.json()) as { ok: boolean; rttMs?: number; reason?: string };
+    return (await res.json()) as CanaryReply;
   } catch (err) {
     return { ok: false, reason: `canary endpoint unreachable: ${errMessage(err)}` };
   }
@@ -276,6 +281,7 @@ function writeLegacyMeta(booting: boolean): void {
     run_store: durability.runStore,
     watch: watch ? "1" : "0",
     slack: slackOn(readBootSpec()) ? "1" : "0",
+    web: readBootSpec().web === false ? "0" : "1",
     created_epoch: String(startedAt),
     created: new Date(startedAt * 1000).toISOString().replace("T", " ").slice(0, 19),
   };
@@ -310,22 +316,21 @@ async function assembleAndPrepare(spec: BootSpec): Promise<SpecInputs> {
   const assembled = await assembleEnv({
     worktree,
     callerEnv: spec.callerEnv,
-    allowMock: spec.callerEnv.DEV_INSTANCE_ALLOW_MOCK === "1",
     log,
   });
   for (const w of assembled.warnings) phase("env", "warn", w);
   harness = assembled.harness;
   let harnessDetail = `live ${assembled.harness} turns (anthropic key from ${assembled.anthropicKeySource})`;
-  if (assembled.harness === "mock") harnessDetail = "mock turns";
-  else if (assembled.harness === "codex") {
-    harnessDetail = assembled.codexAuthSource
-      ? "live codex turns (ChatGPT OAuth auth.json)"
-      : `live codex turns (openai key from ${assembled.openaiKeySource || "the environment"})`;
-  } else if (assembled.harness === "claude") harnessDetail = "live claude turns (native CLI authentication)";
+  if (assembled.harness === "claude") harnessDetail = "live claude turns (native CLI authentication)";
+  if (assembled.codexAuthSource) harnessDetail += `; company ChatGPT subscription from ${assembled.codexAuthSource}`;
   phase("env", "ok", harnessDetail);
 
   phase("deps", "start");
-  await ensureDeps(worktree, { watch: spec.watch, webUiBasePath: spec.callerEnv.DEV_INSTANCE_WEB_UI_BASE || "/" }, log);
+  await ensureDeps(
+    worktree,
+    { web: spec.web, watch: spec.watch, webUiBasePath: spec.callerEnv.DEV_INSTANCE_WEB_UI_BASE || "/" },
+    log,
+  );
   phase("deps", "ok");
 
   phase("sandbox", "start");
@@ -394,7 +399,11 @@ async function assembleAndPrepare(spec: BootSpec): Promise<SpecInputs> {
   if (!portalDevPrincipal && adminGrantsSeed) portalDevPrincipal = adminGrantsSeed.split(":")[0] ?? "";
   if (!portalDevPrincipal && durableAdminPrincipal) portalDevPrincipal = durableAdminPrincipal;
   if (!portalDevPrincipal) portalDevPrincipal = assembled.env.USER || "dev-admin";
-  log(`portal auth: localhost bypass signs in as ${portalDevPrincipal}`);
+  log(
+    assembled.env.PORTAL_LOCAL_AUTH_BYPASS === "0"
+      ? "portal auth: localhost bypass disabled"
+      : `portal auth: localhost bypass signs in as ${portalDevPrincipal}`,
+  );
 
   const tokens = slackOn(spec) ? slotTokens(slot, store) : null;
 
@@ -403,6 +412,7 @@ async function assembleAndPrepare(spec: BootSpec): Promise<SpecInputs> {
     ports,
     baseEnv: assembled.env,
     watch: spec.watch,
+    web: spec.web,
     webUiBasePath: spec.callerEnv.DEV_INSTANCE_WEB_UI_BASE || "/",
     ...(tokens ? { slack: { botToken: tokens.botToken, appToken: tokens.appToken } } : {}),
     sessionStore,
@@ -482,7 +492,14 @@ async function boot(): Promise<void> {
       phase("verify", "ok", "Slack off -- nothing to verify");
     }
     bootedAt = nowEpoch();
-    bootResult = { ok: true, slackEnabled: slackOn(spec), slot, handle, ...verified.result } as BootResult;
+    bootResult = {
+      ok: true,
+      webEnabled: spec.web !== false,
+      slackEnabled: slackOn(spec),
+      slot,
+      handle,
+      ...verified.result,
+    } as BootResult;
     writeLegacyMeta(false);
     persistState();
     finishBoot();
@@ -504,6 +521,12 @@ function finishBoot(): void {
 
 function startLoops(): void {
   const heartbeat = setInterval(() => {
+    if (shuttingDown) return;
+    if (!existsSync(worktree)) {
+      log("worktree vanished -- shutting down and releasing the lease");
+      void shutdownSelf(true);
+      return;
+    }
     if (!existsSync(lock)) {
       log("lease directory vanished (external teardown) -- exiting");
       void shutdownSelf(false);
@@ -583,6 +606,7 @@ async function teardown(reason: string): Promise<void> {
 }
 
 async function shutdownSelf(removeLock: boolean): Promise<void> {
+  if (shuttingDown) return;
   await teardown("shutdown requested");
   if (removeLock) rmSync(lock, { recursive: true, force: true });
   process.exit(EXIT.ok);
@@ -640,7 +664,12 @@ function serveApi(): Server {
       if (req.method === "POST" && req.url === "/canary") {
         if (!canaryChannel) await resolveCanaryChannel(readBootSpec());
         const channel = String(body.channel || canaryChannel || "");
-        respond(200, channel ? await runCanary(channel) : { ok: false, reason: "no canary channel configured" });
+        respond(
+          200,
+          channel
+            ? await runCanary(channel)
+            : ({ ok: false, code: "unconfigured", reason: "no canary channel configured" } satisfies CanaryReply),
+        );
         return;
       }
       if (req.method === "POST" && req.url === "/shutdown") {
@@ -682,12 +711,12 @@ async function reload(body: Record<string, unknown>): Promise<Record<string, unk
     const assembled = await assembleEnv({
       worktree,
       callerEnv,
-      allowMock: callerEnv.DEV_INSTANCE_ALLOW_MOCK === "1",
       log,
     });
     const dryEnvSha = computeEnvSha(assembled.env);
     const allHealthy =
-      children.size === CHILD_ORDER.length && [...children.values()].every((c) => c.state === "healthy");
+      children.size === (spec.web === false ? 1 : CHILD_ORDER.length) &&
+      [...children.values()].every((c) => c.state === "healthy");
     return {
       ok: true,
       noop: dryEnvSha === currentEnvSha && allHealthy,
@@ -703,7 +732,7 @@ async function reload(body: Record<string, unknown>): Promise<Record<string, unk
   const newGitSha = gitHead(worktree);
   const noopEligible =
     newEnvSha === currentEnvSha &&
-    children.size === CHILD_ORDER.length &&
+    children.size === (spec.web === false ? 1 : CHILD_ORDER.length) &&
     [...children.values()].every((c) => c.state === "healthy");
   if (!force && noopEligible) {
     return {
@@ -781,8 +810,8 @@ async function statusReport(): Promise<StatusReport> {
     },
     harness,
     slackEnabled,
+    webEnabled: readBootSpec().web !== false,
     watch,
-    turnsLive: harness !== "mock",
     publicApiUrl: sandbox?.publicApiUrl ?? null,
     children: childStatuses,
   };

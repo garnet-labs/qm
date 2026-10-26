@@ -1,3 +1,5 @@
+import { resolveMentions } from "./mrkdwn.ts";
+export { resolveMentions } from "./mrkdwn.ts";
 import { encodeTs, summarizeReactions, type ReactionTally } from "./reactions.ts";
 import { utcMinute } from "../util/time.ts";
 import { MAX_ATTACHMENTS_PER_TURN } from "./attachments.ts";
@@ -9,6 +11,7 @@ export interface ContextWireMessage {
   text: string;
   threadTs?: string;
   files?: string[];
+  reactions?: ReactionTally[];
 }
 
 const MAX_CONTEXT_MESSAGE_CHARS = 600;
@@ -22,7 +25,7 @@ function compareSlackTimestamps(a: { ts: string }, b: { ts: string }): number {
 export function buildContextWindow(
   scanned: readonly RecentMessage[],
   opts: { count: number; match?: string; scanHasMore?: boolean; nameById?: ReadonlyMap<string, string> },
-): { messages: ContextWireMessage[]; hasMore: boolean; nextBefore?: string } {
+): { messages: ContextWireMessage[]; hasMore: boolean; nextBefore?: string; selfTs?: string[] } {
   const asc = [...scanned].sort(compareSlackTimestamps);
   const needle = opts.match?.trim().toLowerCase();
   const matched = needle ? asc.filter((m) => (m.text ?? "").toLowerCase().includes(needle)) : asc;
@@ -37,15 +40,18 @@ export function buildContextWindow(
       text: clipMessage(resolveMentions(m.text ?? "", opts.nameById), MAX_CONTEXT_MESSAGE_CHARS),
       ...(m.parentTs ? { threadTs: m.parentTs } : {}),
       ...(m.files?.length ? { files: m.files } : {}),
+      ...(m.reactions ? { reactions: m.reactions } : {}),
     };
   });
   const droppedMatches = matched.length > kept.length;
   let nextBefore = opts.scanHasMore ? asc[0]?.ts : undefined;
   if (droppedMatches) nextBefore = kept[0]?.ts;
+  const selfTs = kept.filter((m) => m.isSelf).map((m) => m.ts);
   return {
     messages,
     hasMore: Boolean(opts.scanHasMore) || droppedMatches,
     ...(nextBefore ? { nextBefore } : {}),
+    ...(selfTs.length ? { selfTs } : {}),
   };
 }
 
@@ -65,23 +71,12 @@ export interface RecentMessage {
 export const MAX_RECENT_MESSAGES = 20;
 const MAX_RECENT_MESSAGE_CHARS = 300;
 const MAX_TURN_MESSAGE_CHARS = 4000;
-export const MAX_TOP_LEVEL_CONTEXT_AGE_S = 24 * 60 * 60;
 
 export function recentWindow(
   candidates: readonly RecentMessage[],
   limit: number = MAX_RECENT_MESSAGES,
-  opts?: { triggerTs?: string; maxAgeSeconds?: number },
 ): RecentMessage[] {
-  const cutoff =
-    opts?.triggerTs && opts.maxAgeSeconds && Number.isFinite(Number(opts.triggerTs))
-      ? Number(opts.triggerTs) - opts.maxAgeSeconds
-      : undefined;
-  const usable = candidates.filter(
-    (m) =>
-      m.ts &&
-      (m.name || m.text?.trim() || m.files?.length) &&
-      (cutoff === undefined || m.isTrigger || Number(m.ts) >= cutoff),
-  );
+  const usable = candidates.filter((m) => m.ts && (m.name || m.text?.trim() || m.files?.length));
   if (!usable.length) return [];
   const window = Math.max(1, Math.floor(limit));
   const sorted = [...usable].sort(compareSlackTimestamps);
@@ -116,16 +111,6 @@ function arrangeForDisplay(messages: readonly RecentMessage[]): Array<{ message:
   return out;
 }
 
-const SLACK_MENTION = /<@([A-Z0-9]+)(?:\|[^>]*)?>/g;
-
-export function resolveMentions(text: string, nameById: ReadonlyMap<string, string> | undefined): string {
-  if (!nameById || !text.includes("<@")) return text;
-  return text.replace(SLACK_MENTION, (m, id) => {
-    const name = nameById.get(id);
-    return name ? `@${name}` : m;
-  });
-}
-
 interface ConversationMember {
   id: string;
   name: string;
@@ -135,6 +120,7 @@ interface ConversationMember {
 }
 
 export interface ConversationView {
+  contextNote?: string;
   channel: { name?: string; kind: "dm" | "channel" | "group"; isPrivate?: boolean };
   members: readonly ConversationMember[];
   messages: readonly RecentMessage[];
@@ -246,7 +232,7 @@ export function renderConversationView(view: ConversationView): RenderedConversa
     ? "Files too big to view this turn: " + view.omittedFiles.map((f) => f.name).join(", ") + "."
     : "";
 
-  const header = [fileLine, omittedLine, where, who, here].filter(Boolean).join(" ");
+  const header = [fileLine, omittedLine, where, who, here, view.contextNote].filter(Boolean).join(" ");
 
   const detectContext = msgs
     .filter((m) => !m.isBot && !m.isSelf && !m.isTrigger)

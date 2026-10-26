@@ -1,4 +1,4 @@
-import type { ScopedConfigStore } from "../resolution/config-store.ts";
+import type { ScopedConfigStore, RuntimePurpose } from "../resolution/config-store.ts";
 import {
   defaultModelForHarness,
   fastModeModelIds,
@@ -6,20 +6,145 @@ import {
   isHarnessId,
   modelSupportedByHarness,
   resolveModel,
+  safeModelMetadata,
   thinkingLevelsForHarness,
   modelUnavailableReason,
   type HarnessId,
 } from "../model/pi-models.ts";
-import type { ScopeId } from "../types.ts";
-import type { Harness, HarnessTurnInput, RuntimeChoice } from "./harness.ts";
-import { withTapedEntryMirrors } from "./harness-shared.ts";
+import type { ScopeId, SessionEntry } from "../types.ts";
+import type { Harness, HarnessTurnInput, HarnessTurnResult, RuntimeChoice } from "./harness.ts";
+import { NON_INTERACTIVE_THINKING_LEVEL, NON_INTERACTIVE_FAST_MODE } from "../core/turn-options.ts";
 import { NonRetryableTurnError } from "../core/turn-error.ts";
+import { createGrindMeter, meterGrindSpend } from "./grind.ts";
+import {
+  bankGoalTurn,
+  enforceGoal,
+  governGoal,
+  goalWorkFromEntries,
+  type GoalGovernorInput,
+  type GoalRecord,
+  type GovernorVerdict,
+} from "./goal.ts";
+
+const GOAL_ROUND_MIN_WALL_MS = 30_000;
+
+function turnCompleted(result: HarnessTurnResult): boolean {
+  return !result.stopped && !result.runtimeHandoff && !result.pausedOnApproval && !result.pendingApprovals?.length;
+}
+
+function inputTokens(result: HarnessTurnResult): number {
+  const usage = result.cacheUsage;
+  return usage ? usage.cacheRead + usage.cacheWrite + usage.uncachedInput : 0;
+}
+
+async function runTurnEnforcingGoal(
+  adapter: Harness,
+  input: HarnessTurnInput,
+  harnessId: HarnessId,
+): Promise<HarnessTurnResult> {
+  const emitted: SessionEntry[] = [];
+  let saved: GoalRecord | undefined;
+  const startedAt = Date.now();
+  const meter = createGrindMeter(startedAt);
+  let segment = { goal: input.goal ?? undefined, assignedAt: input.goal?.createdAt };
+  const replacedThisSegment = () => !!segment.goal && segment.goal.createdAt !== segment.assignedAt;
+  const dispatched: HarnessTurnInput = {
+    ...input,
+    goalMeter: meter,
+    recordLlmRequest: (rec, signal) => {
+      if (!replacedThisSegment()) meterGrindSpend(meter, rec.usage ?? null);
+      return input.recordLlmRequest?.(rec, signal);
+    },
+    emit: async (entry) => {
+      const stored = await input.emit(entry);
+      emitted.push(stored);
+      return stored;
+    },
+    saveGoal: async (goal) => {
+      saved = goal;
+      await input.saveGoal?.(goal);
+    },
+  };
+  let result = await adapter.turns.runTurn(dispatched);
+  const goal: GoalRecord | null = saved ?? input.goal ?? null;
+  if (!goal) return result;
+  const account = () => {
+    if (replacedThisSegment()) return;
+    meter.turns += result.modelCalls ?? 1;
+    const tokens = inputTokens(result);
+    meter.tokens += tokens;
+    if (goal.status !== "paused") goal.tokensUsed += tokens;
+  };
+  account();
+  const remainingWallMs = () =>
+    input.turnWallClockMs && input.turnWallClockMs > 0 ? input.turnWallClockMs - (Date.now() - startedAt) : undefined;
+  const blocked = () => {
+    const remaining = remainingWallMs();
+    return (
+      !!input.cancel?.aborted ||
+      !turnCompleted(result) ||
+      (remaining !== undefined && remaining < GOAL_ROUND_MIN_WALL_MS)
+    );
+  };
+  await enforceGoal<"ok" | "halted">({
+    goal,
+    meter,
+    outcome: blocked() ? "halted" : "ok",
+    ok: "ok",
+    blocked,
+    ...(input.governGoal
+      ? {
+          govern: (previous: GovernorVerdict | undefined) =>
+            input.governGoal!({
+              objective: goal.objective,
+              trigger: "checkpoint",
+              recentWork: goalWorkFromEntries([...input.history.slice(-40), ...emitted]),
+              ...(previous ? { previous } : {}),
+            }),
+        }
+      : {}),
+    ...(input.goalInbox ? { inbox: input.goalInbox } : {}),
+    beforePrompt: () => {
+      console.error(`[goal] continuation session=${input.session.id} harness=${harnessId} turns=${meter.turns}`);
+    },
+    prompt: async (note) => {
+      const remaining = remainingWallMs();
+      segment = { goal, assignedAt: goal.createdAt };
+      result = await adapter.turns.runTurn({
+        ...dispatched,
+        continueTurn: undefined,
+        input: note,
+        history: [...input.history, ...emitted],
+        goal,
+        goalContinuation: true,
+        ...(remaining !== undefined ? { turnWallClockMs: Math.max(1, remaining) } : {}),
+      });
+      account();
+      return blocked() ? "halted" : "ok";
+    },
+  });
+  if (saved && saved !== goal) return result;
+  bankGoalTurn(goal, startedAt);
+  if (result.stopped && (result.stoppedByUser || !input.cancel?.aborted) && goal.status === "active") {
+    goal.status = "paused";
+    goal.updatedAt = Date.now();
+  }
+  await dispatched.saveGoal!(goal);
+  return result;
+}
 
 function normalizeRuntimeChoice(choice: RuntimeChoice): RuntimeChoice {
+  if (
+    (choice.effortLevel === "adaptive" || choice.effortLevel === "default") &&
+    !thinkingLevelsForHarness(choice.harnessId, choice.modelId).includes(choice.effortLevel)
+  )
+    throw new NonRetryableTurnError(
+      `${choice.effortLevel} reasoning is not supported by ${choice.harnessId}/${choice.modelId}`,
+    );
   return {
     harnessId: choice.harnessId,
     modelId: choice.modelId,
-    ...(choice.effortLevel && thinkingLevelsForHarness(choice.harnessId).includes(choice.effortLevel)
+    ...(choice.effortLevel && thinkingLevelsForHarness(choice.harnessId, choice.modelId).includes(choice.effortLevel)
       ? { effortLevel: choice.effortLevel }
       : {}),
     ...(typeof choice.fastMode === "boolean"
@@ -32,14 +157,42 @@ function normalizeRuntimeChoice(choice: RuntimeChoice): RuntimeChoice {
 }
 
 export function resolveRuntimeChoice(
-  config: Pick<ScopedConfigStore, "getApprovedHarnesses" | "getRuntimeSelection" | "getBaseModel">,
+  config: Pick<ScopedConfigStore, "getApprovedHarnesses" | "getRuntimeSelection" | "getBaseModel"> &
+    Partial<Pick<ScopedConfigStore, "getPurposeRuntime">>,
   orgScopeId: ScopeId,
   scope: ScopeId,
   fallback: RuntimeChoice,
   requested?: Partial<RuntimeChoice>,
+  purpose?: RuntimePurpose,
 ): RuntimeChoice {
   const approved = config.getApprovedHarnesses() ?? [fallback.harnessId];
   if (approved.length === 0) throw new NonRetryableTurnError("No harnesses are approved");
+  const purposeRuntime = purpose ? config.getPurposeRuntime?.(purpose) : undefined;
+  if (purposeRuntime) {
+    const explicit = Object.fromEntries(Object.entries(requested ?? {}).filter(([, value]) => value !== undefined));
+    const choice = { ...purposeRuntime, ...explicit };
+    if (
+      !isHarnessId(choice.harnessId) ||
+      !approved.includes(choice.harnessId) ||
+      !modelSupportedByHarness(choice.modelId, choice.harnessId)
+    )
+      throw new NonRetryableTurnError(`runtime ${choice.harnessId}/${choice.modelId} is not approved`);
+    const unavailable = modelUnavailableReason(choice.modelId);
+    if (unavailable) throw new NonRetryableTurnError(`${choice.modelId}: ${unavailable}`);
+    if (
+      choice.effortLevel !== undefined &&
+      !thinkingLevelsForHarness(choice.harnessId, choice.modelId).includes(choice.effortLevel)
+    )
+      throw new NonRetryableTurnError(
+        `${choice.effortLevel} reasoning is not supported by ${choice.harnessId}/${choice.modelId}`,
+      );
+    if (choice.fastMode && (!harnessSupportsFastMode(choice.harnessId) || !fastModeModelIds().includes(choice.modelId)))
+      throw new NonRetryableTurnError(`fast mode is not supported by ${choice.harnessId}/${choice.modelId}`);
+    return { ...choice, harnessId: choice.harnessId };
+  }
+  if (purpose === "cron")
+    requested = { effortLevel: NON_INTERACTIVE_THINKING_LEVEL, fastMode: NON_INTERACTIVE_FAST_MODE, ...requested };
+
   const orgStored = config.getRuntimeSelection(orgScopeId);
   const orgLegacy = config.getBaseModel(orgScopeId);
   const configuredOrg: RuntimeChoice =
@@ -96,20 +249,26 @@ export async function resolveRuntimeChoiceDurable(
   fallback: RuntimeChoice,
   requested?: Partial<RuntimeChoice>,
   hydrateModelCatalog?: () => Promise<unknown>,
+  purpose?: RuntimePurpose,
 ): Promise<RuntimeChoice> {
   const approved = (await config.getApprovedHarnessesDurable()) ?? [fallback.harnessId];
-  const [orgStored, scopedStored, orgLegacy, scopedLegacy] = await Promise.all([
+  const [orgStored, scopedStored, orgLegacy, scopedLegacy, purposeRuntime] = await Promise.all([
     config.getRuntimeSelectionDurable(orgScopeId),
     scope === orgScopeId ? null : config.getRuntimeSelectionDurable(scope),
     config.getBaseModelOwnDurable(orgScopeId),
     scope === orgScopeId ? null : config.getBaseModelOwnDurable(scope),
+    purpose ? config.getPurposeRuntimeDurable(purpose) : undefined,
   ]);
   if (hydrateModelCatalog) {
-    const candidates = [requested?.modelId, scopedStored?.modelId, orgStored?.modelId];
+    const candidates = [requested?.modelId, purposeRuntime?.modelId, scopedStored?.modelId, orgStored?.modelId];
     if (candidates.some((modelId) => modelId && !resolveModel(modelId))) await hydrateModelCatalog();
   }
-  const view: Pick<ScopedConfigStore, "getApprovedHarnesses" | "getRuntimeSelection" | "getBaseModel"> = {
+  const view: Pick<
+    ScopedConfigStore,
+    "getApprovedHarnesses" | "getRuntimeSelection" | "getBaseModel" | "getPurposeRuntime"
+  > = {
     getApprovedHarnesses: () => approved,
+    getPurposeRuntime: () => purposeRuntime,
     getRuntimeSelection: (id: ScopeId) => {
       if (id === orgScopeId) return orgStored;
       return id === scope ? scopedStored : null;
@@ -119,13 +278,13 @@ export async function resolveRuntimeChoiceDurable(
       return id === scope ? scopedLegacy : null;
     },
   };
-  return resolveRuntimeChoice(view, orgScopeId, scope, fallback, requested);
+  return resolveRuntimeChoice(view, orgScopeId, scope, fallback, requested, purpose);
 }
 
 export function createHarnessRouter(
   adapters: ReadonlyMap<HarnessId, Harness>,
   utility: Harness,
-  resolve: (input: HarnessTurnInput) => RuntimeChoice | Promise<RuntimeChoice>,
+  resolve: (input: HarnessTurnInput, routedBy: (ruleId: string) => void) => RuntimeChoice | Promise<RuntimeChoice>,
 ): Harness {
   const lastHarness = new Map<string, HarnessId>();
   return {
@@ -140,7 +299,17 @@ export function createHarnessRouter(
     tools: utility.tools,
     turns: {
       async runTurn(input) {
-        const choice = await resolve(input);
+        let routedBy: string | undefined;
+        const choice = await resolve(input, (ruleId) => {
+          routedBy = ruleId;
+        });
+        const label = safeModelMetadata(choice.modelId)?.label;
+        input.onRuntime?.({
+          harnessId: choice.harnessId,
+          modelId: choice.modelId,
+          ...(label ? { label } : {}),
+          ...(routedBy ? { change: { rule: routedBy } } : {}),
+        });
         const adapter = adapters.get(choice.harnessId);
         if (!adapter) throw new Error(`harness ${choice.harnessId} is unavailable`);
         const prior = lastHarness.get(input.session.id);
@@ -149,16 +318,22 @@ export function createHarnessRouter(
           await adapter.turns.resetSession?.(input.session.id);
         }
         lastHarness.set(input.session.id, choice.harnessId);
+        const judge = adapter.models?.judge;
         const dispatched: HarnessTurnInput = {
           ...input,
           runtime: choice,
           tools: input.runtimeControl
             ? { ...input.tools, runtime: (request, signal) => input.runtimeControl!(choice, request, signal) }
             : input.tools,
+          ...(judge
+            ? {
+                governGoal: (goalInput: GoalGovernorInput) => governGoal(judge, goalInput, input.cancel),
+              }
+            : {}),
         };
-        return adapter.turns.runTurn(
-          adapter.profile.capabilities.has("native-tape") ? dispatched : withTapedEntryMirrors(dispatched),
-        );
+        return adapter.profile.capabilities.has("goal-enforcement")
+          ? adapter.turns.runTurn(dispatched)
+          : runTurnEnforcingGoal(adapter, dispatched, choice.harnessId);
       },
       async resetSession(sessionId) {
         lastHarness.delete(sessionId);

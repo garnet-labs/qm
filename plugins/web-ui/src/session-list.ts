@@ -1,4 +1,12 @@
-import { sharedContextLabel, type CoreContext, type CoreProject, type CoreSession } from "./core-bridge.ts";
+import {
+  sharedContextLabel,
+  type CoreContext,
+  type CoreProject,
+  type CoreSession,
+  type SessionBackgroundView,
+} from "./core-bridge.ts";
+import { descendantsOf } from "./subagent-activity.ts";
+import { goalFloorLabel, goalWorkedLabel } from "./goal-strip.ts";
 import { relTime } from "./ui.ts";
 
 type ProjectAwareContext = CoreContext & { project?: CoreProject };
@@ -20,6 +28,24 @@ export function activityOf(s: CoreSession): number {
 }
 
 export type ChatBrowseStatus = "active" | "waiting" | "archived";
+
+export function surfaceOf(s: Pick<CoreSession, "surface">): "web" | "slack" | "core" {
+  return s.surface === "web" || s.surface === "slack" ? s.surface : "core";
+}
+
+const AUTOMATION_RUN_LABELS: Record<string, string> = {
+  cron: "Cron run",
+  webhook: "Webhook run",
+  loop: "Loop run",
+};
+
+export function automationRunLabel(s: Pick<CoreSession, "surface">): string | null {
+  return (s.surface && AUTOMATION_RUN_LABELS[s.surface]) || null;
+}
+
+export function sidebarSessions(sessions: readonly CoreSession[]): CoreSession[] {
+  return sessions.filter((session) => !session.parentSessionId && !automationRunLabel(session));
+}
 
 export function splitPinned<T extends Pick<CoreSession, "pinned">>(sessions: readonly T[]): { pinned: T[]; rest: T[] } {
   const pinned: T[] = [];
@@ -124,17 +150,50 @@ export function bumpActivity(list: CoreSession[], threadRef: string, at: number)
   return list.map((s) => (s.threadRef === threadRef ? { ...s, lastActivityAt: at } : s));
 }
 
-export function reconcileSessions(
-  server: CoreSession[],
+export function upsertSessions(prev: CoreSession[], rows: readonly CoreSession[]): CoreSession[] {
+  if (!rows.length) return prev;
+  const incoming = new Map(rows.map((row) => [row.id, row]));
+  const threads = new Set(rows.map((row) => row.threadRef));
+  const kept = prev.filter((row) => !incoming.has(row.id) && !threads.has(row.threadRef));
+  return [...kept, ...rows];
+}
+
+export interface PageWindow {
+  archived: boolean;
+  surface?: string;
+  floor: number | null;
+}
+
+function inPageClass(row: CoreSession, window: PageWindow): boolean {
+  if (!row.id || row.parentSessionId || automationRunLabel(row)) return false;
+  if (Boolean(row.archived) !== window.archived) return false;
+  if (window.surface && row.surface !== window.surface) return false;
+  return true;
+}
+
+export function mergeFirstPage(
   prev: CoreSession[],
+  page: { sessions: readonly CoreSession[]; pinned?: readonly CoreSession[] },
+  window: PageWindow,
   openIds: readonly string[] = [],
 ): CoreSession[] {
-  const known = new Set(server.map((s) => s.threadRef));
-  const pending = prev.filter((s) => !s.id && !known.has(s.threadRef));
-  const served = new Set(server.map((s) => s.id));
-  const dropped = new Set(openIds.filter((id) => !served.has(id)));
-  const stillOpen = dropped.size ? prev.filter((s) => dropped.has(s.id) && !known.has(s.threadRef)) : [];
-  return [...pending, ...stillOpen, ...server];
+  const served = new Set([...page.sessions, ...(page.pinned ?? [])].map((row) => row.id));
+  const open = new Set(openIds);
+  const kept = prev.filter((row) => {
+    if (served.has(row.id) || open.has(row.id) || !inPageClass(row, window)) return true;
+    if (row.pinned && !window.archived) return false;
+    return window.floor !== null && activityOf(row) < window.floor;
+  });
+  return upsertSessions(kept, [...(page.pinned ?? []), ...page.sessions]);
+}
+
+export function mergeChildren(prev: CoreSession[], rootId: string, children: readonly CoreSession[]): CoreSession[] {
+  const below = new Set(descendantsOf(prev, rootId).map(({ session }) => session.id));
+  const served = new Set(children.map((row) => row.id));
+  return upsertSessions(
+    prev.filter((row) => !below.has(row.id) || served.has(row.id)),
+    children,
+  );
 }
 
 export function markWorking(list: CoreSession[], threadRef: string): CoreSession[] {
@@ -175,19 +234,41 @@ export function applySessionState(
 export interface RowIndicators {
   working: boolean;
   awaiting: boolean;
-  background: { jobs: number; watches: number; crons: number; label: string } | null;
+  background: BackgroundCounts | null;
+}
+
+export interface BackgroundCounts {
+  jobs: number;
+  watches: number;
+  crons: number;
+  subagents: number;
+  goal: boolean;
+  label: string;
 }
 
 export function backgroundLabel(
   jobs: number,
   watches: number,
   crons: number,
-): { jobs: number; watches: number; crons: number; label: string } | null {
+  subagents = 0,
+  subagentsWaiting = 0,
+  goal?: { activeMs: number; runningSince?: number; floor?: Record<string, number> },
+  now = Date.now(),
+): BackgroundCounts | null {
   const parts: string[] = [];
+  if (goal)
+    parts.push(
+      `goal · ${goalWorkedLabel(goal.activeMs + (goal.runningSince ? Math.max(0, now - goal.runningSince) : 0), goalFloorLabel(goal.floor ?? null))}`,
+    );
+  if (subagents > 0) parts.push(`${subagents} subagent${subagents === 1 ? "" : "s"} running`);
+  if (subagentsWaiting > 0)
+    parts.push(`${subagentsWaiting} subagent${subagentsWaiting === 1 ? " needs" : "s need"} you`);
   if (jobs > 0) parts.push(`${jobs} background job${jobs === 1 ? "" : "s"} running`);
   if (watches > 0) parts.push(`${watches} watch${watches === 1 ? "" : "es"} armed`);
   if (crons > 0) parts.push(`${crons} cron${crons === 1 ? "" : "s"} scheduled here`);
-  return parts.length ? { jobs, watches, crons, label: parts.join(" · ") } : null;
+  return parts.length
+    ? { jobs, watches, crons, subagents: subagents + subagentsWaiting, goal: Boolean(goal), label: parts.join(" · ") }
+    : null;
 }
 
 export function watchActivityLabel(w: { lastFiredAt?: number }): string {
@@ -196,10 +277,18 @@ export function watchActivityLabel(w: { lastFiredAt?: number }): string {
 
 export function rowIndicators(s: CoreSession, liveThreads: ReadonlySet<string> | string | null): RowIndicators {
   const live = typeof liveThreads === "string" ? new Set([liveThreads]) : (liveThreads ?? new Set<string>());
+  const children = s.subagents ?? { running: 0, waiting: 0 };
   return {
     working: Boolean(s.working) || (Boolean(s.threadRef) && live.has(s.threadRef)),
-    awaiting: Boolean(s.awaitingInput),
-    background: backgroundLabel(s.backgroundJobs ?? 0, s.watches ?? 0, s.crons ?? 0),
+    awaiting: Boolean(s.awaitingInput) || children.waiting > 0,
+    background: backgroundLabel(
+      s.backgroundJobs ?? 0,
+      s.watches ?? 0,
+      s.crons ?? 0,
+      children.running,
+      children.waiting,
+      s.goal,
+    ),
   };
 }
 
@@ -210,4 +299,37 @@ export function conversationBackground(
 ): RowIndicators["background"] {
   const row = list.find((s) => (sessionId ? s.id === sessionId : Boolean(threadRef) && s.threadRef === threadRef));
   return row ? rowIndicators(row, null).background : null;
+}
+
+export function shouldStartProactiveOpener(state: {
+  started: boolean;
+  sessionId: string | null;
+  scopeId: string | null;
+  messageCount: number;
+  loaded: boolean;
+  sessions: readonly Pick<CoreSession, "id" | "surface">[];
+}): boolean {
+  return (
+    !state.started &&
+    state.sessionId === null &&
+    state.scopeId === null &&
+    state.messageCount === 0 &&
+    state.loaded &&
+    !state.sessions.some((session) => session.id && !automationRunLabel(session))
+  );
+}
+
+export function cronRowMeta(c: SessionBackgroundView["crons"][number]): string {
+  const next = c.nextFireAt ? `next fire ${nextFireIn(c.nextFireAt)}` : "paused";
+  if (!c.lastFire) return next;
+  if (c.lastFire.status === "running") return `${next} · running now`;
+  return `${next} · last ${c.lastFire.status ?? "fired"} ${relTime(c.lastFire.firedAt)}`;
+}
+
+function nextFireIn(at: number): string {
+  const mins = Math.round((at - Date.now()) / 60_000);
+  if (mins <= 0) return "due now";
+  if (mins < 60) return `in ${mins}m`;
+  if (mins < 1440) return `in ${Math.floor(mins / 60)}h ${String(mins % 60).padStart(2, "0")}m`;
+  return `in ${Math.floor(mins / 1440)}d`;
 }

@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 import { createMemorySessionStore } from "../src/sessions/memory-session-store.ts";
 import type { SessionStore } from "../src/sessions/session-store.ts";
@@ -80,7 +80,7 @@ test("memory store: search ignores non-conversational entry types", async () => 
   const { lease } = await store.acquireLease(s.id);
   await store.append(lease!, {
     type: "tool_call",
-    payload: { text: "grep zanzibar" },
+    payload: { tool: "execute", callId: "c1", text: "grep zanzibar" },
     scopeLabel: scopeId("personal", "U1"),
   });
   await store.append(lease!, {
@@ -103,6 +103,13 @@ test("app.searchSessions decorates hits with session metadata and enforces visib
     "let's plan the zanzibar trip",
     "Zanzibar it is — I drafted an itinerary.",
   ]);
+  const { lease } = await sessions.acquireLease(id);
+  await sessions.append(lease!, {
+    type: "tool_result",
+    payload: { tool: "execute", callId: "c1", text: "zanzibar weather outputonly" },
+    scopeLabel: scopeId("personal", "U1"),
+  });
+  await sessions.releaseLease(lease!);
   await sessions.updateTitle(id, "Trip planning");
   await seed(sessions, "web:U2:other", "U2", ["zanzibar for U2 only"]);
 
@@ -112,6 +119,7 @@ test("app.searchSessions decorates hits with session metadata and enforces visib
   sessions.getForParticipant = async () => {
     throw new Error("search must not read legacy message activity");
   };
+  assert.deepEqual(await app.searchSessions("U1", "outputonly"), []);
   const hits = await app.searchSessions("U1", "zanzibar");
   assert.equal(hits.length, 2, "only U1's own conversation is searched");
   assert.ok(hits.every((h) => h.sessionId === id));
@@ -121,4 +129,18 @@ test("app.searchSessions decorates hits with session metadata and enforces visib
   assert.equal(hits[1]!.author, "josh");
 
   assert.deepEqual(await app.searchSessions("U1", ""), [], "empty query is empty, not an error");
+});
+
+test("app.searchSessions finds sessions by title", async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), "search-"));
+  const { app, sessions } = buildApp(testConfig({ dataDir }));
+
+  const id = await seed(sessions, "web:U1:titled", "U1", ["hello there"]);
+  await sessions.updateTitle(id, "Quarterly roadmap review");
+  await seed(sessions, "web:U2:other2", "U2", ["hello there"]);
+
+  const byTitle = await app.searchSessions("U1", "roadmap");
+  assert.ok(byTitle.some((h) => h.sessionId === id && h.entryType === "title"));
+
+  assert.deepEqual(await app.searchSessions("U2", "roadmap"), [], "title matches respect participation");
 });

@@ -62,6 +62,13 @@ async function resolveSurfaceTarget(
   return { source: dest.type, target: { conversationTarget: dest.target } };
 }
 
+async function rateLimitRecipient(ctx: ApiCtx): Promise<Pick<SurfaceContextQuery, "rateLimitRecipient">> {
+  const cap = ctx.capability;
+  if (!cap?.liveActor || cap.destination?.type !== "slack" || !cap.destination.target) return {};
+  const member = await ctx.app.directoryMember(cap.actorId);
+  return { rateLimitRecipient: { target: cap.destination.target, user: member?.slackId ?? cap.actorId } };
+}
+
 async function createSurfaceContextRequest(ctx: ApiCtx): Promise<void> {
   const { res, app, body, capability } = ctx;
   if (!capability) {
@@ -84,8 +91,10 @@ async function createSurfaceContextRequest(ctx: ApiCtx): Promise<void> {
     ...resolved.target,
     viewer: capability.actorId,
     count,
+    ...(await rateLimitRecipient(ctx)),
     ...(before ? { before } : {}),
     ...(match ? { match } : {}),
+    ...(b.live === true ? { live: true } : {}),
   };
   const request = await app.createContextRequest(resolved.source, query);
   return awaitFulfillment(ctx, request.id, query.channelName);
@@ -112,6 +121,7 @@ async function createSurfaceFileRequest(ctx: ApiCtx): Promise<void> {
   const query: SurfaceContextQuery = {
     ...resolved.target,
     count: 1,
+    ...(await rateLimitRecipient(ctx)),
     file: { ts, ...(threadTs ? { threadTs } : {}), ...(name ? { name } : {}) },
   };
   const request = await app.createContextRequest(resolved.source, query);
@@ -176,6 +186,7 @@ function awaitFileFulfillment(ctx: ApiCtx, requestId: string): Promise<void> {
         exp: Date.now() + FILE_DOWNLOAD_TTL_MS,
       },
       (ctx.deps.capabilitySecret ?? secret)!,
+      ctx.deps.capabilityTokenCompression,
     );
     const { blobId, ...meta } = file;
     return sendJson(res, 200, {
@@ -230,6 +241,8 @@ async function fulfillContextRequest(ctx: ApiCtx): Promise<void> {
             ...(typeof b.hasMore === "boolean" ? { hasMore: b.hasMore } : {}),
             ...(typeof b.nextBefore === "string" ? { nextBefore: b.nextBefore } : {}),
             ...(typeof b.note === "string" ? { note: b.note } : {}),
+            ...(Array.isArray(b.selfTs) ? { selfTs: b.selfTs.filter((ts) => typeof ts === "string") } : {}),
+            ...(b.liveSearch === "unconfigured" || b.liveSearch === "unconnected" ? { liveSearch: b.liveSearch } : {}),
             ...(file ? { file } : {}),
             ...(group ? { group } : {}),
           } satisfies SurfaceContextResult,
@@ -243,8 +256,21 @@ async function fulfillContextRequest(ctx: ApiCtx): Promise<void> {
 }
 
 export const contextRoutes: ReadonlyArray<Route<ApiCtx>> = [
-  { method: "POST", path: "/v1/surface-context", auth: "either", handle: createSurfaceContextRequest },
-  { method: "POST", path: "/v1/surface-file", auth: "either", handle: createSurfaceFileRequest },
+  {
+    method: "POST",
+    path: "/v1/surface-context",
+    actor: "system",
+    auth: "either",
+    allowedInStrict: true,
+    handle: createSurfaceContextRequest,
+  },
+  { method: "POST", path: "/v1/surface-file", actor: "system", auth: "either", handle: createSurfaceFileRequest },
   { method: "GET", path: "/v1/surface-context/pending", auth: "source", handle: listPendingContextRequests },
-  { method: "POST", path: "/v1/surface-context/:id/result", auth: "source", handle: fulfillContextRequest },
+  {
+    method: "POST",
+    path: "/v1/surface-context/:id/result",
+    actor: "system",
+    auth: "source",
+    handle: fulfillContextRequest,
+  },
 ];

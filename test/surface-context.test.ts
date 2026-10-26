@@ -5,11 +5,12 @@ import type { Server } from "node:http";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildApp, type BuiltApp } from "../src/wiring.ts";
+import { type BuiltApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { createServer } from "../src/api/server.ts";
 import { scopeId } from "../src/types.ts";
 import { mintCapabilityToken, verifyCapabilityToken, CAPABILITY_TTL_MS } from "../src/auth/capability-token.ts";
-import { signedRequestHeaders } from "../src/auth/source-auth-sign.ts";
+import { signedRequestHeaders } from "../plugins/chassis/src/source-auth-sign.ts";
 import { testConfig } from "./support/test-config.ts";
 
 const SECRET = "surface-context-test-secret".repeat(3);
@@ -105,6 +106,8 @@ describe("surface-context pulls", async () => {
       messages: [{ ts: "1699.0001", author: "Alice", text: "deploy went out" }],
       hasMore: true,
       nextBefore: "1699.0001",
+      selfTs: ["1699.0001", 7],
+      liveSearch: "unconnected",
     }));
     assert.equal(
       query.conversationTarget,
@@ -119,8 +122,37 @@ describe("surface-context pulls", async () => {
     assert.equal(body.messages[0].text, "deploy went out");
     assert.equal(body.hasMore, true);
     assert.equal(body.nextBefore, "1699.0001");
+    assert.deepEqual(body.selfTs, ["1699.0001"]);
+    assert.equal(body.liveSearch, "unconnected");
     const pending = await (await signedGet(pendingPath())).json();
     assert.deepEqual((pending as any).requests, []);
+  });
+
+  it("passes an explicit live read through the authorized context route", async () => {
+    const asking = post("/v1/surface-context", { live: true }, { "x-agent-capability": await cap() });
+    const query = await fulfillNext(() => ({ messages: [] }));
+    assert.equal(query.live, true);
+    assert.equal(query.conversationTarget, "C9:1700.0001");
+    assert.equal((await asking).status, 200);
+  });
+
+  it("only live capabilities supply the original requester target, ignoring body overrides", async () => {
+    for (const path of ["/v1/surface-context", "/v1/surface-file"]) {
+      for (const liveActor of [true, false]) {
+        const asking = post(
+          path,
+          {
+            channel: "#eng",
+            ts: "1700.1",
+            rateLimitRecipient: { target: "SECRET", user: "OTHER" },
+          },
+          { "x-agent-capability": await cap({ liveActor }) },
+        );
+        const query = await fulfillNext(() => ({ messages: [] }));
+        assert.deepEqual(query.rateLimitRecipient, liveActor ? { target: "C9:1700.0001", user: "U1" } : undefined);
+        await asking;
+      }
+    }
   });
 
   it("resolves a public channel by name through the directory", async () => {

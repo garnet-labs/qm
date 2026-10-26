@@ -29,3 +29,9 @@ export function pgTextSafe(s: string): string {
   if (hasLoneSurrogate(out)) out = out.replace(LONE_SURROGATE_ALL, "\uFFFD");
   return out;
 }
+
+export function outermostJsonObject(text: string): string | undefined {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  return start === -1 || end < start ? undefined : text.slice(start, end + 1);
+}

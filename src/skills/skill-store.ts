@@ -4,6 +4,7 @@ import type { ScopeId } from "../types.ts";
 import { parseScopeId } from "../types.ts";
 import { createMemoryMap, type DurableMap } from "../persistence/durable-map.ts";
 import { assertSafeSkillName, isSafeSkillName } from "./skill-name.ts";
+import { createMemoryAdvisoryLock, type AdvisoryLock } from "../persistence/advisory-lock.ts";
 
 type SkillStatus = "draft" | "reviewed" | "published" | "archived";
 
@@ -77,11 +78,13 @@ export interface SkillResolution {
 export interface SkillStoreOptions {
   signingSecret?: string;
   backing?: DurableMap<Skill>;
+  advisoryLock?: AdvisoryLock;
 }
 
 export interface SkillStore {
   create(input: { scopeId: ScopeId; manifest: SkillManifest; createdBy: string; pack?: Skill["pack"] }): Promise<Skill>;
   update(id: string, manifest: SkillManifest): Promise<Skill>;
+  withNameLock?<T>(scopeId: ScopeId, name: string, fn: () => Promise<T>): Promise<T>;
   get(id: string): Promise<Skill | null>;
   list(): Promise<Skill[]>;
   verify(skill: Skill): boolean;
@@ -101,8 +104,10 @@ function scopeKind(scopeId: ScopeId): string {
   return parseScopeId(scopeId).kind ?? scopeId;
 }
 
-function publishedByScopeAndName(all: Skill[]): Map<string, Skill> {
-  const index = new Map<string, Skill>();
+export type SkillSummary = Pick<Skill, "id" | "scopeId" | "status"> & { manifest: Pick<SkillManifest, "name"> };
+
+function publishedByScopeAndName<T extends SkillSummary>(all: T[]): Map<string, T> {
+  const index = new Map<string, T>();
   for (const s of all) {
     if (s.status !== "published") continue;
     const key = `${s.scopeId}\u0000${s.manifest.name}`;
@@ -111,16 +116,63 @@ function publishedByScopeAndName(all: Skill[]): Map<string, Skill> {
   return index;
 }
 
-function resolveFromIndex(index: Map<string, Skill>, name: string, orderedScopes: ScopeId[]): SkillResolution {
+function resolveFromIndex<T extends SkillSummary>(
+  index: Map<string, T>,
+  name: string,
+  orderedScopes: ScopeId[],
+): { skill: T | null; shadowed: T[] } {
   if (!isSafeSkillName(name)) return { skill: null, shadowed: [] };
-  const published = orderedScopes.map((sc) => index.get(`${sc}\u0000${name}`)).filter((s): s is Skill => Boolean(s));
+  const published = orderedScopes.map((sc) => index.get(`${sc}\u0000${name}`)).filter((s): s is T => Boolean(s));
   const [skill, ...shadowed] = published;
   return { skill: skill ?? null, shadowed };
+}
+
+export function visibleSkillRows<T extends SkillSummary>(
+  all: T[],
+  orderedScopes: ScopeId[],
+  granted?: readonly GrantedSkillRef[],
+): Array<{ skill: T; shadowed: T[] }> {
+  const index = publishedByScopeAndName(all);
+  const inScope = new Set(orderedScopes);
+  const names = [
+    ...new Set(
+      all
+        .filter((s) => s.status === "published" && inScope.has(s.scopeId) && isSafeSkillName(s.manifest.name))
+        .map((s) => s.manifest.name),
+    ),
+  ];
+  const visible = names
+    .map((n) => resolveFromIndex(index, n, orderedScopes))
+    .filter((r): r is { skill: T; shadowed: T[] } => r.skill !== null);
+  if (granted?.length) {
+    const byId = new Map(all.map((skill) => [skill.id, skill]));
+    const byName = new Map(visible.map((r) => [r.skill.manifest.name, r]));
+    const seen = new Set<string>();
+    for (const ref of granted) {
+      if (seen.has(ref.id)) continue;
+      seen.add(ref.id);
+      const s = byId.get(ref.id);
+      if (!s || s.status !== "published" || s.scopeId !== ref.ownerScopeId || !isSafeSkillName(s.manifest.name))
+        continue;
+      const existing = byName.get(s.manifest.name);
+      if (existing) {
+        if (existing.skill.id !== s.id && !existing.shadowed.some((x) => x.id === s.id)) existing.shadowed.push(s);
+        continue;
+      }
+      const r = { skill: s, shadowed: [] as T[] };
+      byName.set(s.manifest.name, r);
+      visible.push(r);
+    }
+  }
+  return visible;
 }
 
 export function createSkillStore(opts: SkillStoreOptions = {}): SkillStore {
   const skills = opts.backing ?? createMemoryMap<Skill>();
   const secret = opts.signingSecret ?? randomUUID();
+  const advisoryLock = opts.advisoryLock ?? createMemoryAdvisoryLock();
+  const withNameLock = <T>(scopeId: ScopeId, name: string, fn: () => Promise<T>) =>
+    advisoryLock.withLock(`skill-name:${scopeId}:${name}`, fn);
 
   function sign(manifest: SkillManifest): string {
     const files = canonicalFiles(manifest.files);
@@ -135,6 +187,7 @@ export function createSkillStore(opts: SkillStoreOptions = {}): SkillStore {
   }
 
   return {
+    withNameLock,
     async create(input) {
       assertSafeSkillName(input.manifest.name);
       const at = Date.now();
@@ -203,13 +256,17 @@ export function createSkillStore(opts: SkillStoreOptions = {}): SkillStore {
     },
 
     async archive(id) {
-      const s = await skills.get(id);
-      if (!s) throw new Error(`unknown skill: ${id}`);
-      if (s.status === "archived") return s;
-      s.status = "archived";
-      s.updatedAt = Date.now();
-      await skills.put(s.id, s);
-      return s;
+      const existing = await skills.get(id);
+      if (!existing) throw new Error(`unknown skill: ${id}`);
+      return withNameLock(existing.scopeId, existing.manifest.name, async () => {
+        const s = await skills.get(id);
+        if (!s) throw new Error(`unknown skill: ${id}`);
+        if (s.status === "archived") return s;
+        s.status = "archived";
+        s.updatedAt = Date.now();
+        await skills.put(s.id, s);
+        return s;
+      });
     },
 
     async restore(skill) {
@@ -231,39 +288,7 @@ export function createSkillStore(opts: SkillStoreOptions = {}): SkillStore {
 
     async visibleFor(orderedScopes, granted) {
       const all = await skills.all();
-      const index = publishedByScopeAndName(all);
-      const inScope = new Set(orderedScopes);
-      const names = [
-        ...new Set(
-          all
-            .filter((s) => s.status === "published" && inScope.has(s.scopeId) && isSafeSkillName(s.manifest.name))
-            .map((s) => s.manifest.name),
-        ),
-      ];
-      const visible = names
-        .map((n) => resolveFromIndex(index, n, orderedScopes))
-        .filter((r): r is SkillResolution & { skill: Skill } => r.skill !== null);
-      if (granted?.length) {
-        const byId = new Map(all.map((skill) => [skill.id, skill]));
-        const byName = new Map(visible.map((r) => [r.skill.manifest.name, r]));
-        const seen = new Set<string>();
-        for (const ref of granted) {
-          if (seen.has(ref.id)) continue;
-          seen.add(ref.id);
-          const s = byId.get(ref.id);
-          if (!s || s.status !== "published" || s.scopeId !== ref.ownerScopeId || !isSafeSkillName(s.manifest.name))
-            continue;
-          const existing = byName.get(s.manifest.name);
-          if (existing) {
-            if (existing.skill.id !== s.id && !existing.shadowed.some((x) => x.id === s.id)) existing.shadowed.push(s);
-            continue;
-          }
-          const r = { skill: s, shadowed: [] as Skill[] };
-          byName.set(s.manifest.name, r);
-          visible.push(r);
-        }
-      }
-      return visible;
+      return visibleSkillRows(all, orderedScopes, granted);
     },
 
     async promote(id, targetScopeId) {

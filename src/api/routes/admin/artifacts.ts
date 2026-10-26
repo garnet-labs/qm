@@ -1,3 +1,6 @@
+import { isDeepStrictEqual } from "node:util";
+import { isCronRuntime } from "../../../cron/runtime.ts";
+import { errMessage } from "../../../util/errors.ts";
 import { parseScopeId, type Destination } from "../../../types.ts";
 import { publicUrlOf } from "../../../deploy/deploy-store.ts";
 import { sendJson } from "../../http.ts";
@@ -5,7 +8,6 @@ import { audit, requireScopedAdmin } from "../shared.ts";
 import { type ApiCtx } from "../route.ts";
 import { notifyOwnerOfCronEdit } from "../../../triggers/edit-notice.ts";
 import { requireScopedResource } from "./common.ts";
-import { withoutFireLog } from "../crons.ts";
 
 function isAdminCronDestination(v: unknown): v is Destination {
   if (typeof v !== "object" || v === null) return false;
@@ -40,6 +42,9 @@ export async function listAdminArtifacts(ctx: ApiCtx): Promise<void> {
         enabled: c.enabled,
         archived: c.archived,
         schedule: c.schedule,
+        runtime: c.runtime,
+        loopId: c.loopId,
+        unattendedGrants: c.unattendedGrants,
         destination: c.destination,
         createdAt: c.createdAt,
         lastFiredAt: c.lastFiredAt,
@@ -85,6 +90,39 @@ export async function listAdminArtifacts(ctx: ApiCtx): Promise<void> {
   return sendJson(res, 200, { scopeId: scope, skills });
 }
 
+export async function putAdminCronRuntime(ctx: ApiCtx): Promise<void> {
+  const { res, app, deps, params, body } = ctx;
+  const id = params.id!;
+  const scoped = await requireScopedResource(
+    ctx,
+    () => app.getCron(id),
+    (cron) => cron.ownerScopeId,
+    "cron",
+  );
+  if (!scoped) return;
+  if (
+    typeof body !== "object" ||
+    body === null ||
+    !("runtime" in body) ||
+    Object.keys(body).some((key) => key !== "runtime") ||
+    body.runtime === undefined ||
+    !isCronRuntime(body.runtime)
+  )
+    return sendJson(res, 400, { error: "bad_request", message: "runtime is required; use null to inherit" });
+  try {
+    const updated = await app.setCronRuntime(id, body.runtime);
+    audit(deps, {
+      principalId: scoped.actor.id,
+      action: "cron.runtime.update",
+      resource: id,
+      scopeLabel: scoped.record.ownerScopeId,
+    });
+    return sendJson(res, 200, { cron: updated ? { id: updated.id, runtime: updated.runtime } : null });
+  } catch (error) {
+    return sendJson(res, 400, { error: "bad_request", message: errMessage(error) });
+  }
+}
+
 export async function putAdminCronDestination(ctx: ApiCtx): Promise<void> {
   const { res, app, deps, params, body } = ctx;
   const id = params.id!;
@@ -99,6 +137,11 @@ export async function putAdminCronDestination(ctx: ApiCtx): Promise<void> {
   if (typeof body !== "object" || body === null || !("destination" in body)) {
     return sendJson(res, 400, { error: "bad_request", message: "destination is required; use null to clear" });
   }
+  if ((cron.unattendedGrants?.length ?? 0) > 0)
+    return sendJson(res, 409, {
+      error: "conflict",
+      message: "this cron carries unattended admin read grants, so only its owner can change where it delivers",
+    });
   const destination = (body as { destination: unknown }).destination;
   if (destination !== null && !isAdminCronDestination(destination)) {
     return sendJson(res, 400, {
@@ -107,12 +150,13 @@ export async function putAdminCronDestination(ctx: ApiCtx): Promise<void> {
     });
   }
   const next = destination === null ? undefined : destination;
+  if (isDeepStrictEqual(cron.destination, next))
+    return sendJson(res, 200, { cron: { id: cron.id, destination: cron.destination } });
   const updated = await app.setCronDestination(id, next);
   await notifyOwnerOfCronEdit(app, {
     cron,
     editorId: actor.id,
     changeSummary: ["destination"],
-    editFingerprint: `destination:${next?.target ?? "cleared"}`,
   });
   audit(deps, {
     principalId: actor.id,
@@ -120,7 +164,7 @@ export async function putAdminCronDestination(ctx: ApiCtx): Promise<void> {
     resource: id,
     scopeLabel: cron.ownerScopeId,
   });
-  return sendJson(res, 200, { cron: updated ? withoutFireLog(updated) : null });
+  return sendJson(res, 200, { cron: updated ? { id: updated.id, destination: updated.destination } : null });
 }
 
 export async function getAdminSkill(ctx: ApiCtx): Promise<void> {

@@ -23,6 +23,49 @@ const backends: Backend[] = [{ name: "memory", make: () => createMemoryRunStore(
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 for (const backend of backends) {
+  test(`[${backend.name}] conversation lookup includes independent tasks and status context but excludes neighboring DMs`, async () => {
+    const { runs } = backend.make();
+    for (const ref of ["dm:D1", "dm:D1:task:a", "dm:D1:status:b", "dm:D11:task:c", "dm:D2"]) {
+      await runs.enqueue({ sessionId: ref, request: turn(ref) });
+    }
+    assert.deepEqual((await runs.list({ threadRef: "dm:D1" })).map((run) => run.sessionId).sort(), [
+      "dm:D1",
+      "dm:D1:status:b",
+      "dm:D1:task:a",
+    ]);
+  });
+
+  test(`[${backend.name}] terminalFinished pages finished runs by (finishedAt, id) within the bound`, async () => {
+    const { runs } = backend.make();
+    const finished: string[] = [];
+    for (const ref of ["a", "b", "c"]) {
+      const run = (await runs.enqueue({ sessionId: ref, request: turn(ref) })).run;
+      const claimed = await runs.claimForSession(ref, "w", 5_000);
+      await runs.complete(run.id, claimed?.leaseToken ?? "", { status: "ok", reply: ref });
+      finished.push(run.id);
+    }
+    await runs.enqueue({ sessionId: "pending", request: turn("pending") });
+    const running = (await runs.enqueue({ sessionId: "running", request: turn("running") })).run;
+    await runs.claimForSession("running", "w", 5_000);
+    const far = Date.now() + 60_000;
+    const all = await runs.terminalFinished({ finishedAt: 0, id: "" }, far, 10);
+    assert.deepEqual(new Set(all.map((run) => run.id)), new Set(finished), "only terminal runs are listed");
+    assert.ok(!all.some((run) => run.id === running.id));
+    for (let i = 1; i < all.length; i++) {
+      const prev = all[i - 1]!;
+      const next = all[i]!;
+      assert.ok(prev.finishedAt! < next.finishedAt! || (prev.finishedAt === next.finishedAt && prev.id < next.id));
+    }
+    const first = await runs.terminalFinished({ finishedAt: 0, id: "" }, far, 2);
+    const rest = await runs.terminalFinished({ finishedAt: first[1]!.finishedAt!, id: first[1]!.id }, far, 2);
+    assert.deepEqual(
+      [...first, ...rest].map((run) => run.id),
+      all.map((run) => run.id),
+      "keyset paging is gapless",
+    );
+    assert.deepEqual(await runs.terminalFinished({ finishedAt: 0, id: "" }, all[0]!.finishedAt! - 1, 10), []);
+  });
+
   test(`[${backend.name}] enqueue dedups by dedup key`, async () => {
     const { runs } = backend.make();
     const a = await runs.enqueue({ sessionId: "s1", request: turn("hi"), dedupKey: "k1" });
@@ -166,6 +209,19 @@ for (const backend of backends) {
     assert.equal(await runs.claim("w3", 5_000), null);
   });
 
+  test(`[${backend.name}] inline claims cannot overtake an earlier pending run`, async () => {
+    const { runs } = backend.make();
+    const unrelated = (await runs.enqueue({ sessionId: "unrelated", request: turn("other") })).run;
+    const first = (await runs.enqueue({ sessionId: "inline-order", request: turn("first") })).run;
+    const second = (await runs.enqueue({ sessionId: "inline-order", request: turn("second") })).run;
+    assert.equal(await runs.claimById(second.id, "second-worker", 5_000), null);
+    const claimedFirst = await runs.claimForSession("inline-order", "first-worker", 5_000);
+    assert.equal((await runs.get(unrelated.id))?.status, "pending");
+    assert.equal(claimedFirst?.id, first.id);
+    await runs.complete(first.id, claimedFirst!.leaseToken!, { status: "ok" });
+    assert.equal((await runs.claimById(second.id, "second-worker", 5_000))?.id, second.id);
+  });
+
   test(`[${backend.name}] lease fencing on heartbeat/complete`, async () => {
     const { runs } = backend.make();
     const r = (await runs.enqueue({ sessionId: "s1", request: turn("hi") })).run;
@@ -206,6 +262,33 @@ for (const backend of backends) {
     assert.equal(reclaimed?.id, r.id);
     assert.equal(reclaimed?.attempts, 2, "reclaim treated as a retry");
     assert.equal(reclaimed?.errorAttempts, 0);
+  });
+
+  test(`[${backend.name}] a requeued run records why its last attempt stopped`, async () => {
+    const { runs } = backend.make();
+    const r = (await runs.enqueue({ sessionId: "s1", request: turn("long turn") })).run;
+    assert.equal((await runs.get(r.id))?.lastStop ?? null, null, "a fresh run has no stop cause");
+
+    const first = await runs.claim("w1", 60_000);
+    await runs.releaseLease(r.id, first!.leaseToken!, { kind: "shutdown" });
+    assert.deepEqual((await runs.get(r.id))?.lastStop, { kind: "shutdown" });
+
+    const second = await runs.claim("w1", 60_000);
+    const stop = { kind: "error" as const, code: "transient", status: 503 };
+    await runs.fail(r.id, second!.leaseToken!, "boom", { retry: true, stop });
+    assert.deepEqual((await runs.get(r.id))?.lastStop, stop);
+
+    await sleep(5);
+    const unstarted = await runs.claim("w1", 60_000);
+    await runs.releaseLease(r.id, unstarted!.leaseToken!);
+    assert.deepEqual((await runs.get(r.id))?.lastStop, stop, "a handback before the attempt started keeps the cause");
+
+    await sleep(5);
+    const third = await runs.claim("w1", 1);
+    assert.ok(third, "claimable once the retry delay passes");
+    await sleep(5);
+    await runs.reapExpired();
+    assert.deepEqual((await runs.get(r.id))?.lastStop, { kind: "lease_expired" });
   });
 
   test(`[${backend.name}] releaseLease with a wrong/stale token is a no-op`, async () => {
@@ -250,6 +333,22 @@ for (const backend of backends) {
     assert.equal(failed?.attempts, 1);
     assert.equal(failed?.result?.status, "failed");
     assert.equal(failed?.result?.reason, "provider rejected the request");
+  });
+
+  test(`[${backend.name}] a run that exhausts its attempts keeps the provider error code on its result`, async () => {
+    const { runs } = backend.make();
+    const r = (await runs.enqueue({ sessionId: "s1", request: turn("hi"), maxAttempts: 1 })).run;
+    const claimed = await runs.claim("w1", 5_000);
+    await runs.fail(r.id, claimed!.leaseToken!, "slow down", {
+      retry: true,
+      stop: { kind: "error", code: "rate_limit", status: 429 },
+    });
+    assert.deepEqual((await runs.get(r.id))?.result, {
+      status: "failed",
+      sessionId: "s1",
+      reason: "slow down",
+      errorCode: "rate_limit",
+    });
   });
 
   test(`[${backend.name}] reaper does not requeue a run that completed after its lease expired`, async () => {
@@ -335,6 +434,9 @@ for (const backend of backends) {
     assert.equal((await runs.get(r.id))?.deliveryState?.editRef, "171.002");
     assert.equal(await runs.setDeliveryState(r.id, claimed?.leaseToken ?? "", { editRef: "171.003" }), true);
     assert.equal((await runs.get(r.id))?.deliveryState?.editRef, "171.003");
+    assert.equal(await runs.setDeliveryState(r.id, claimed?.leaseToken ?? "", { replying: true }), true);
+    await runs.setDeliveryState(r.id, null, { editRef: "171.003" });
+    assert.deepEqual((await runs.get(r.id))?.deliveryState, { editRef: "171.003", replying: true });
     const seen: string[] = [];
     runs.onTerminal((run) => seen.push(`${run.id}:${run.status}:${run.deliveryState?.editRef ?? ""}`));
     await runs.complete(r.id, claimed?.leaseToken ?? "", { status: "ok", reply: "done" });
@@ -393,3 +495,29 @@ for (const backend of backends) {
     assert.equal(await runs.noteTurnUserSeq("missing-run", 1), false);
   });
 }
+
+test("editing pending text preserves identity, order, attachments and rejects stale or started edits", async () => {
+  const { runs } = createMemoryRunStore();
+  const request = {
+    ...turn("original"),
+    attachments: [{ name: "notes.txt", mimetype: "text/plain", sizeBytes: 5, blobId: "notes-blob" }],
+  };
+  const first = (await runs.enqueue({ sessionId: "edits", request, dedupKey: "edit-key" })).run;
+  const next = (await runs.enqueue({ sessionId: "edits", request: turn("next") })).run;
+  assert.equal(await runs.editPendingText(first.id, "revised", "original"), true);
+  assert.equal(await runs.editPendingText(first.id, "stale", "original"), false);
+  const saved = await runs.get(first.id);
+  assert.equal(saved?.request.text, "revised");
+  assert.equal(saved?.request.displayText, "revised");
+  assert.deepEqual(saved?.request.attachments, request.attachments);
+  assert.equal(saved?.dedupKey, "edit-key");
+  assert.deepEqual(
+    (await runs.inFlightForThread("edits")).map((run) => run.id),
+    [first.id, next.id],
+  );
+  const claimed = await runs.claimById(first.id, "worker", 1000);
+  assert.equal(claimed?.request.text, "revised");
+  assert.equal(await runs.editPendingText(first.id, "late", "revised"), false);
+  await runs.fail(first.id, claimed!.leaseToken!, "retry", { retry: true });
+  assert.equal(await runs.editPendingText(first.id, "retry edit", "revised"), false);
+});

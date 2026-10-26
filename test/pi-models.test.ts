@@ -14,6 +14,9 @@ import {
   MODEL_PROVIDERS,
   SELECTABLE_BASE_MODELS,
   contextTokenBudgetForModel,
+  codexProviderModelId,
+  codexSubscriptionModelId,
+  modelSupportsFastMode,
 } from "../src/model/pi-models.ts";
 
 test("every selectable base model resolves against the pi-ai registry", () => {
@@ -34,6 +37,17 @@ test("selectable models span providers (multi-provider is wired)", () => {
   assert.ok(providers.has("openrouter"), "expected an OpenRouter-hosted open-model option");
 });
 
+test("codex subscription ids stay namespaced inside QM and bare toward the provider", () => {
+  assert.equal(codexSubscriptionModelId("gpt-5.6-sol"), "codex/gpt-5.6-sol");
+  assert.equal(codexSubscriptionModelId("codex/gpt-5.6-sol"), "codex/gpt-5.6-sol");
+  assert.equal(codexProviderModelId("codex/gpt-5.6-sol"), "gpt-5.6-sol");
+  assert.equal(codexProviderModelId("gpt-5.6-sol"), "gpt-5.6-sol");
+  const subscription = getRequiredModel("codex/gpt-5.6-sol");
+  assert.equal(subscription.id, "codex/gpt-5.6-sol");
+  assert.equal(String(subscription.provider), "openai-codex");
+  assert.equal(getRequiredModel(codexProviderModelId(subscription.id)).provider, "openai");
+});
+
 test("unknown models are not silently accepted", () => {
   assert.equal(resolveModel("claude-not-a-real-model"), undefined);
   assert.throws(() => getRequiredModel("claude-not-a-real-model"), /Unsupported model/);
@@ -42,11 +56,8 @@ test("unknown models are not silently accepted", () => {
 test("native harnesses reject cross-provider pins and choose their own defaults", () => {
   assert.equal(modelSupportedByHarness("claude-opus-4-8", "claude"), true);
   assert.equal(modelSupportedByHarness("gpt-5.6-sol", "claude"), false);
-  assert.equal(modelSupportedByHarness("gpt-5.6-sol", "codex"), true);
-  assert.equal(modelSupportedByHarness("claude-opus-4-8", "codex"), false);
   assert.equal(modelSupportedByHarness("claude-future-9", "claude"), true);
-  assert.equal(modelSupportedByHarness("gpt-future-9", "codex"), true);
-  assert.equal(defaultModelForHarness("codex", "claude-opus-4-8"), "gpt-5.6-sol");
+  assert.equal(defaultModelForHarness("claude", "gpt-5.6-sol"), "claude-opus-5");
 });
 
 test("the default base model follows the providers a deployment can actually bill", () => {
@@ -80,43 +91,82 @@ test("provider-blind callers and explicit pins keep the shipped default", () => 
 
 test("a provider that cannot serve a harness has no default model for it", () => {
   assert.equal(defaultModelForProvider("pi", "openrouter"), "openrouter/auto");
-  assert.equal(defaultModelForProvider("codex", "openai"), "gpt-5.6-sol");
   assert.equal(defaultModelForProvider("claude", "anthropic"), "claude-opus-5");
-  assert.equal(defaultModelForProvider("codex", "anthropic"), undefined, "the Codex CLI runs no Anthropic model");
   assert.equal(defaultModelForProvider("claude", "openrouter"), undefined, "the Claude CLI runs no OpenRouter model");
-  assert.equal(defaultModelForProvider("opencode", "openrouter"), undefined, "opencode has no OpenRouter route");
 });
 
 test("the curated catalog contains only current model families", () => {
   assert.deepEqual(
     SELECTABLE_BASE_MODELS.map((model) => model.id),
     [
+      "claude-opus-5-5",
       "claude-fable-5-1",
       "claude-fable-5",
       "claude-opus-5",
       "claude-opus-4-8",
+      "claude-sonnet-5-5",
       "claude-sonnet-5",
+      "claude-haiku-5-5",
       "claude-haiku-4-5",
       "gpt-5.6-sol",
       "gpt-5.6-terra",
       "gpt-5.6-luna",
       "gpt-6-astra",
+      "gpt-6-astra-ultrafast",
+      "gpt-6.1-sol",
+      "gpt-6.1-sol-ultrafast",
+      "gpt-6-sol",
+      "gpt-6-luna",
       "openrouter/auto",
     ],
   );
   assert.equal(getRequiredModel("gpt-5.6-sol").contextWindow, 1_050_000);
   assert.equal(getRequiredModel("gpt-6-astra").contextWindow, 1_050_000);
+  assert.equal(getRequiredModel("gpt-6-sol").contextWindow, 1_050_000);
+  assert.equal(getRequiredModel("gpt-6-luna").contextWindow, 1_050_000);
+  const sol61 = getRequiredModel("gpt-6.1-sol");
+  assert.equal(sol61.contextWindow, 1_050_000);
+  assert.equal(sol61.maxTokens, 128_000);
+  assert.equal(String(sol61.provider), "openai");
+  assert.equal(sol61.api, "openai-responses");
+  assert.deepEqual(sol61.cost, {
+    input: 2,
+    output: 10,
+    cacheRead: 0.1,
+    cacheWrite: 2.5,
+    tiers: [{ inputTokensAbove: 272_000, input: 4, output: 15, cacheRead: 0.2, cacheWrite: 5 }],
+  });
+  assert.equal(sol61.thinkingLevelMap?.off, null);
+  assert.equal(sol61.thinkingLevelMap?.minimal, null);
+  assert.equal(sol61.thinkingLevelMap?.max, "max");
+  assert.equal(modelSupportsFastMode("gpt-6.1-sol"), true);
+  assert.equal(contextTokenBudgetForModel("gpt-6.1-sol"), 150_000);
+  assert.deepEqual(getRequiredModel("gpt-6-sol").cost, {
+    input: 2,
+    output: 10,
+    cacheRead: 0.2,
+    cacheWrite: 2.5,
+    tiers: [{ inputTokensAbove: 272_000, input: 4, output: 15, cacheRead: 0.4, cacheWrite: 5 }],
+  });
+  assert.deepEqual(getRequiredModel("gpt-6-luna").cost, {
+    input: 0.1,
+    output: 0.5,
+    cacheRead: 0.01,
+    cacheWrite: 0.125,
+    tiers: [{ inputTokensAbove: 272_000, input: 0.2, output: 0.75, cacheRead: 0.02, cacheWrite: 0.25 }],
+  });
 });
 
 test("auxiliary models come from the configured base model's own provider", () => {
   assert.equal(
     auxiliaryModelFor("claude-opus-5"),
-    "claude-haiku-4-5",
+    "claude-haiku-5-5",
     "the deployment default resolves an Anthropic auxiliary",
   );
-  assert.equal(auxiliaryModelFor("claude-opus-4-8"), "claude-haiku-4-5");
-  assert.equal(auxiliaryModelFor("claude-fable-5-1"), "claude-haiku-4-5");
-  assert.equal(auxiliaryModelFor("claude-fable-5"), "claude-haiku-4-5");
+  assert.equal(auxiliaryModelFor("claude-opus-5-5"), "claude-haiku-5-5");
+  assert.equal(auxiliaryModelFor("claude-opus-4-8"), "claude-haiku-5-5");
+  assert.equal(auxiliaryModelFor("claude-fable-5-1"), "claude-haiku-5-5");
+  assert.equal(auxiliaryModelFor("claude-fable-5"), "claude-haiku-5-5");
   assert.equal(
     auxiliaryModelFor("gpt-5.6-sol"),
     "gpt-5.6-luna",
@@ -126,7 +176,7 @@ test("auxiliary models come from the configured base model's own provider", () =
 });
 
 test("the Anthropic auxiliary is resolvable by provider, so Anthropic-only surfaces keep working", () => {
-  assert.equal(auxiliaryModelForProvider("anthropic"), "claude-haiku-4-5");
+  assert.equal(auxiliaryModelForProvider("anthropic"), "claude-haiku-5-5");
   assert.equal(auxiliaryModelForProvider("openai"), "gpt-5.6-luna");
   assert.equal(auxiliaryModelForProvider("nope"), undefined);
 });
@@ -180,6 +230,27 @@ test("context token budget is half of each model's real input room", () => {
     tiers: undefined,
   });
   assert.equal(contextTokenBudgetForModel("claude-fable-5-1"), 150_000, "a 1M window is capped, not halved");
+  const opus55 = getRequiredModel("claude-opus-5-5");
+  assert.equal(opus55.contextWindow, 1_000_000);
+  assert.equal(opus55.maxTokens, 128_000);
+  assert.equal(String(opus55.provider), "anthropic");
+  assert.deepEqual(opus55.cost, { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5, tiers: undefined });
+  assert.equal(contextTokenBudgetForModel("claude-opus-5-5"), 150_000);
+  const sonnet55 = getRequiredModel("claude-sonnet-5-5");
+  assert.equal(sonnet55.contextWindow, 1_000_000);
+  assert.equal(sonnet55.maxTokens, 128_000);
+  assert.deepEqual(sonnet55.cost, { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5, tiers: undefined });
+  const haiku55 = getRequiredModel("claude-haiku-5-5");
+  assert.equal(haiku55.contextWindow, 1_000_000);
+  assert.equal(haiku55.maxTokens, 128_000);
+  assert.deepEqual(haiku55.cost, {
+    input: 0.1,
+    output: 0.5,
+    cacheRead: 0.01,
+    cacheWrite: 0.125,
+    tiers: [{ inputTokensAbove: 100_000, input: 0.5, output: 2.5, cacheRead: 0.05, cacheWrite: 0.625 }],
+  });
+  assert.equal(contextTokenBudgetForModel("claude-haiku-5-5"), 150_000);
   assert.equal(getRequiredModel("claude-fable-5").contextWindow, 1_000_000);
   assert.equal(contextTokenBudgetForModel("claude-fable-5"), 150_000);
   assert.equal(contextTokenBudgetForModel("gpt-5.6-sol"), 150_000);
@@ -204,4 +275,20 @@ test("personal models retain canonical endpoints when org endpoints are overridd
   } finally {
     setProviderBaseUrls({});
   }
+});
+
+test("registered OpenAI clones retain exact model identity on the Codex subscription transport", () => {
+  for (const id of ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"]) {
+    const api = getRequiredModel(id);
+    const subscription = getRequiredModel(codexSubscriptionModelId(id));
+    assert.equal(subscription.id, `codex/${id}`);
+    assert.equal(subscription.provider, "openai-codex");
+    assert.equal(subscription.api, "openai-codex-responses");
+    assert.equal(subscription.baseUrl, getRequiredModel("codex/gpt-5.6-sol").baseUrl);
+    assert.equal(subscription.contextWindow, api.contextWindow);
+    assert.equal(subscription.maxTokens, api.maxTokens);
+    assert.deepEqual(subscription.cost, api.cost);
+  }
+  assert.equal(resolveModel("codex/claude-opus-5"), undefined);
+  assert.equal(resolveModel("codex/unregistered-model"), undefined);
 });

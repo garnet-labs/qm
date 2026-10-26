@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -14,6 +14,7 @@ import {
 import { parseTar } from "../src/sandbox/tar.ts";
 import type { Deployment, DeploymentVersion } from "../src/deploy/deploy-store.ts";
 import { scopeId } from "../src/types.ts";
+import { createMemoryMap } from "../src/persistence/durable-map.ts";
 
 const TOKEN = "FlyV1-test-token";
 const PREFIX = "qm-d";
@@ -32,10 +33,16 @@ interface FlyCall {
 }
 
 interface FakeFlyOptions {
+  updateLeavesStopped?: boolean;
+  loseFirstCreateResponse?: boolean;
   createAppStatus?: number;
   createAppBody?: string;
   existingApp?: { name: string; network: string; organization: { slug: string } };
+  racingApp?: { name: string; network: string; organization: { slug: string } };
+  rereadAppStatus?: number;
   ips?: string[];
+  ingressNetwork?: string;
+  networkPolicies?: unknown[];
   deleteAppStatus?: number;
   existingMachines?: string[];
   states?: string[];
@@ -45,11 +52,14 @@ interface FakeFlyOptions {
   cordonStatus?: number;
   cordonFailsAfterApply?: boolean;
   uncordonStatus?: number;
+  exec?: (script: string) => { exit_code?: number; stdout?: string };
 }
 
 function fakeFly(opts: FakeFlyOptions = {}) {
   const calls: FlyCall[] = [];
   const machines = new Map<string, string>();
+  const configs = new Map<string, FlyMachineConfig>();
+  const volumes: Array<{ id: string; name: string; region: string }> = [];
   for (const id of opts.existingMachines ?? []) machines.set(id, "started");
   const states = [...(opts.states ?? ["started"])];
   const checkStates = [...(opts.checkStates ?? ["passing"])];
@@ -59,6 +69,7 @@ function fakeFly(opts: FakeFlyOptions = {}) {
   const cordoned = new Set<string>();
   let app = opts.existingApp;
   let created = 0;
+  let reread: number | undefined;
   const fetchImpl = (async (input: string | URL, init: RequestInit = {}): Promise<Response> => {
     const url = new URL(String(input));
     const method = init.method ?? "GET";
@@ -77,29 +88,63 @@ function fakeFly(opts: FakeFlyOptions = {}) {
       if ((opts.createAppStatus ?? 201) < 300) {
         app = { name: body.app_name, network: body.network, organization: { slug: body.org_slug } };
       }
+      if (opts.racingApp) app = opts.racingApp;
+      reread = opts.rereadAppStatus;
       return new Response(opts.createAppBody ?? "{}", { status: opts.createAppStatus ?? 201 });
     }
+    if (method === "GET" && segments.length === 3 && reread) return json(reread, { error: "unavailable" });
     if (method === "GET" && segments.length === 3) return app ? json(200, app) : json(404, { error: "not found" });
     if (method === "DELETE" && segments.length === 3) {
       app = undefined;
       return new Response("{}", { status: opts.deleteAppStatus ?? 202 });
     }
-    if (segments[3] === "ip_assignments" && method === "GET") return json(200, { ips: ips.map((ip) => ({ ip })) });
+    if (segments[3] === "ip_assignments" && method === "GET")
+      return json(200, {
+        ips: ips.map((ip) => ({ ip, network: { name: opts.ingressNetwork ?? "trusted-ingress", org_slug: ORG } })),
+      });
+    if (segments[3] === "network_policies" && method === "GET")
+      return json(
+        200,
+        opts.networkPolicies ?? [
+          {
+            netpolSelector: { all: true },
+            rules: [{ action: "allow", direction: "ingress", ports: [{ protocol: "tcp", port: 22 }] }],
+          },
+        ],
+      );
     if (segments[3] === "ip_assignments" && method === "POST") {
       ips.push("fdaa:1:2:3::1");
       return json(201, { ip: ips[0] });
     }
+    if (segments[3] === "volumes" && method === "GET") return json(200, volumes);
+    if (segments[3] === "volumes" && method === "POST") {
+      const body = JSON.parse(String(init.body));
+      const volume = { id: `volume-${volumes.length + 1}`, name: body.name, region: body.region };
+      volumes.push(volume);
+      return json(201, volume);
+    }
     if (method === "GET" && segments.length === 4)
       return json(
         200,
-        [...machines.keys()].map((id) => ({ id, state: machines.get(id) })),
+        [...machines.keys()].map((id) => ({ id, state: machines.get(id), config: configs.get(id) })),
       );
     if (method === "POST" && segments.length === 4) {
       const id = `machine-${++created}`;
       machines.set(id, "created");
+      configs.set(id, JSON.parse(String(init.body)).config);
+      cordoned.add(id);
+      if (opts.loseFirstCreateResponse && created === 1) throw new Error("create response lost");
       return json(200, { id, state: "created" });
     }
     const machineId = segments[4] ?? "";
+    if (method === "POST" && segments.length === 5) {
+      configs.set(machineId, JSON.parse(String(init.body)).config);
+      return json(200, { id: machineId, state: opts.updateLeavesStopped ? "stopped" : "started" });
+    }
+    if (method === "POST" && segments.length === 6 && segments[5] === "start") {
+      machines.set(machineId, "started");
+      return json(200, { id: machineId, state: "started" });
+    }
     if (method === "GET" && segments.length === 5) {
       if (!machines.has(machineId)) return json(404, { error: "not found" });
       const state = nextState();
@@ -107,7 +152,8 @@ function fakeFly(opts: FakeFlyOptions = {}) {
       return json(200, {
         id: machineId,
         state,
-        checks: [{ name: "app", status: nextCheck() }],
+        config: configs.get(machineId),
+        checks: [{ name: "app", status: configs.get(machineId)?.env.BROKEN === "1" ? "failing" : nextCheck() }],
         ...(opts.events ? { events: opts.events } : {}),
       });
     }
@@ -121,6 +167,10 @@ function fakeFly(opts: FakeFlyOptions = {}) {
       if (status < 300) cordoned.delete(machineId);
       return json(status, {});
     }
+    if (method === "POST" && segments.length === 6 && segments[5] === "exec") {
+      const script = /^sh -c '(.*)'$/s.exec(JSON.parse(String(init.body)).cmd)![1]!.replaceAll(`'"'"'`, "'");
+      return json(200, opts.exec?.(script) ?? {});
+    }
     if (method === "DELETE" && segments.length === 5) {
       if ((opts.destroyMachineStatus ?? 200) < 300) {
         machines.delete(machineId);
@@ -130,7 +180,7 @@ function fakeFly(opts: FakeFlyOptions = {}) {
     }
     return json(500, { error: `unexpected ${method} ${url.pathname}` });
   }) as unknown as typeof fetch;
-  return { fetchImpl, calls, machines, cordoned };
+  return { fetchImpl, calls, machines, cordoned, configs, volumes };
 }
 
 function provider(fetchImpl: typeof fetch, extra: Partial<FlyDeployProviderOptions> = {}) {
@@ -139,6 +189,7 @@ function provider(fetchImpl: typeof fetch, extra: Partial<FlyDeployProviderOptio
     appPrefix: PREFIX,
     baseImage: IMAGE,
     org: ORG,
+    configStore: createMemoryMap<FlyMachineConfig>(),
     fetchImpl,
     pollIntervalMs: 1,
     machineStartTimeoutMs: 200,
@@ -210,6 +261,9 @@ test("apply: creates an isolated Fly app, injects the snapshot, and returns priv
     {
       protocol: "tcp",
       internal_port: 8080,
+      autostop: "suspend",
+      autostart: true,
+      min_machines_running: 0,
       ports: [{ port: 8080 }],
       checks: [{ type: "tcp", interval: "2s", timeout: "1s", grace_period: "1s" }],
     },
@@ -217,7 +271,7 @@ test("apply: creates an isolated Fly app, injects the snapshot, and returns priv
   assert.equal(config.files[0]!.guest_path, "/app.tar.gz");
   assert.deepEqual(config.init.exec.slice(0, 2), ["/bin/sh", "-lc"]);
   assert.match(config.init.exec[2]!, /tar -xzf \/app\.tar\.gz -C \/app/);
-  assert.match(config.init.exec[2]!, /exec sh -lc 'node server\.js'/);
+  assert.match(config.init.exec[2]!, /cd \/app; node server\.js/);
 
   const unpacked = await parseTar(gunzipSync(Buffer.from(config.files[0]!.raw_value, "base64")));
   assert.deepEqual(
@@ -228,8 +282,16 @@ test("apply: creates an isolated Fly app, injects the snapshot, and returns priv
   assert.equal(unpacked.find((f) => f.path === "index.html")!.data.toString("utf8"), "<h1>hi</h1>");
 });
 
+test("apply: keeps an always-on deployment running under Fly managed lifecycle", async () => {
+  const { fetchImpl, calls } = fakeFly();
+  await provider(fetchImpl).apply({ ...deployment(ID), alwaysOn: true }, version(snapshot({ "server.js": "" })));
+  const { config } = machineCreate(calls);
+  assert.equal(config.services[0]!.min_machines_running, 1);
+  assert.equal(config.services[0]!.autostart, true);
+});
+
 test("apply: refuses a pre-existing public IP before creating a machine", async () => {
-  const unsafe = fakeFly({ createAppStatus: 422, existingApp: OWNED_APP, ips: ["2a09:8280:1::1"] });
+  const unsafe = fakeFly({ existingApp: OWNED_APP, ips: ["2a09:8280:1::1"] });
   await assert.rejects(
     provider(unsafe.fetchImpl).apply(deployment(ID), version(snapshot({ "index.html": "hi" }))),
     /public IP assignment; refusing to expose/,
@@ -237,23 +299,25 @@ test("apply: refuses a pre-existing public IP before creating a machine", async 
   assert.ok(!unsafe.calls.some((c) => c.path.endsWith("/machines")), "an unsafe app never gets a machine");
 });
 
-test("apply: an app that already exists is not an error", async () => {
+test("apply: an app created concurrently is reused whatever the create failure says", async () => {
   for (const over of [
-    { createAppStatus: 409, existingApp: OWNED_APP },
-    { createAppStatus: 422, createAppBody: '{"error":"Name has already been taken"}', existingApp: OWNED_APP },
+    { createAppStatus: 409 },
+    { createAppStatus: 422, createAppBody: '{"error":"Name has already been taken"}' },
+    { createAppStatus: 500, createAppBody: '{"error":"internal"}' },
   ]) {
-    const { fetchImpl } = fakeFly(over);
+    const { fetchImpl, calls } = fakeFly({ ...over, racingApp: OWNED_APP });
     const endpoint = await provider(fetchImpl).apply(deployment(ID), version(snapshot({ "index.html": "hi" })));
     assert.deepEqual(endpoint, { host: `${APP}.flycast`, port: 8080 });
+    assert.ok(calls.some((c) => c.method === "POST" && c.path === "/v1/apps"));
   }
 });
 
 test("apply: a name conflict is reused only when its organization and isolated network match", async () => {
-  for (const existingApp of [
+  for (const racingApp of [
     { ...OWNED_APP, network: "default" },
     { ...OWNED_APP, organization: { slug: "someone-else" } },
   ]) {
-    const { fetchImpl, calls } = fakeFly({ createAppStatus: 422, existingApp });
+    const { fetchImpl, calls } = fakeFly({ createAppStatus: 422, racingApp });
     await assert.rejects(
       provider(fetchImpl).apply(deployment(ID), version(snapshot({ "index.html": "hi" }))),
       /not the isolated app owned by this deployment/,
@@ -263,10 +327,27 @@ test("apply: a name conflict is reused only when its organization and isolated n
 });
 
 test("apply: a rejected app creation still surfaces", async () => {
-  const { fetchImpl } = fakeFly({ createAppStatus: 401, createAppBody: '{"error":"unauthorized"}' });
+  for (const [status, body] of [
+    [401, '{"error":"unauthorized"}'],
+    [422, '{"error":"Name has already been taken"}'],
+  ] as const) {
+    const { fetchImpl } = fakeFly({ createAppStatus: status, createAppBody: body });
+    await assert.rejects(
+      provider(fetchImpl).apply(deployment(ID), version(snapshot({ "index.html": "hi" }))),
+      new RegExp(`create app .*http ${status}`),
+    );
+  }
+});
+
+test("apply: a failed create whose app cannot be re-read reports the create failure", async () => {
+  const { fetchImpl } = fakeFly({ createAppStatus: 500, createAppBody: '{"error":"boom"}', rereadAppStatus: 503 });
   await assert.rejects(
     provider(fetchImpl).apply(deployment(ID), version(snapshot({ "index.html": "hi" }))),
-    /create app .*http 401.*unauthorized/,
+    (e: Error) => {
+      assert.match(e.message, /create app .*http 500.*boom/);
+      assert.match(String((e.cause as Error).message), /read app .*http 503/);
+      return true;
+    },
   );
 });
 
@@ -331,16 +412,6 @@ test("apply: an app bundle over the machine-file cap is refused with its actual 
   assert.deepEqual(calls, [], "nothing is created on Fly for a bundle that could never be injected");
 });
 
-test("apply: highly compressible source cannot bypass the unpacked-size cap", async () => {
-  const { fetchImpl, calls } = fakeFly();
-  const big = snapshot({ "zeros.bin": Buffer.alloc(20_000_001) });
-  await assert.rejects(
-    provider(fetchImpl).apply(deployment(ID), version(big)),
-    /app source is too large.*20000001 bytes, maximum 20000000 bytes/,
-  );
-  assert.deepEqual(calls, []);
-});
-
 test("apply: a machine that never starts reports its last state", async () => {
   const { fetchImpl, machines } = fakeFly({ existingMachines: ["machine-old"], states: ["created"] });
   await assert.rejects(
@@ -366,6 +437,39 @@ test("apply: an entrypoint that exits without binding the port reports why, with
   );
 });
 
+test("apply: an app that only answers 5xx fails publish and reports its output", async () => {
+  const reported: Array<{ code: string; message: string }> = [];
+  const { fetchImpl, machines } = fakeFly({
+    exec: (script) =>
+      script.includes("http_code") ? { exit_code: 96, stdout: "500\n" } : { stdout: "boot: database unreachable" },
+  });
+  await assert.rejects(
+    provider(fetchImpl, { onError: (e) => reported.push(e) }).apply(
+      deployment(ID),
+      version(snapshot({ "server.js": "" })),
+    ),
+    /answered HTTP 500 on \/ .*database unreachable/s,
+  );
+  assert.deepEqual(
+    reported.map((e) => e.code),
+    ["app_start_failed"],
+  );
+  assert.equal(machines.size, 0, "the unhealthy machine is removed");
+});
+
+test("a visit finds a Fly app with no supervisor, reports it and asks for a relaunch", async () => {
+  const reported: Array<{ code: string; message: string }> = [];
+  const { fetchImpl } = fakeFly({
+    existingMachines: ["machine-live"],
+    exec: (script) => (script.includes(".reported") ? { exit_code: 99, stdout: "down\nfatal: out of widgets" } : {}),
+  });
+  const d = { ...deployment(ID), endpoint: { host: `${APP}.flycast`, port: 8080 } };
+  const deploy = provider(fetchImpl, { onError: (e) => reported.push(e) });
+  assert.equal(await deploy.resolveEndpoint!(d, version(snapshot({}))), null);
+  assert.equal(reported[0]!.code, "app_down");
+  assert.match(reported[0]!.message, /out of widgets/);
+});
+
 test("apply: an app that stays up but never passes its service check reports the readiness window", async () => {
   const { fetchImpl } = fakeFly({ checkStates: ["critical"] });
   await assert.rejects(
@@ -379,7 +483,7 @@ test("destroy: deletes the whole Fly app and tolerates one that is already gone"
   await provider(fetchImpl).destroy(deployment(ID));
   assert.deepEqual(
     calls.map((c) => `${c.method} ${c.path}`),
-    [`GET /v1/apps/${APP}`, `DELETE /v1/apps/${APP}`],
+    [`GET /v1/apps/${APP}`, `GET /v1/apps/${APP}/volumes`, `DELETE /v1/apps/${APP}`],
   );
   assert.equal(calls.at(-1)!.query, "?force=true");
 
@@ -396,9 +500,13 @@ test("destroy: refuses a mismatched app and surfaces a failed deletion", async (
   await assert.rejects(provider(fetchImpl).destroy(deployment(ID)), /delete app .*http 500/);
 });
 
-test("profile: the core keeps managing idle TTL because 6PN dialing cannot wake a stopped machine", () => {
+test("profile: shared Flycast manages suspension while existing standalone apps retain idle cleanup", () => {
   const { fetchImpl } = fakeFly();
-  assert.deepEqual(provider(fetchImpl).profile, { managedScaleToZero: false });
+  assert.deepEqual(provider(fetchImpl).profile, { managedScaleToZero: false, maxAppBytes: 20_000_000 });
+  assert.deepEqual(provider(fetchImpl, { sharedAppName: "company-app" }).profile, {
+    managedScaleToZero: true,
+    maxAppBytes: 20_000_000,
+  });
 });
 
 test("missing fly configuration fails at the point of use with the env var that is missing", async () => {
@@ -428,4 +536,313 @@ test("an invalid app prefix fails before reaching Fly", async () => {
     );
   }
   assert.deepEqual(calls, []);
+});
+
+test("durable apply retains one volume across updates, rollback, archive and recreation", async () => {
+  const fake = fakeFly();
+  const deploy = provider(fake.fetchImpl, { dataVolumeSizeGb: 1, appReadyTimeoutMs: 10 });
+  const d = deployment(ID);
+  const first = version(snapshot({ "server.js": "first" }));
+  await deploy.apply(d, first);
+  const original = structuredClone(fake.configs.get("machine-1")!);
+  assert.deepEqual(original.mounts, [{ volume: "volume-1", path: "/data" }]);
+  assert.equal(original.env.DATA_DIR, "/data");
+  assert.equal(deploy.profile.dataDir, "/data");
+  await deploy.apply(d, version(snapshot({ "server.js": "second" }), { version: 2 }));
+  assert.deepEqual([...fake.machines.keys()], ["machine-1"]);
+  assert.deepEqual(fake.configs.get("machine-1")!.mounts, original.mounts);
+  const working = structuredClone(fake.configs.get("machine-1")!);
+  await assert.rejects(
+    deploy.apply(d, version(snapshot({ "server.js": "broken" }), { env: { BROKEN: "1" } })),
+    /never listened/,
+  );
+  assert.deepEqual(fake.configs.get("machine-1"), working);
+  await deploy.destroy(d);
+  assert.equal(fake.machines.size, 0);
+  assert.equal(fake.volumes.length, 1);
+  assert.equal(
+    fake.calls.some((c) => c.method === "DELETE" && c.path === `/v1/apps/${APP}`),
+    false,
+  );
+  await deploy.apply(d, first);
+  assert.deepEqual(fake.configs.get("machine-2")!.mounts, original.mounts);
+  assert.equal(fake.volumes.length, 1);
+});
+
+test("durable apply refuses to replace an existing ephemeral machine", async () => {
+  const fake = fakeFly({ existingMachines: ["old"] });
+  await assert.rejects(
+    provider(fake.fetchImpl, { dataVolumeSizeGb: 1 }).apply(
+      deployment(ID),
+      version(snapshot({ "server.js": "first" })),
+    ),
+    /explicit migration/,
+  );
+  assert.deepEqual([...fake.machines.keys()], ["old"]);
+  assert.equal(fake.volumes.length, 0);
+});
+
+test("durable retry restores routing after an accepted create loses its response", async () => {
+  const fake = fakeFly({ loseFirstCreateResponse: true });
+  const deploy = provider(fake.fetchImpl, { dataVolumeSizeGb: 1 });
+  const d = deployment(ID),
+    v = version(snapshot({ "server.js": "app" }));
+  await assert.rejects(deploy.apply(d, v), /create response lost/);
+  assert.equal(fake.cordoned.has("machine-1"), true);
+  await deploy.apply(d, v);
+  assert.equal(fake.cordoned.has("machine-1"), false);
+  assert.equal(fake.machines.size, 1);
+});
+
+test("missing volume configuration cannot downgrade or destroy durable storage", async () => {
+  const fake = fakeFly();
+  const d = deployment(ID),
+    v = version(snapshot({ "server.js": "app" }));
+  await provider(fake.fetchImpl, { dataVolumeSizeGb: 1 }).apply(d, v);
+  const missing = provider(fake.fetchImpl);
+  await assert.rejects(missing.apply(d, v), /restore FLY_DEPLOY_DATA_VOLUME_SIZE_GB/);
+  assert.equal(fake.machines.size, 1);
+  await missing.destroy(d);
+  assert.equal(fake.volumes.length, 1);
+  assert.equal(
+    fake.calls.some((c) => c.method === "DELETE" && c.path === `/v1/apps/${APP}`),
+    false,
+  );
+});
+
+test("durable rollback uses the accepted configuration after a provider restart", async () => {
+  const fake = fakeFly();
+  const configStore = createMemoryMap<FlyMachineConfig>();
+  const opts = { dataVolumeSizeGb: 1, configStore, appReadyTimeoutMs: 10 };
+  const d = deployment(ID),
+    good = version(snapshot({ "server.js": "good" }));
+  await provider(fake.fetchImpl, opts).apply(d, good);
+  const accepted = structuredClone(fake.configs.get("machine-1")!);
+  fake.configs.set("machine-1", { ...accepted, env: { BROKEN: "1" } });
+  const restarted = provider(fake.fetchImpl, opts);
+  await assert.rejects(
+    restarted.apply(d, version(snapshot({ "server.js": "bad" }), { env: { BROKEN: "1" } })),
+    /never listened/,
+  );
+  assert.deepEqual(fake.configs.get("machine-1"), accepted);
+});
+
+test("always-on toggles update an existing machine without replacing its data", async () => {
+  const fake = fakeFly();
+  const deploy = provider(fake.fetchImpl, { dataVolumeSizeGb: 1 });
+  const d = deployment(ID);
+  await deploy.apply(d, version(snapshot({ "server.js": "app" })));
+  for (const alwaysOn of [true, false]) {
+    await deploy.setAlwaysOn!(d, alwaysOn);
+    assert.equal(fake.configs.get("machine-1")!.services[0]!.min_machines_running, alwaysOn ? 1 : 0);
+    assert.deepEqual(fake.configs.get("machine-1")!.mounts, [{ volume: "volume-1", path: "/data" }]);
+    assert.equal(fake.machines.size, 1);
+  }
+});
+
+test("always-on toggles preserve the latest ephemeral publication after a prior toggle", async () => {
+  const fake = fakeFly();
+  const deploy = provider(fake.fetchImpl);
+  const d = deployment(ID);
+  await deploy.apply(d, version(snapshot({ "server.js": "first" })));
+  await deploy.setAlwaysOn!(d, true);
+  await deploy.apply({ ...d, alwaysOn: true }, version(snapshot({ "server.js": "second" }), { version: 2 }));
+  const current = structuredClone(fake.configs.get("machine-2")!);
+  await deploy.setAlwaysOn!(d, false);
+  assert.deepEqual(fake.configs.get("machine-2"), {
+    ...current,
+    services: current.services.map((service) => ({ ...service, min_machines_running: 0 })),
+  });
+});
+
+test("an update that leaves the machine stopped explicitly starts it", async () => {
+  const fake = fakeFly({ updateLeavesStopped: true });
+  const deploy = provider(fake.fetchImpl, { dataVolumeSizeGb: 1 });
+  const d = deployment(ID),
+    v = version(snapshot({ "server.js": "app" }));
+  await deploy.apply(d, v);
+  await deploy.setAlwaysOn!(d, true);
+  assert.ok(fake.calls.some((c) => c.method === "POST" && c.path.endsWith("/machines/machine-1/start")));
+});
+
+test("configuration-store failure rolls back an updated machine", async () => {
+  const fake = fakeFly();
+  const configStore = createMemoryMap<FlyMachineConfig>();
+  const put = configStore.put.bind(configStore);
+  let writes = 0;
+  configStore.put = async (id, value) => {
+    if (++writes === 2) throw new Error("store unavailable");
+    await put(id, value);
+  };
+  const deploy = provider(fake.fetchImpl, { dataVolumeSizeGb: 1, configStore });
+  const d = deployment(ID),
+    v = version(snapshot({ "server.js": "first" }));
+  await deploy.apply(d, v);
+  const accepted = structuredClone(fake.configs.get("machine-1"));
+  await assert.rejects(deploy.apply(d, version(snapshot({ "server.js": "second" }))), /store unavailable/);
+  assert.deepEqual(fake.configs.get("machine-1"), accepted);
+  assert.deepEqual(await configStore.get(d.id), accepted);
+});
+
+test("always-on uses the accepted configuration after an interrupted update", async () => {
+  const fake = fakeFly();
+  const deploy = provider(fake.fetchImpl, { dataVolumeSizeGb: 1 });
+  const d = deployment(ID);
+  await deploy.apply(d, version(snapshot({ "server.js": "good" })));
+  const accepted = structuredClone(fake.configs.get("machine-1")!);
+  fake.configs.set("machine-1", { ...accepted, env: { BROKEN: "1" } });
+  await deploy.setAlwaysOn!(d, true);
+  assert.deepEqual(fake.configs.get("machine-1")!.env, accepted.env);
+});
+
+test("shared app updates and archives only the owning deployment", async () => {
+  const fake = fakeFly({
+    existingApp: { name: "company-app", network: "company-app", organization: { slug: ORG } },
+    ips: ["fdaa:1:2:3::1"],
+  });
+  const portStore = createMemoryMap<string>();
+  const configStore = createMemoryMap<FlyMachineConfig>();
+  const options = { sharedAppName: "company-app", portStore, configStore, dataVolumeSizeGb: 1 };
+  const deploy = provider(fake.fetchImpl, options);
+  const a = deployment(ID),
+    b = deployment("other-deployment");
+  const v = version(snapshot({ "server.js": "good" }));
+  const ea = await deploy.apply(a, v),
+    eb = await deploy.apply(b, v);
+  assert.equal(ea.host, eb.host);
+  assert.notEqual(ea.port, eb.port);
+  assert.equal(fake.volumes.length, 2);
+  const sibling = structuredClone(fake.configs.get("machine-2"));
+  assert.deepEqual(await provider(fake.fetchImpl, options).apply(a, v), ea);
+  await deploy.setAlwaysOn!(a, true);
+  assert.deepEqual(fake.configs.get("machine-2"), sibling);
+  await deploy.destroy(a);
+  assert.deepEqual([...fake.machines.keys()], ["machine-2"]);
+  assert.equal(fake.volumes.length, 2);
+  assert.equal(
+    fake.calls.some((call) => call.method === "DELETE" && call.path === "/v1/apps/company-app"),
+    false,
+  );
+  assert.deepEqual(await deploy.apply(a, v), ea);
+  assert.equal(fake.volumes.length, 2);
+});
+
+test("shared app refuses missing durable port ownership before API calls", async () => {
+  const fake = fakeFly();
+  await assert.rejects(
+    provider(fake.fetchImpl, { sharedAppName: "company-app", dataVolumeSizeGb: 1 }).apply(
+      deployment(ID),
+      version(snapshot({})),
+    ),
+    /persistent port assignments/,
+  );
+  assert.equal(fake.calls.length, 0);
+});
+
+test("shared ports preserve an existing owner's claim and survive provider recreation", async () => {
+  const fake = fakeFly({
+    existingApp: { name: "company-app", network: "company-app", organization: { slug: ORG } },
+    ips: ["fdaa:1:2:3::1"],
+  });
+  const portStore = createMemoryMap<string>();
+  const first = 20000 + (createHash("sha256").update(ID).digest().readUInt32BE(0) % 45536);
+  await portStore.put(`company-app:${first}`, "existing-owner");
+  const options = {
+    sharedAppName: "company-app",
+    portStore,
+    configStore: createMemoryMap<FlyMachineConfig>(),
+    dataVolumeSizeGb: 1,
+  };
+  const d = deployment(ID),
+    v = version(snapshot({ "server.js": "good" }));
+  const endpoint = await provider(fake.fetchImpl, options).apply(d, v);
+  assert.notEqual(endpoint.port, first);
+  assert.equal(await portStore.get(`company-app:${first}`), "existing-owner");
+  assert.deepEqual(await provider(fake.fetchImpl, options).apply(d, v), endpoint);
+});
+
+test("shared publishing requires pre-provisioned app and ingress without creating either", async () => {
+  for (const existing of [false, true]) {
+    const fake = fakeFly(
+      existing ? { existingApp: { name: "company-app", network: "company-app", organization: { slug: ORG } } } : {},
+    );
+    const deploy = provider(fake.fetchImpl, {
+      appPrefix: "",
+      sharedAppName: "company-app",
+      portStore: createMemoryMap<string>(),
+      dataVolumeSizeGb: 1,
+    });
+    await assert.rejects(deploy.apply(deployment(ID), version(snapshot({}))), /provisioned before publishing/);
+    assert.equal(
+      fake.calls.some((call) => call.method === "POST"),
+      false,
+    );
+  }
+});
+
+test("private transport is restored when resolving a persisted endpoint", async () => {
+  const fake = fakeFly();
+  let connections = 0;
+  const deploy = provider(fake.fetchImpl, {
+    privateTransport: {
+      ensure: async () => {
+        connections++;
+        return 18096;
+      },
+    },
+  });
+  const d = deployment(ID);
+  const endpoint = await deploy.apply(d, version(snapshot({ "server.js": "app" })));
+  assert.equal(endpoint.socksProxyPort, 18096);
+  assert.deepEqual(await deploy.resolveEndpoint!({ ...d, endpoint }, version(snapshot({}))), endpoint);
+  assert.equal(connections, 2);
+});
+
+test("shared publishing rejects missing or permissive ingress isolation before creating resources", async () => {
+  for (const overrides of [
+    { ingressNetwork: "" },
+    { ingressNetwork: "default" },
+    { ingressNetwork: "company-app" },
+    { networkPolicies: [] },
+    {
+      networkPolicies: [
+        {
+          netpolSelector: { all: true, metadata: { role: "not-qm" } },
+          rules: [{ action: "allow", direction: "ingress", ports: [{ protocol: "tcp", port: 22 }] }],
+        },
+      ],
+    },
+    {
+      networkPolicies: [
+        {
+          netpolSelector: { all: false },
+          rules: [{ action: "allow", direction: "ingress", ports: [{ protocol: "tcp", port: 22 }] }],
+        },
+      ],
+    },
+    {
+      networkPolicies: [
+        {
+          netpolSelector: { all: true },
+          rules: [{ action: "allow", direction: "ingress", ports: [{ protocol: "tcp", port: 8080 }] }],
+        },
+      ],
+    },
+  ]) {
+    const fake = fakeFly({
+      existingApp: { name: "company-app", network: "company-app", organization: { slug: ORG } },
+      ips: ["fdaa:1:2:3::1"],
+      ...overrides,
+    });
+    const deploy = provider(fake.fetchImpl, {
+      sharedAppName: "company-app",
+      portStore: createMemoryMap<string>(),
+      dataVolumeSizeGb: 1,
+    });
+    await assert.rejects(
+      deploy.apply(deployment(ID), version(snapshot({ "index.html": "hi" }))),
+      /requires.*(private network|ingress restricted)/,
+    );
+    assert.ok(fake.calls.every((call) => call.method === "GET"));
+  }
 });

@@ -5,7 +5,7 @@ import { readEnvFile } from "../util.ts";
 import { CliError, errMessage, header, note, ok, step, warn } from "../log.ts";
 import { validateSandboxLayer, type SandboxValidation } from "../sandbox-layer.ts";
 import { discoverPlugins, type ResolvedPlugin } from "../plugins.ts";
-import { mockHarnessWarning, type QmConfig } from "../config.ts";
+import type { QmConfig } from "../config.ts";
 import { computedSecrets, runtimeSecretNames, type ComputedSecret } from "../secrets.ts";
 import { hostedServiceEnv, isVirtualService, runnableServices } from "../services.ts";
 import { serviceEnvironment } from "../backends/aws.ts";
@@ -95,6 +95,7 @@ export function runChecks(
         secretNames.has(name) ||
         (/(?:_SECRET|_TOKEN|_KEY|_CREDENTIALS?|PASSWORD)$/.test(name) &&
           !name.endsWith("PUBLIC_KEY") &&
+          !(name === "POSTHOG_API_KEY" && /^phc_[A-Za-z0-9]+$/.test(value)) &&
           !/^[.~/]/.test(value));
       if (secretish) {
         configError(
@@ -142,8 +143,6 @@ export function runChecks(
     const optional = secrets.filter((secret) => !secret.required).map((secret) => secret.name);
     if (optional.length) step(`optional secrets: ${optional.join(", ")}`);
     for (const w of layer.warnings) warn(w);
-    const mockHarness = mockHarnessWarning(config);
-    if (mockHarness) warn(mockHarness);
   }
 
   const errors = [

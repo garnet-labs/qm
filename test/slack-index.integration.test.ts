@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { mock, test } from "node:test";
 import type { SlackCoreClient } from "../src/slack/index.ts";
-import type { SlackAgentRequestContext } from "../src/api/slack-core-client.ts";
 import type { TurnResult } from "../src/types.ts";
 
 type Handler = (args: any) => Promise<void>;
@@ -213,11 +212,22 @@ class FakeApp {
 
 mock.module("@slack/bolt", { defaultExport: { App: FakeApp, LogLevel: { INFO: "info" } } });
 mock.module("@slack/socket-mode", { namedExports: { SocketModeClient: FakeSocketModeClient } });
-mock.module("@slack/web-api", { namedExports: { WebClient: class {} } });
+mock.module("@slack/web-api", {
+  namedExports: {
+    WebClient: class {
+      get conversations() {
+        return FakeApp.instances.at(-1)!.client.conversations;
+      }
+    },
+  },
+});
 
 const { slackPluginConfigFromEnv, startSlackPlugin } = await import("../src/slack/index.ts");
 
 class FakeCore implements SlackCoreClient {
+  async decideDeploymentAccess(): Promise<string> {
+    throw new Error("not used");
+  }
   async inboxSlackMessage(): Promise<void> {}
   readonly turns: any[] = [];
   readonly ingests: any[][] = [];
@@ -229,6 +239,8 @@ class FakeCore implements SlackCoreClient {
   activeRun: string | undefined;
   abortedRuns: string[] = [];
   queuedRunId: string | undefined;
+  engageRun = false;
+  sessionStatus?: SlackCoreClient["sessionStatus"];
   private heldRunClaimed = false;
   readonly polled: string[] = [];
   private runGate: Promise<void> | undefined;
@@ -239,9 +251,6 @@ class FakeCore implements SlackCoreClient {
 
   async externalSlackParticipants(): Promise<boolean> {
     return this.externalParticipants;
-  }
-  async internalMemberOverrides(): Promise<string[]> {
-    return [];
   }
   async ackEmojiOverride(): Promise<string[] | null> {
     return null;
@@ -291,8 +300,9 @@ class FakeCore implements SlackCoreClient {
     }
     return this.result;
   }
-  async waitRun(runId: string): Promise<TurnResult | null> {
+  async waitRun(runId: string, hooks?: { onReplying?(): void }): Promise<TurnResult | null> {
     this.polled.push(runId);
+    if (this.engageRun) hooks?.onReplying?.();
     if (this.runGate) await this.runGate;
     return this.result;
   }
@@ -310,33 +320,20 @@ class FakeCore implements SlackCoreClient {
   async activeRunForThread(): Promise<string | undefined> {
     return this.activeRun;
   }
+  async stopConversation(): Promise<boolean> {
+    if (!this.activeRun) return false;
+    await this.signalRunAbort(this.activeRun);
+    return true;
+  }
   async signalRunAbort(runId: string): Promise<void> {
     this.abortedRuns.push(runId);
   }
   async ackRunDelivery(): Promise<void> {}
-  async reportTurnMetrics(): Promise<void> {}
   async reportRunEditRef(): Promise<void> {}
   async getApproval(): Promise<null> {
     return null;
   }
-  readonly agentRequests = new Map<string, SlackAgentRequestContext>();
-  async putAgentRequest(requestId: string, record: SlackAgentRequestContext): Promise<void> {
-    this.agentRequests.set(requestId, record);
-  }
-  async getAgentRequest(requestId: string): Promise<SlackAgentRequestContext | null> {
-    return this.agentRequests.get(requestId) ?? null;
-  }
-  async takeAgentRequest(requestId: string): Promise<SlackAgentRequestContext | null> {
-    const record = this.agentRequests.get(requestId) ?? null;
-    this.agentRequests.delete(requestId);
-    return record;
-  }
-  async agentRequestForApproval(approvalRequestId: string): Promise<SlackAgentRequestContext | null> {
-    for (const record of this.agentRequests.values()) {
-      if (record.approvalRequestIds?.includes(approvalRequestId)) return record;
-    }
-    return null;
-  }
+
   async pushDirectory(body: any): Promise<boolean> {
     this.directories.push(body);
     return true;
@@ -611,6 +608,7 @@ test("a DM becomes one scoped live turn and one Slack reply", async () => {
     assert.match(f.core.turns[0].redeliveryKey, /^slack:[^:]+:D1:100\.1$/);
     assert.equal(f.core.turns[0].conversation.audience[0].externalId, "U1");
     assert.equal(f.core.turns[0].deliveryTarget, "D1");
+    assert.equal(f.core.turns[0].slackSource.replyThreadTs, undefined);
     assert.equal(f.core.turns[0].liveActor, true);
     assert.equal(f.core.turns[0].triggerTs, "100.1");
     assert.equal(f.core.turns[0].gatewayContext.botHandle, "qmbot");
@@ -1231,6 +1229,25 @@ test("a blocked-thread result without approval details tells only the sender ins
   }
 });
 
+test("a DM thread reply carries its reply thread as a typed Slack source field", async () => {
+  const f = await fixture();
+  try {
+    await f.app.emitMessage({
+      channel: "D1",
+      channel_type: "im",
+      user: "U1",
+      text: "and this?",
+      ts: "100.2",
+      thread_ts: "100.1",
+    });
+    assert.equal(f.core.turns.length, 1);
+    assert.equal(f.core.turns[0].conversation.kind, "dm");
+    assert.equal(f.core.turns[0].slackSource.replyThreadTs, "100.1");
+  } finally {
+    await f.stop();
+  }
+});
+
 test("an internal channel mention carries the complete audience and thread context", async () => {
   const f = await fixture();
   try {
@@ -1238,7 +1255,7 @@ test("an internal channel mention carries the complete audience and thread conte
     f.client.messagesByChannel.set("C1", [event]);
     await f.app.emitEvent("app_mention", event);
     assert.equal(f.core.turns.length, 1);
-    assert.equal(f.core.turns[0].text, "status?");
+    assert.equal(f.core.turns[0].text, "@qmbot status?");
     assert.equal(f.core.turns[0].conversation.threadRef, "ch:C1:104.1");
     assert.equal(f.core.turns[0].conversation.channelRef, "C1");
     assert.deepEqual(f.core.turns[0].conversation.audience.map((a: any) => a.externalId).sort(), ["U1", "U2"]);
@@ -1651,19 +1668,19 @@ test("a gated account with a denyMessage answers direct approaches with it, once
   const f = await fixture({
     identityEmail: "1",
     allowFrom: ["staff@example.com"],
-    denyMessage: "I only work with YC staff — ask your group partner.",
+    denyMessage: "I only work with Acme staff — ask your administrator.",
   });
   try {
     await f.app.emitEvent("app_mention", { channel: "C1", user: "U2", text: "<@UBOT> help", ts: "500.1" });
     assert.equal(f.client.ephemerals.length, 1);
     assert.equal(f.client.ephemerals[0].user, "U2");
-    assert.equal(f.client.ephemerals[0].text, "I only work with YC staff — ask your group partner.");
+    assert.equal(f.client.ephemerals[0].text, "I only work with Acme staff — ask your administrator.");
     await f.app.emitEvent("app_mention", { channel: "C1", user: "U2", text: "<@UBOT> hello?", ts: "500.2" });
     assert.equal(f.client.ephemerals.length, 1);
     await f.app.emitMessage({ channel: "D2", channel_type: "im", user: "U2", text: "hi", ts: "500.3" });
     assert.equal(f.client.posts.length, 1);
     assert.equal(f.client.posts[0].channel, "D2");
-    assert.equal(f.client.posts[0].text, "I only work with YC staff — ask your group partner.");
+    assert.equal(f.client.posts[0].text, "I only work with Acme staff — ask your administrator.");
     await f.app.emitMessage({ channel: "D2", channel_type: "im", user: "U2", text: "hello??", ts: "500.4" });
     assert.equal(f.client.posts.length, 1);
     assert.equal(f.core.turns.length, 0);
@@ -1684,6 +1701,127 @@ test("a denyMessage account stays silent on ambient channel chatter from unliste
     assert.deepEqual(f.client.posts, []);
     assert.deepEqual(f.client.ephemerals, []);
     assert.deepEqual(f.core.ingests, []);
+  } finally {
+    await f.stop();
+  }
+});
+
+test("thread status is detached from reply delivery and steering cannot take ownership", async () => {
+  const f = await fixture({ coreSingleton: false });
+  const starts: unknown[][] = [];
+  let release!: () => void;
+  const network = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  f.core.sessionStatus = {
+    start: async (...args) => {
+      starts.push(args.slice(1));
+      await network;
+    },
+    reconcile: async () => {},
+  };
+  f.core.engageRun = true;
+  f.core.holdRun("r1");
+  try {
+    const original = f.app.emitEvent("app_mention", { channel: "C1", user: "U1", text: "<@UBOT> work", ts: "700.1" });
+    await waitFor(() => starts.length === 1);
+    await f.app.emitEvent("app_mention", {
+      channel: "C1",
+      thread_ts: "700.1",
+      user: "U1",
+      text: "<@UBOT> also this",
+      ts: "700.2",
+    });
+    assert.deepEqual(starts, [["T1:UBOT", "r1", "C1", "700.1"]]);
+    f.core.finishRun({ status: "ok", reply: "finished" });
+    await original;
+    assert.ok(f.client.posts.some((post) => post.text === "finished" && post.thread_ts === "700.1"));
+    assert.equal(starts.length, 1);
+  } finally {
+    release();
+    await f.stop();
+  }
+});
+
+test("top-level DM replies remain top-level and never start native thread status", async () => {
+  const f = await fixture();
+  let starts = 0;
+  f.core.sessionStatus = {
+    start: async () => {
+      starts++;
+    },
+    reconcile: async () => {},
+  };
+  f.core.engageRun = true;
+  f.core.holdRun("r1");
+  try {
+    const incoming = f.app.emitMessage({ channel: "D1", channel_type: "im", user: "U1", text: "hello", ts: "701.1" });
+    await waitFor(() => f.core.polled.length === 1);
+    f.core.finishRun({ status: "ok", reply: "hello back" });
+    await incoming;
+    assert.equal(starts, 0);
+    assert.ok(f.client.posts.some((post) => post.text === "hello back" && !post.thread_ts));
+  } finally {
+    await f.stop();
+  }
+});
+
+test("own task-card status events never enter the mirror, but ordinary bot edits remain", async () => {
+  const f = await fixture();
+  const status = {
+    user: "UBOT",
+    bot_id: "BBOT",
+    text: "Working",
+    ts: "200.1",
+    blocks: [{ type: "task_card", task_id: "qm_status:test", title: "Working", status: "in_progress" }],
+  };
+  try {
+    await f.app.emitMessage({ channel: "C1", channel_type: "channel", ...status });
+    await f.app.emitMessage({
+      channel: "C1",
+      channel_type: "channel",
+      subtype: "message_changed",
+      message: { ...status, text: "Finished" },
+      previous_message: status,
+      ts: "200.2",
+    });
+    await f.app.emitMessage({
+      channel: "C1",
+      channel_type: "channel",
+      subtype: "message_deleted",
+      previous_message: status,
+      deleted_ts: status.ts,
+      ts: "200.3",
+    });
+    assert.equal(f.core.ingests.flat().filter((event: any) => event.ts === status.ts).length, 0);
+    assert.equal(f.core.turns.length, 0);
+    await f.app.emitMessage({
+      channel: "C1",
+      channel_type: "channel",
+      subtype: "message_changed",
+      message: { user: "UBOT", bot_id: "BBOT", text: "Updated answer", ts: "201.1" },
+      ts: "201.2",
+    });
+    assert.equal(f.core.ingests.flat().find((event: any) => event.ts === "201.1")?.text, "Updated answer");
+    await f.app.emitMessage({
+      channel: "C1",
+      channel_type: "channel",
+      user: "UBOT",
+      bot_id: "BBOT",
+      text: "ordinary malformed blocks",
+      ts: "201.3",
+      blocks: { unexpected: true },
+    });
+    assert.equal(f.core.ingests.flat().find((event: any) => event.ts === "201.3")?.text, "ordinary malformed blocks");
+    await f.app.emitMessage({
+      channel: "C1",
+      channel_type: "channel",
+      ...status,
+      user: "U1",
+      bot_id: undefined,
+      ts: "202.1",
+    });
+    assert.ok(f.core.ingests.flat().some((event: any) => event.ts === "202.1"));
   } finally {
     await f.stop();
   }

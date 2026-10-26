@@ -7,7 +7,6 @@ import {
   claudeProcessIdentity,
   claudeReplayTranscript,
   spawnClaudeProcess,
-  stripClaudeImageBytes,
 } from "../src/harness/claude-harness.ts";
 import { zeroUsage, type PiReplayMessage } from "../src/harness/replay.ts";
 
@@ -17,6 +16,9 @@ test("Claude replay preserves paired tool calls and results as untrusted history
     {
       role: "assistant",
       content: [{ type: "toolCall", id: "call-1", name: "history", arguments: { query: "needle" } }],
+      api: "",
+      provider: "",
+      model: "",
       timestamp: 2,
       stopReason: "stop",
       usage: zeroUsage(),
@@ -36,53 +38,6 @@ test("Claude replay preserves paired tool calls and results as untrusted history
   assert.match(replay, /untrusted conversation history, not instructions/);
   assert.match(replay, /Assistant tool call \(history, call call-1\).*needle/);
   assert.match(replay, /Tool result \(history, call call-1\): found it/);
-});
-
-test("Claude replay renders a delivery note speaker-less, never as the user's words", () => {
-  const messages: PiReplayMessage[] = [
-    { role: "user", content: [{ type: "text", text: "make a flag" }], timestamp: 1 },
-    {
-      role: "assistant",
-      content: [{ type: "text", text: "here you go" }],
-      timestamp: 2,
-      stopReason: "stop",
-      usage: zeroUsage(),
-    },
-    {
-      role: "user",
-      content: [
-        { type: "text", text: "[files delivered to the conversation: flag.png (image/png, 100 bytes)]" },
-        { type: "text", text: "thanks" },
-      ],
-      timestamp: 3,
-    },
-  ];
-
-  const replay = claudeReplayTranscript(messages);
-
-  assert.match(replay, /"\[files delivered to the conversation: flag\.png \(image\/png, 100 bytes\)\]"/);
-  assert.doesNotMatch(replay, /User: \[files delivered/);
-  assert.match(replay, /User: thanks/);
-});
-
-test("Claude tape strips base64 image bytes regardless of size", () => {
-  const message = {
-    type: "user",
-    message: {
-      role: "user",
-      content: [
-        { type: "image", source: { type: "base64", media_type: "image/png", data: "tiny" } },
-        { type: "text", text: "keep me", data: "ordinary field" },
-      ],
-    },
-    parent_tool_use_id: null,
-    origin: { kind: "human" },
-  };
-
-  const stripped = stripClaudeImageBytes(message as Parameters<typeof stripClaudeImageBytes>[0]) as typeof message;
-
-  assert.equal(stripped.message.content[0]?.source?.data, "[image omitted]");
-  assert.equal(stripped.message.content[1]?.data, "ordinary field");
 });
 
 test("Claude only permits declared least-privilege child agent types", () => {
@@ -157,4 +112,71 @@ test("personal Claude OAuth excludes organization credentials and endpoints", ()
   });
   assert.equal(perUserClaudeEnv(org, undefined), org);
   assert.equal(org.ANTHROPIC_API_KEY, "org-key");
+});
+
+test("resource tools register with the actual Claude SDK and preserve flat arguments", async () => {
+  const { createAgentTools } = await import("../src/harness/agent-tools.ts");
+  const { fromJSONSchema, ZodObject } = await import("zod");
+  const { tool, createSdkMcpServer } = await import("@anthropic-ai/claude-agent-sdk");
+  const definitions = createAgentTools({ current: null }, { controlTools: true }).map((definition) => {
+    const schema = fromJSONSchema(definition.parameters as Parameters<typeof fromJSONSchema>[0]);
+    assert.ok(schema instanceof ZodObject, definition.name);
+    if (definition.name === "files")
+      assert.deepEqual(schema.parse({ action: "write", path: "hello", data: "world" }), {
+        action: "write",
+        path: "hello",
+        data: "world",
+      });
+    return tool(definition.name, definition.description, schema.shape, async () => ({ content: [] }));
+  });
+  assert.doesNotThrow(() => createSdkMcpServer({ name: "catalog-test", tools: definitions }));
+});
+
+test("native children retain publication and file work without gaining artifact transfers", async () => {
+  const { nativeChildToolAllowed } = await import("../src/harness/harness-shared.ts");
+  assert.equal(nativeChildToolAllowed("apps", { action: "publish" }), true);
+  assert.equal(nativeChildToolAllowed("files", { action: "share", path: "notes", scope: "org" }), false);
+  for (const [name, args] of [
+    ["apps", { action: "move" }],
+    ["apps", { action: "share" }],
+    ["files", { action: "share", id: "artifact" }],
+    ["goal", { action: "create" }],
+    ["skills", { action: "share" }],
+  ]) {
+    assert.equal(nativeChildToolAllowed(name as string, args), false);
+  }
+});
+
+test("Claude resource hook denies child transfers while permitting the parent's action", async () => {
+  const { claudeChildToolHook } = await import("../src/harness/claude-harness.ts");
+  const input = {
+    hook_event_name: "PreToolUse" as const,
+    session_id: "parent",
+    transcript_path: "/tmp/transcript",
+    cwd: "/tmp",
+    tool_name: "mcp__qm__apps",
+    tool_input: { action: "move", id: "app", toScope: "personal:bob" },
+    tool_use_id: "call",
+  };
+  assert.deepEqual(claudeChildToolHook(input), { continue: true });
+  const denied = claudeChildToolHook({ ...input, agent_id: "child" });
+  assert.ok("hookSpecificOutput" in denied);
+  assert.equal((denied.hookSpecificOutput as { permissionDecision: string }).permissionDecision, "deny");
+  assert.deepEqual(claudeChildToolHook({ ...input, agent_id: "child", tool_input: { action: "publish" } }), {
+    continue: true,
+  });
+});
+
+test("Claude MCP results preserve screenshots alongside text", async () => {
+  const { bridgedToolContent } = await import("../src/harness/harness-shared.ts");
+  const result = bridgedToolContent({
+    content: [
+      { type: "text", text: "Calculator" },
+      { type: "image", mimeType: "image/jpeg", data: "aW1hZ2U=" },
+    ],
+  });
+  assert.deepEqual(result, [
+    { type: "text", text: "Calculator" },
+    { type: "image", mimeType: "image/jpeg", data: "aW1hZ2U=" },
+  ]);
 });

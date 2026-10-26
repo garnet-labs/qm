@@ -1,12 +1,4 @@
-import type {
-  Cron,
-  CronFireLogEntry,
-  CronFireNote,
-  CronSchedule,
-  Destination,
-  Principal,
-  RecipientConsent,
-} from "../types.ts";
+import type { Cron, CronFireLogEntry, CronFireNote, CronSchedule, Destination } from "../types.ts";
 import { createMemoryMap, type DurableMap } from "../persistence/durable-map.ts";
 import {
   createMemoryCronFireStore,
@@ -19,24 +11,26 @@ import {
   buildTriggerBase,
   contentPart,
   createDeduped,
-  setTriggerRecipientConsent,
   type CreateTriggerInput,
 } from "../triggers/trigger-store.ts";
+import { assertCronRuntime } from "./runtime.ts";
 import { hashId } from "../util/crypto.ts";
 import { advanceNextFireAt, isCalendarSchedule, normalizeSchedule, recoverNextFireAt } from "./schedule.ts";
 
 export interface CreateCronInput extends CreateTriggerInput {
+  runtime?: Cron["runtime"];
+  enabled?: boolean;
   schedule: Cron["schedule"];
   title?: string;
   action?: string;
   message?: string;
-  runAs?: Cron["runAs"];
-  members?: Principal[];
   unattendedGrants?: string[];
   loopId?: string;
+  sessionRef?: string;
 }
 
 export interface CronPatch {
+  runtime?: Cron["runtime"];
   title?: string;
   action?: string;
   message?: string;
@@ -44,9 +38,8 @@ export interface CronPatch {
   enabled?: boolean;
   archived?: boolean;
   destination?: Destination;
-  members?: Principal[];
-  runAs?: Cron["runAs"];
   unattendedGrants?: string[];
+  sessionRef?: string | null;
 }
 
 export const DEFAULT_FIRE_RUNNING_STALE_MS = 24 * 60 * 60 * 1000;
@@ -65,7 +58,6 @@ export interface CronStore {
   delete(id: string): Promise<void>;
   setEnabled(id: string, enabled: boolean): Promise<void>;
   setDestination(id: string, destination: Destination | undefined): Promise<void>;
-  setRecipientConsent(id: string, recipientConsent: RecipientConsent): Promise<void>;
   beginFire(id: string, entry: CronFireLogEntry, opts?: { exclusive?: boolean }): Promise<BeginFireResult>;
   sweepStrandedFires(now: number): Promise<number>;
   pruneFires(now: number): Promise<number>;
@@ -81,6 +73,16 @@ export interface CronStore {
   claimSlot(id: string, scheduledAt: number, at: number): Promise<boolean>;
   unclaimSlot(id: string, scheduledAt: number, at: number, priorLastFiredAt: number | undefined): Promise<void>;
   due(now: number): Promise<Array<Cron & { scheduledAt: number }>>;
+}
+
+export function cronIsActive(cron: Pick<Cron, "enabled" | "archived" | "schedule" | "lastFiredAt">): boolean {
+  if (!cron.enabled || cron.archived) return false;
+  const oneShot = cron.schedule.cron === undefined && cron.schedule.everyMs === undefined;
+  return !(oneShot && cron.lastFiredAt !== undefined);
+}
+
+export function cronTiedTo(cron: Pick<Cron, "destination" | "sessionRef">, threadRef: string): boolean {
+  return cron.destination?.target === threadRef || cron.sessionRef === threadRef;
 }
 
 export function isDeferred(cron: Pick<Cron, "deferUntil">, now: number): boolean {
@@ -102,6 +104,7 @@ export function createCronStore(
   return {
     async create(input) {
       assertNoEscalation(input);
+      assertCronRuntime(input);
       const now = Date.now();
       const title = normalizeTitle(input.title);
       const { schedule, nextFireAt } = normalizeSchedule(input.schedule, now);
@@ -112,29 +115,33 @@ export function createCronStore(
         contentPart(input.action),
         contentPart(input.message),
         contentPart(input.destination),
-        contentPart(input.runAs),
-        contentPart(input.members),
         contentPart(input.unattendedGrants),
         contentPart(title),
         ...(input.loopId !== undefined ? [contentPart(input.loopId)] : []),
+        ...(input.runtime ? [contentPart(input.runtime)] : []),
       ]);
       return createDeduped(backing, contentId, (id) => ({
         ...buildTriggerBase(input, id, now),
+        enabled: input.enabled !== false,
         schedule,
         ...(nextFireAt !== undefined ? { nextFireAt } : {}),
         ...(title ? { title } : {}),
         ...(input.action !== undefined ? { action: input.action } : {}),
         ...(input.message !== undefined ? { message: input.message } : {}),
-        ...(input.runAs ? { runAs: input.runAs } : {}),
-        ...(input.members ? { members: input.members } : {}),
         ...(input.unattendedGrants ? { unattendedGrants: input.unattendedGrants } : {}),
         ...(input.loopId ? { loopId: input.loopId } : {}),
+        ...(input.sessionRef ? { sessionRef: input.sessionRef } : {}),
+        ...(input.runtime ? { runtime: input.runtime } : {}),
       }));
     },
     get: (id) => backing.get(id),
     list: () => backing.all(),
     async update(id, patch) {
+      const before = await backing.get(id);
+      if (!before) return null;
+      assertCronRuntime({ ...before, ...patch });
       const fields: Partial<Cron> = {};
+      if (patch.runtime !== undefined) fields.runtime = patch.runtime;
       if (patch.title !== undefined) fields.title = normalizeTitle(patch.title);
       if (patch.action !== undefined) fields.action = patch.action;
       if (patch.message !== undefined) fields.message = patch.message;
@@ -147,9 +154,8 @@ export function createCronStore(
       if (patch.archived !== undefined) fields.archived = patch.archived;
       if (patch.destination !== undefined) fields.destination = patch.destination;
       if (patch.archived === true) fields.enabled = false;
-      if (patch.members !== undefined) fields.members = patch.members;
-      if (patch.runAs !== undefined) fields.runAs = patch.runAs;
       if (patch.unattendedGrants !== undefined) fields.unattendedGrants = patch.unattendedGrants;
+      if (patch.sessionRef !== undefined) fields.sessionRef = patch.sessionRef ?? undefined;
       return backing.merge(id, fields);
     },
     delete: (id) => backing.delete(id),
@@ -158,9 +164,6 @@ export function createCronStore(
     },
     async setDestination(id, destination) {
       await backing.merge(id, { destination });
-    },
-    setRecipientConsent(id, recipientConsent) {
-      return setTriggerRecipientConsent(backing, id, recipientConsent);
     },
     async beginFire(id, entry, opts) {
       if ((await backing.get(id)) === null) return { begun: false };
@@ -285,3 +288,15 @@ export function createCronStore(
     },
   };
 }
+
+export const DROP_RUN_AS_MIGRATION = {
+  id: "durable-map/crons/0001-drop-run-as",
+  statements: [
+    ...["crons", "loops"].map(
+      (table) => `CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, json JSONB NOT NULL)`,
+    ),
+    `UPDATE crons SET json = jsonb_set(json, '{owner}', to_jsonb('system:' || (json ->> 'ownerScopeId'))) WHERE json ->> 'runAs' = 'scopeFloor' AND json ->> 'loopId' IS NULL AND json ->> 'ownerScopeId' NOT LIKE 'personal:%'`,
+    "UPDATE crons SET json = json - 'runAs' - 'ownerResourcesRequireOpen' - 'members' WHERE json ?| array['runAs', 'ownerResourcesRequireOpen', 'members']",
+    "UPDATE loops SET json = json - 'runAs' WHERE json ? 'runAs'",
+  ],
+};

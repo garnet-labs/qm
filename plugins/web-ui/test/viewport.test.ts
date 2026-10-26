@@ -5,6 +5,7 @@ import { JSDOM } from "jsdom";
 class FakeVisualViewport extends EventTarget {
   height = 659;
   offsetTop = 0;
+  scale = 1;
 }
 
 const dom = new JSDOM('<div class="chat-scroll"></div>', { url: "https://example.test/" });
@@ -12,18 +13,13 @@ const vv = new FakeVisualViewport();
 let scrollCalls = 0;
 Object.defineProperties(dom.window, {
   innerHeight: { value: 659, configurable: true },
-  scrollY: { get: () => (vv.offsetTop ? 309 : 0), configurable: true },
+  scrollY: { value: 309, configurable: true },
   visualViewport: { value: vv, configurable: true },
   matchMedia: {
     value: () => ({ matches: true, addEventListener() {}, removeEventListener() {} }),
     configurable: true,
   },
-  scrollTo: {
-    value: () => {
-      scrollCalls++;
-    },
-    configurable: true,
-  },
+  scrollTo: { value: () => scrollCalls++, configurable: true },
 });
 Object.assign(globalThis, { document: dom.window.document, window: dom.window });
 
@@ -36,26 +32,55 @@ Object.defineProperties(transcript, {
 
 const { trackVisualViewport } = await import("../src/viewport.ts");
 trackVisualViewport();
+const style = dom.window.document.documentElement.style;
 
-test("an iOS keyboard offset anchors the app to the visual viewport on every viewport event", () => {
-  vv.height = 350;
-  vv.offsetTop = 309;
-  vv.dispatchEvent(new Event("resize"));
+function viewport(height: number, offsetTop = 0, scale = 1, event = "resize") {
+  Object.assign(vv, { height, offsetTop, scale });
+  vv.dispatchEvent(new Event(event));
+}
 
-  assert.equal(dom.window.document.documentElement.style.getPropertyValue("--vvh"), "350px");
-  assert.equal(dom.window.document.documentElement.style.getPropertyValue("--vv-top"), "309px");
-  assert.equal(dom.window.document.documentElement.classList.contains("kbd-open"), true);
-  assert.equal(scrollCalls, 1);
-  assert.equal(transcript.scrollTop, 900);
+test("keyboard resize and pan follow the visual viewport without fighting document scroll", () => {
+  viewport(350, 309);
+  assert.equal(style.getPropertyValue("--vvh"), "350px");
+  assert.equal(style.getPropertyValue("--vv-top"), "309px");
+  assert.equal(scrollCalls, 0);
+  assert.equal(transcript.scrollTop, 300);
 
-  vv.offsetTop = 221;
-  vv.dispatchEvent(new Event("scroll"));
-  assert.equal(dom.window.document.documentElement.style.getPropertyValue("--vv-top"), "221px");
-  assert.equal(scrollCalls, 2);
+  viewport(350, 221, 1, "scroll");
+  assert.equal(style.getPropertyValue("--vv-top"), "221px");
+  assert.equal(scrollCalls, 0);
 
-  vv.height = 659;
-  vv.offsetTop = 0;
-  vv.dispatchEvent(new Event("resize"));
-  assert.equal(dom.window.document.documentElement.style.getPropertyValue("--vv-top"), "0px");
-  assert.equal(dom.window.document.documentElement.classList.contains("kbd-open"), false);
+  viewport(659);
+  assert.equal(style.getPropertyValue("--vvh"), "659px");
+  assert.equal(style.getPropertyValue("--vv-top"), "0px");
+});
+
+test("small viewport changes track their origin without a keyboard-height threshold", () => {
+  viewport(600, 40);
+  assert.equal(style.getPropertyValue("--vvh"), "600px");
+  assert.equal(style.getPropertyValue("--vv-top"), "40px");
+});
+
+test("pinch zoom does not resize or reposition the app shell", () => {
+  viewport(659);
+  viewport(329.5, 100, 2);
+  viewport(329.5, 160, 2, "scroll");
+  assert.equal(style.getPropertyValue("--vvh"), "659px");
+  assert.equal(style.getPropertyValue("--vv-top"), "0px");
+  viewport(350, 80);
+  assert.equal(style.getPropertyValue("--vvh"), "350px");
+  assert.equal(style.getPropertyValue("--vv-top"), "80px");
+});
+
+test("window resize refreshes geometry after orientation changes", () => {
+  Object.assign(vv, { height: 280, offsetTop: 10, scale: 1 });
+  dom.window.dispatchEvent(new dom.window.Event("resize"));
+  assert.equal(style.getPropertyValue("--vvh"), "280px");
+  assert.equal(style.getPropertyValue("--vv-top"), "10px");
+});
+
+test("browsers without VisualViewport use the CSS fallback", () => {
+  Object.defineProperty(dom.window, "visualViewport", { value: undefined, configurable: true });
+  assert.doesNotThrow(trackVisualViewport);
+  Object.defineProperty(dom.window, "visualViewport", { value: vv, configurable: true });
 });

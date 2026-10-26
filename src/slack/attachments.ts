@@ -1,7 +1,6 @@
 import { sleep } from "./util.ts";
 import { channelShareTs, parseUploadedFileIds, slackErrorCode } from "./payloads.ts";
 import { BlobTooLargeError } from "../persistence/blob-transfer.ts";
-import { messageWithForwardedContent, type SlackMessageAttachment } from "./forwards.ts";
 
 export interface IncomingAttachment {
   name: string;
@@ -55,38 +54,6 @@ export const MAX_ATTACHMENT_BYTES = 1_000_000_000;
 
 export function isOversize(file: Pick<SlackFile, "size">): boolean {
   return typeof file.size === "number" && file.size > MAX_ATTACHMENT_BYTES;
-}
-
-export interface ThreadMessage {
-  user?: string;
-  text?: string;
-  ts?: string;
-  bot_id?: string;
-  subtype?: string;
-  files?: SlackFile[];
-  attachments?: SlackMessageAttachment[];
-}
-
-export function collectEarlierThreadFiles(
-  messages: readonly ThreadMessage[],
-  opts: { triggerTs: string; botUserId: string; ownBotId: string; have: readonly SlackFile[]; inThread: boolean },
-): SlackFile[] {
-  if (!opts.inThread) return [];
-  const seen = new Set<string>();
-  for (const f of opts.have) if (f.id) seen.add(f.id);
-  const out: SlackFile[] = [];
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i]!;
-    if (m.ts === opts.triggerTs) continue;
-    const isBot = (m.user && m.user === opts.botUserId) || (opts.ownBotId !== "" && m.bot_id === opts.ownBotId);
-    if (isBot) continue;
-    for (const f of messageWithForwardedContent(m).files) {
-      if (f.id && seen.has(f.id)) continue;
-      if (f.id) seen.add(f.id);
-      out.push(f.user || !m.user ? f : { ...f, user: m.user });
-    }
-  }
-  return out;
 }
 
 export function isTrustedSlackHost(url: string, extraHost?: string): boolean {
@@ -250,12 +217,9 @@ export async function uploadAttachments(
 }
 
 export function uploadFailureNote(err: unknown): string {
-  const e = err as { data?: { needed?: string }; message?: string };
+  const e = err as { data?: { needed?: string } };
   const code = slackErrorCode(err) ?? "";
-  const msg = e?.message ?? String(err);
-  const isPermission =
-    code === "missing_scope" || code === "not_allowed_token_type" || code === "access_denied" || /scope/i.test(msg);
-  if (isPermission) {
+  if (code === "missing_scope" || code === "not_allowed_token_type" || code === "access_denied") {
     const needed = e?.data?.needed ?? "files:write";
     return `⚠️ I couldn't attach the file(s) — check my upload permission (${needed}).`;
   }

@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import type { TurnRequest } from "../src/types.ts";
 import { testConfig } from "./support/test-config.ts";
 
@@ -19,6 +19,38 @@ function dm(text: string, thread: string): TurnRequest {
   return { surface: "test", actor, conversation: { kind: "dm", threadRef: thread }, text };
 }
 
+test("background output selects the recorded private resource and fails closed when it is unavailable", async () => {
+  const built = buildApp(testConfig({}));
+  try {
+    const root = await built.app.turn(dm("Start", "resource-output"));
+    const resource = await built.sandboxResources.create("U1", "personal:U1", "sprites", "Worker");
+    const fallback = await built.sandboxResources.create("U1", "personal:U1", "sprites", "Default");
+    await built.sandboxResources.setDefault("U1", "personal:U1", fallback.id);
+    await built.processes!.register({ ...registryRow("private-output", "resource-output"), sandboxId: resource.id });
+    let selected: string | undefined;
+    const provision = built.sandbox.provision.bind(built.sandbox);
+    built.sandbox.provision = (layers, options) => {
+      selected = options?.sandboxId;
+      return provision(layers, options);
+    };
+    let reads = 0;
+    built.sandbox.readProcess = async () => {
+      reads++;
+      return { chunks: "private output", cursor: 14, status: { state: "exited", code: 0 } };
+    };
+    const output = await built.app.readSessionBackgroundOutput(root.sessionId!, "private-output", "U1", 0);
+    assert.equal(output?.chunk, "private output");
+    assert.equal(selected, resource.id);
+    await built.processes!.markStatus("private-output", "exited");
+    await built.sandboxResources.retire("U1", resource.id);
+    await assert.rejects(built.app.readSessionBackgroundOutput(root.sessionId!, "private-output", "U1", 0), /retired/);
+    assert.equal(reads, 1);
+    assert.equal(selected, resource.id);
+  } finally {
+    await built.runtime.stop();
+  }
+});
+
 function registryRow(
   processId: string,
   sessionRef: string | undefined,
@@ -29,6 +61,7 @@ function registryRow(
     scopeId: "personal:U1",
     kind: over.kind ?? ("background" as const),
     command: "sleep 600",
+    sandboxId: "sandbox-1",
     ttlMs: over.ttlMs ?? 60_000,
     ...(sessionRef ? { sessionRef } : {}),
   };
@@ -86,13 +119,14 @@ test("sessionBackground spells the badge out for the viewer — and stays invisi
   const r = await app.turn(dm("start the job", thread));
   const sessionId = r.sessionId!;
 
-  await processes!.register(registryRow("p-1", thread));
+  await processes!.register({ ...registryRow("p-1", thread), purpose: "Preview app server" });
   await monitors.create(watchInput(thread, { pattern: "error|FAILED", instructions: "summarize failures" }));
 
   const view = await app.sessionBackground(sessionId, "U1");
   assert.equal(view?.jobs.length, 1);
   assert.equal(view?.jobs[0]?.processId, "p-1");
   assert.equal(view?.jobs[0]?.command, "sleep 600");
+  assert.equal(view?.jobs[0]?.purpose, "Preview app server");
   assert.ok((view?.jobs[0]?.expiresAt ?? 0) > Date.now(), "jobs carry their TTL deadline");
   assert.equal(view?.watches.length, 1);
   assert.equal(view?.watches[0]?.pattern, "error|FAILED");
